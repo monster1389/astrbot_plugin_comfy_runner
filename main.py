@@ -2152,10 +2152,10 @@ class ComfyUIPlugin(Star):
                 image_component = Image.fromFileSystem(str(img_path))
                 yield event.chain_result([image_component])
             else:
-                self_id = self_id(event) or "0"
+                sender_id = self_id(event) or "0"
                 image_component = Image.fromFileSystem(str(img_path))
                 forward_node = Node(
-                    user_id=int(self_id),
+                    user_id=int(sender_id),
                     nickname="ComfyUI",
                     content=[image_component]
                 )
