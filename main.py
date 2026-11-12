@@ -15,7 +15,14 @@ from astrbot.api import llm_tool, logger
 from astrbot.api.provider import LLMResponse
 from astrbot.core.message.message_event_result import MessageChain
 
-from .comfy_runner.config import Config
+from .comfy_runner.access import (
+    AccessController,
+    group_id,
+    is_group_message,
+    load_lexicon,
+    self_id,
+)
+from .comfy_runner.config import POLICIES, Config
 from .comfy_runner.prompt import (
     build_segments,
     coerce_history,
@@ -78,13 +85,7 @@ class ComfyUIPlugin(Star):
         control = self.cfg.control
         llm = self.cfg.llm
 
-        self.cooldown_seconds = control.cooldown_seconds
-        self.user_cooldowns = {}
         self._recent_draw_failures = {}
-        self.admin_user_ids = set(control.admin_ids)
-        self.lockdown = control.lockdown
-        self.lockdown_command_enabled = control.lockdown_command_enabled
-        self.whitelist_group_ids = set(control.whitelist_group_ids)
 
         self.multi_image_mode = llm.multi_image_mode
         logger.info(f"[ComfyUI] 多图模式: {'开启' if self.multi_image_mode else '关闭'}")
@@ -101,44 +102,21 @@ class ComfyUIPlugin(Star):
         if self.target_image_count > 1:
             logger.info(f"[ComfyUI] 目标出图数量: {self.target_image_count}")
 
-        self.default_group_policy = control.default_group_policy
-        self.default_private_policy = control.default_private_policy
-        self.group_policies = {}
-        self.policies = {
-            "none": set(),
-            "lite": {"legacy_lite"},
-            "full": {"legacy_lite", "minors", "sexual_violence", "bestiality_incest_necrophilia", "violence_gore", "scat_urine_vomit", "self_harm", "sexual", "nudity", "fetish"},
-        }
-
-        self.admin_bypass_whitelist = control.admin_bypass.whitelist
-        self.admin_bypass_cooldown = control.admin_bypass.cooldown
-        self.admin_bypass_sensitive = control.admin_bypass.sensitive_words
-
-        admin_count = len(self.admin_user_ids)
-        group_count = len(self.whitelist_group_ids)
-        logger.info(f"[ComfyUI] 超级管理员: {admin_count} 个 | 白名单群: {group_count} 个")
-        if self.lockdown:
+        self.access = AccessController(control, load_lexicon(self.sensitive_words_path))
+        word_count = sum(len(words) for words in self.access.lexicon.values())
+        logger.info(f"[ComfyUI] 敏感词库已加载: {word_count} 个词条")
+        logger.info(
+            f"[ComfyUI] 超级管理员: {len(control.admin_ids)} 个 | "
+            f"白名单群: {len(control.whitelist_group_ids)} 个"
+        )
+        if self.access.lockdown:
             logger.warning("[ComfyUI] 绘图功能全局锁定已启用，仅超级管理员可用")
-        logger.info(f"[ComfyUI] 锁定命令开关: {'开启' if self.lockdown_command_enabled else '关闭'}")
-
-        # 加载敏感词
-        self.lexicon = {}
-        try:
-            if self.sensitive_words_path.exists():
-                with open(self.sensitive_words_path, "r", encoding="utf-8") as f:
-                    self.lexicon = json.load(f)
-                word_count = sum(len(v) for v in self.lexicon.values() if isinstance(v, list))
-                logger.info(f"[ComfyUI] 🔒 敏感词库已加载: {word_count} 个词条")
-            else:
-                self.lexicon = {"legacy_lite": [], "full": []} 
-        except Exception:
-            self.lexicon = {"legacy_lite": [], "full": []}
-
-        self._policy_patterns = {}
-        self._build_policy_patterns()
+        logger.info(
+            f"[ComfyUI] 锁定命令开关: "
+            f"{'开启' if control.lockdown_command_enabled else '关闭'}"
+        )
         
         # 初始化 ComfyUI API
-        self.comfy_ui = None
         self.api = None
         try:
             from .comfyui_api import ComfyUI
@@ -175,73 +153,6 @@ class ComfyUIPlugin(Star):
     # ====== 更新 Schema ======
 
     # ====== 权限检查（返回原因）======
-    def _check_access(self, event: AstrMessageEvent) -> tuple:
-        """
-        统一的权限检查，返回 (是否通过, 拒绝原因)
-        """
-        user_id = str(event.get_sender_id())
-        is_admin = user_id in self.admin_user_ids
-        
-        # 1. 全局锁定检查
-        if self.lockdown and not is_admin:
-            return False, "🔒 绘图失败:绘图功能锁定中，仅超级管理员可用"
-        
-        # 2. 群聊白名单检查
-        if self._is_group_message(event):
-            gid = self._get_group_id(event)
-            if not gid:
-                return False, "⚠️ 无法获取群号"
-            
-            # 检查白名单
-            if gid not in self.whitelist_group_ids:
-                # 管理员可以绕过
-                if is_admin and self.admin_bypass_whitelist:
-                    pass  # 放行
-                else:
-                    return False, f"🚫 本群({gid})不在白名单中"
-        
-        return True, ""
-
-    def _check_cooldown(self, event: AstrMessageEvent) -> tuple:
-        """
-        冷却检查，返回 (是否通过, 剩余秒数或0)
-        """
-        user_id = str(event.get_sender_id())
-        is_admin = user_id in self.admin_user_ids
-        
-        # 管理员绕过冷却
-        if is_admin and self.admin_bypass_cooldown:
-            return True, 0
-        
-        current_time = time.time()
-        last_time = self.user_cooldowns.get(user_id, 0)
-        elapsed = current_time - last_time
-
-        if elapsed < self.cooldown_seconds:
-            remain = int(self.cooldown_seconds - elapsed)
-            return False, remain
-
-        self.user_cooldowns[user_id] = current_time
-        return True, 0
-
-    def _check_sensitive(self, prompt: str, event: AstrMessageEvent) -> tuple:
-        """
-        敏感词检查，返回 (是否通过, 触发的敏感词列表)
-        """
-        user_id = str(event.get_sender_id())
-        is_admin = user_id in self.admin_user_ids
-        
-        sensitive = self._find_sensitive_words(prompt, event)
-        
-        if not sensitive:
-            return True, []
-        
-        # 管理员绕过
-        if is_admin and self.admin_bypass_sensitive:
-            logger.info(f"[ComfyUI] 👑 管理员 {user_id} 使用敏感词 {sensitive}，已放行")
-            return True, []
-        
-        return False, sensitive
 
 
     def _extract_command_prompt(self, event: AstrMessageEvent) -> str:
@@ -682,7 +593,7 @@ class ComfyUIPlugin(Star):
     async def _handle_paint_logic(self, event: AstrMessageEvent, direct_send: bool):
         """处理画图的核心逻辑"""
         # 权限检查
-        allowed, reason = self._check_access(event)
+        allowed, reason = self.access.check_access(event)
         if not allowed:
             self._remember_draw_failure(
                 event,
@@ -706,7 +617,7 @@ class ComfyUIPlugin(Star):
 
             # 敏感词检查
             prompt_to_check, _ = extract_lora_control_tags(prompt)
-            passed, sensitive = self._check_sensitive(prompt_to_check, event)
+            passed, sensitive = self.access.check_sensitive(prompt_to_check, event)
             if not passed:
                 tip = "、".join(sensitive[:5])  # 最多显示5个
                 extra = f"等 {len(sensitive)} 个" if len(sensitive) > 5 else ""
@@ -743,7 +654,7 @@ class ComfyUIPlugin(Star):
     async def cmd_probe_send(self, event: AstrMessageEvent):
         """探测 event.send() 是否会触发 on_decorating_result"""
         user_id = str(event.get_sender_id())
-        if user_id not in self.admin_user_ids:
+        if user_id not in self.access.admin_ids:
             yield event.plain_result("🚫 仅管理员可用")
             return
 
@@ -762,15 +673,15 @@ class ComfyUIPlugin(Star):
     # ===== 探针结束 =====
     @filter.command("comfy帮助")
     async def cmd_comfyui_help(self, event: AstrMessageEvent):
-        allowed, reason = self._check_access(event)
+        allowed, reason = self.access.check_access(event)
         if not allowed:
             yield event.plain_result(reason)
             return
         
-        gid = self._get_group_id(event)
-        policy = self._get_policy_for_event(event)
+        gid = group_id(event)
+        policy = self.access.policy_for(event)
         user_id = str(event.get_sender_id())
-        is_admin = user_id in self.admin_user_ids
+        is_admin = user_id in self.access.admin_ids
         
         tips = [
             "🎨 ComfyUI Pro 插件帮助",
@@ -802,8 +713,8 @@ class ComfyUIPlugin(Star):
         tips.append("━━━━━━━━━━━━━━━━━━")
         tips.append(f"📍 当前位置：{'群聊 ' + gid if gid else '私聊'}")
         tips.append(f"🔒 违禁级别：{policy}")
-        tips.append(f"⏱️ 冷却时间：{self.cooldown_seconds} 秒")
-        tips.append(f"🔐 全局锁定：{'开启' if self.lockdown else '关闭'}")
+        tips.append(f"⏱️ 冷却时间：{self.cfg.control.cooldown_seconds} 秒")
+        tips.append(f"🔐 全局锁定：{'开启' if self.access.lockdown else '关闭'}")
         if is_admin:
             tips.append(f"👑 身份：管理员")
             tips.append(f"📂 数据目录：{self.data_dir}")
@@ -814,7 +725,7 @@ class ComfyUIPlugin(Star):
         """测试主动发送 - 第二轮"""
     
         user_id = str(event.get_sender_id())
-        if user_id not in self.admin_user_ids:
+        if user_id not in self.access.admin_ids:
             yield event.plain_result("🚫 仅管理员可用")
             return
     
@@ -1060,27 +971,27 @@ class ComfyUIPlugin(Star):
 
     @filter.command("违禁级别", aliases={"banlevel", "敏感级别"})
     async def cmd_set_policy(self, event: AstrMessageEvent):
-        allowed, reason = self._check_access(event)
+        allowed, reason = self.access.check_access(event)
         if not allowed:
             yield event.plain_result(reason)
             return
         
-        if not self._is_group_message(event):
+        if not is_group_message(event):
             yield event.plain_result("⚠️ 该指令仅支持在群聊中使用")
             return
 
         # 检查管理员权限
         user_id = str(event.get_sender_id())
-        if user_id not in self.admin_user_ids:
+        if user_id not in self.access.admin_ids:
             yield event.plain_result("🚫 权限不足，仅管理员可修改违禁级别")
             return
 
         full_msg = event.message_str.strip()
         parts = full_msg.split()
-        gid = self._get_group_id(event) or "未知"
+        gid = group_id(event) or "未知"
 
         if len(parts) == 1:
-            current = self.group_policies.get(gid, self.default_group_policy)
+            current = self.access.policy_for(event)
             yield event.plain_result(
                 f"📊 本群当前违禁级别：{current}\n"
                 f"━━━━━━━━━━━━━━\n"
@@ -1094,11 +1005,11 @@ class ComfyUIPlugin(Star):
             return
 
         level = parts[1].lower()
-        if level not in self.policies:
+        if level not in POLICIES:
             yield event.plain_result("❌ 无效级别，可选：none / lite / full")
             return
 
-        self.group_policies[gid] = level
+        self.access.set_policy(gid, level)
         logger.info(f"[ComfyUI] 群 {gid} 违禁级别已设为 {level}（操作者：{user_id}）")
         yield event.plain_result(f"✅ 已将本群违禁级别设置为：{level}")
 
@@ -1106,11 +1017,11 @@ class ComfyUIPlugin(Star):
     async def cmd_comfy_lock(self, event: AstrMessageEvent):
         """管理员动态切换全局锁定状态"""
         user_id = str(event.get_sender_id())
-        if user_id not in self.admin_user_ids:
+        if user_id not in self.access.admin_ids:
             yield event.plain_result("🚫 权限不足，仅管理员可切换全局锁定")
             return
 
-        if not self.lockdown_command_enabled:
+        if not self.cfg.control.lockdown_command_enabled:
             yield event.plain_result("⚠️ 锁定命令开关已关闭，请在插件配置中启用 control.lockdown_command_enabled")
             return
 
@@ -1121,20 +1032,20 @@ class ComfyUIPlugin(Star):
             yield event.plain_result(
                 "🔐 全局锁定状态\n"
                 "━━━━━━━━━━━━━━━━━━\n"
-                f"当前: {'开启' if self.lockdown else '关闭'}\n"
-                f"命令开关: {'开启' if self.lockdown_command_enabled else '关闭'}\n"
+                f"当前: {'开启' if self.access.lockdown else '关闭'}\n"
+                f"命令开关: {'开启' if self.cfg.control.lockdown_command_enabled else '关闭'}\n"
                 "用法: /comfy_lock on|off|status"
             )
             return
 
         if action in ("on", "true", "1", "enable", "start", "开启"):
-            self.lockdown = True
+            self.access.lockdown = True
             logger.warning(f"[ComfyUI] 管理员 {user_id} 通过命令开启全局锁定")
             yield event.plain_result("🔒 已开启全局锁定：当前仅超级管理员可用绘图功能")
             return
 
         if action in ("off", "false", "0", "disable", "stop", "关闭"):
-            self.lockdown = False
+            self.access.lockdown = False
             logger.info(f"[ComfyUI] 管理员 {user_id} 通过命令关闭全局锁定")
             yield event.plain_result("🔓 已关闭全局锁定：恢复正常访问控制")
             return
@@ -1145,7 +1056,7 @@ class ComfyUIPlugin(Star):
     async def cmd_comfy_list(self, event: AstrMessageEvent):
         """列出当前所有可用工作流"""
         user_id = str(event.get_sender_id())
-        if user_id not in self.admin_user_ids:
+        if user_id not in self.access.admin_ids:
             yield event.plain_result("🚫 权限不足，仅管理员可查看工作流列表")
             return
 
@@ -1200,7 +1111,7 @@ class ComfyUIPlugin(Star):
     async def cmd_comfy_use(self, event: AstrMessageEvent):
         """切换工作流"""
         user_id = str(event.get_sender_id())
-        if user_id not in self.admin_user_ids:
+        if user_id not in self.access.admin_ids:
             yield event.plain_result("🚫 权限不足，仅管理员可切换工作流")
             return
 
@@ -1255,7 +1166,7 @@ class ComfyUIPlugin(Star):
     async def cmd_comfy_save(self, event: AstrMessageEvent):
         """保存/导入工作流"""
         user_id = str(event.get_sender_id())
-        if user_id not in self.admin_user_ids:
+        if user_id not in self.access.admin_ids:
             yield event.plain_result("🚫 权限不足，仅管理员可导入工作流")
             return
 
@@ -1304,7 +1215,7 @@ class ComfyUIPlugin(Star):
     
         # 权限检查
         user_id = str(event.get_sender_id())
-        if user_id not in self.admin_user_ids:
+        if user_id not in self.access.admin_ids:
             yield event.plain_result("🚫 权限不足，仅管理员可设置步数覆盖")
             return
     
@@ -1496,7 +1407,7 @@ class ComfyUIPlugin(Star):
 
     @filter.command("测试lora", aliases=["lora_test", "lora测试"])
     async def cmd_lora_test(self, event: AstrMessageEvent):
-        allowed, reason = self._check_access(event)
+        allowed, reason = self.access.check_access(event)
         if not allowed:
             yield event.plain_result(reason)
             return
@@ -1722,112 +1633,7 @@ class ComfyUIPlugin(Star):
             yield result
 
     # ====== 辅助方法 ======
-    def _is_group_message(self, event: AstrMessageEvent) -> bool:
-        mt = getattr(event, "message_type", None)
-        if mt is not None:
-            return mt == "group"
-        try:
-            if hasattr(event, "get_group_id"):
-                gid = event.get_group_id()
-                if gid:
-                    return True
-            gid_attr = getattr(event, "group_id", None)
-            return gid_attr is not None
-        except Exception:
-            return False
 
-    def _get_group_id(self, event: AstrMessageEvent):
-        if not self._is_group_message(event):
-            return None
-        getters = [
-            lambda e: e.get_group_id() if hasattr(e, "get_group_id") else None,
-            lambda e: getattr(e, "group_id", None),
-            lambda e: getattr(getattr(e, "scene", None), "group_id", None),
-        ]
-        for g in getters:
-            try:
-                gid = g(event)
-                if gid:
-                    return str(gid)
-            except Exception:
-                continue
-        return None
-
-    def _get_self_id(self, event: AstrMessageEvent):
-        getters = [
-            lambda e: e.get_self_id() if hasattr(e, "get_self_id") else None,
-            lambda e: getattr(e, "self_id", None),
-            lambda e: getattr(getattr(self.context, "bot", None), "self_id", None),
-            lambda e: getattr(self.context, "self_id", None),
-        ]
-        for g in getters:
-            try:
-                sid = g(event)
-                if sid:
-                    return str(sid)
-            except Exception:
-                continue
-        return None
-
-    def _is_ascii_term(self, s: str) -> bool:
-        return all(ord(ch) < 128 for ch in s)
-
-    def _build_policy_patterns(self):
-        for policy, cats in self.policies.items():
-            word_terms = []
-            phrase_terms = []
-            for cat in cats:
-                for t in self.lexicon.get(cat, []):
-                    if not t:
-                        continue
-                    if self._is_ascii_term(t):
-                        if " " in t: 
-                            phrase_terms.append(re.escape(t))
-                        else:         
-                            word_terms.append(re.escape(t))
-            word_terms = list(dict.fromkeys(word_terms))
-            phrase_terms = list(dict.fromkeys(phrase_terms))
-
-            parts = []
-            if word_terms:
-                parts.append(r'(?<![A-Za-z0-9_])(?:' + '|'.join(word_terms) + r')(?![A-Za-z0-9_])')
-            if phrase_terms:
-                parts.append('|'.join(phrase_terms))
-
-            ascii_pat = re.compile('|'.join(parts), re.IGNORECASE) if parts else None
-            self._policy_patterns[policy] = ascii_pat
-
-    def _get_policy_for_event(self, event: AstrMessageEvent) -> str:
-        if self._is_group_message(event):
-            gid = self._get_group_id(event)
-            if not gid:
-                return self.default_group_policy
-            return self.group_policies.get(gid, self.default_group_policy)
-        return self.default_private_policy
-
-    def _find_sensitive_words(self, text: str, event: AstrMessageEvent = None):
-        if not text:
-            return []
-        policy = "full"
-        if event is not None:
-            policy = self._get_policy_for_event(event)
-
-        if policy == "none":
-            return []
-
-        ascii_pat = self._policy_patterns.get(str(policy).lower())
-        if not ascii_pat:
-            return []
-
-        seen = set()
-        result = []
-        for m in ascii_pat.finditer(text):
-            w = m.group(0)
-            key = w.lower()
-            if key not in seen:
-                seen.add(key)
-                result.append(w)
-        return result
 
     # ====== 修改提取逻辑 ======
     @filter.on_llm_response(priority=70)
@@ -1888,7 +1694,7 @@ class ComfyUIPlugin(Star):
             event._comfy_auto_painted = True
 
             # 权限检查
-            allowed, reason = self._check_access(event)
+            allowed, reason = self.access.check_access(event)
             if not allowed:
                 logger.warning(f"[ComfyUI] 多图请求被拒绝: {reason}")
                 self._remember_draw_failure(
@@ -1908,7 +1714,7 @@ class ComfyUIPlugin(Star):
                 return
 
             # 冷却检查
-            ok, remain = self._check_cooldown(event)
+            ok, remain = self.access.check_cooldown(event)
             if not ok:
                 logger.info(f"[ComfyUI] 用户 {event.get_sender_id()} 冷却中")
                 message = f"⏱️ 冷却中，请在 {remain} 秒后重试"
@@ -1931,7 +1737,7 @@ class ComfyUIPlugin(Star):
             # 敏感词预检所有 prompt
             for s in segments:
                 if s["type"] == "prompt":
-                    passed, sensitive = self._check_sensitive(s["content"], event)
+                    passed, sensitive = self.access.check_sensitive(s["content"], event)
                     if not passed:
                         tip = "、".join(sensitive[:3])
                         logger.warning(f"[ComfyUI] 多图模式触发敏感词: {tip}")
@@ -1983,7 +1789,7 @@ class ComfyUIPlugin(Star):
         event._comfy_auto_painted = True
 
         # 权限检查
-        allowed, reason = self._check_access(event)
+        allowed, reason = self.access.check_access(event)
         if not allowed:
             logger.warning(f"[ComfyUI] 单图请求被拒绝: {reason}")
             self._remember_draw_failure(
@@ -1999,7 +1805,7 @@ class ComfyUIPlugin(Star):
             return
 
         # 敏感词检查
-        passed, sensitive = self._check_sensitive(prompt, event)
+        passed, sensitive = self.access.check_sensitive(prompt, event)
         if not passed:
             tip = "、".join(sensitive[:5])
             logger.warning(f"[ComfyUI] 用户 {event.get_sender_id()} 触发敏感词: {tip}")
@@ -2017,7 +1823,7 @@ class ComfyUIPlugin(Star):
             return
 
         # 冷却检查
-        ok, remain = self._check_cooldown(event)
+        ok, remain = self.access.check_cooldown(event)
         if not ok:
             logger.info(f"[ComfyUI] 用户 {event.get_sender_id()} 冷却中，图片跳过")
             message = f"⏱️ 冷却中，请在 {remain} 秒后重试"
@@ -2243,7 +2049,7 @@ class ComfyUIPlugin(Star):
         draw_source = event.get_extra("comfy_draw_source") or "LLM 工具"
         
         # 权限检查
-        allowed, reason = self._check_access(event)
+        allowed, reason = self.access.check_access(event)
         if not allowed:
             self._remember_draw_failure(
                 event,
@@ -2288,7 +2094,7 @@ class ComfyUIPlugin(Star):
         try:
             # 敏感词检查
             prompt, lora_selections = extract_lora_control_tags(prompt)
-            passed, sensitive = self._check_sensitive(prompt, event)
+            passed, sensitive = self.access.check_sensitive(prompt, event)
             if not passed:
                 tip = "、".join(sensitive[:5])
                 logger.warning(f"[ComfyUI] 用户 {event.get_sender_id()} 触发敏感词: {tip}")
@@ -2303,7 +2109,7 @@ class ComfyUIPlugin(Star):
                 return
 
             # 冷却检查
-            ok, remain = self._check_cooldown(event)
+            ok, remain = self.access.check_cooldown(event)
             if not ok:
                 message = f"⏱️ 冷却中，请在 {remain} 秒后重试"
                 self._remember_draw_failure(
@@ -2346,7 +2152,7 @@ class ComfyUIPlugin(Star):
                 image_component = Image.fromFileSystem(str(img_path))
                 yield event.chain_result([image_component])
             else:
-                self_id = self._get_self_id(event) or "0"
+                self_id = self_id(event) or "0"
                 image_component = Image.fromFileSystem(str(img_path))
                 forward_node = Node(
                     user_id=int(self_id),
