@@ -1,0 +1,30 @@
+# 插件自带的 ruff 配置。缺少本文件时 ruff 会向上取容器里的 /AstrBot/pyproject.toml。
+
+[tool.ruff]
+line-length = 88
+target-version = "py312"
+extend-exclude = ["data"]
+
+[tool.ruff.lint]
+select = [
+  "F",
+  "W",
+  "E",
+  "ASYNC",
+  "C4",
+  "Q",
+  "I",
+  "UP",
+  "D",
+]
+ignore = [
+  "ASYNC230",
+  "ASYNC240",
+  "D203",
+  "D213",
+  "D400",
+  "D415",
+]
+
+[tool.ruff.lint.pydocstyle]
+convention = "google"
