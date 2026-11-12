@@ -14,6 +14,24 @@ from astrbot.api.message_components import *
 from astrbot.api import llm_tool, logger
 from astrbot.api.provider import LLMResponse
 from astrbot.core.message.message_event_result import MessageChain
+
+from .comfy_runner.config import Config
+from .comfy_runner.prompt import (
+    build_segments,
+    coerce_history,
+    compact_prompt,
+    count_visible_text_length,
+    extract_lora_control_tags,
+    extract_prompt_lora_pairs,
+    extract_usable_prompt_entries,
+    find_pic_prompts,
+    normalize_lora_key,
+    normalize_prompt_signature,
+    parse_lora_picks,
+    remove_spans,
+    sanitize_context_content,
+    strip_control_tags,
+)
 # 获取插件目录（用于读取默认文件）
 PLUGIN_DIR = Path(os.path.dirname(os.path.abspath(__file__)))
 class _ComfyImageMarker:
@@ -54,63 +72,53 @@ class ComfyUIPlugin(Star):
         self.sensitive_words_path = self.data_dir / "sensitive_words.json"
         
         # ====== 4. 更新 UI 配置 ======
-        self._auto_update_schema()
         
-        # Control 配置
-        control_conf = config.get("control", {})
-        self.cooldown_seconds = control_conf.get("cooldown_seconds", 60)
+        self.cfg = Config.from_mapping(config, data_dir=self.data_dir)
+        control = self.cfg.control
+        llm = self.cfg.llm
+
+        self.cooldown_seconds = control.cooldown_seconds
         self.user_cooldowns = {}
         self._recent_draw_failures = {}
-        self.admin_user_ids = set(map(str, control_conf.get("admin_ids", [])))
-        self.lockdown = bool(control_conf.get("lockdown", False))
-        self.lockdown_command_enabled = bool(control_conf.get("lockdown_command_enabled", True))
-        self.whitelist_group_ids = set(map(str, control_conf.get("whitelist_group_ids", [])))
-    
-        llm_settings = config.get("llm_settings", {})
-        self.multi_image_mode = llm_settings.get("multi_image_mode", False)
-        logger.info(f"[ComfyUI] 🖼️ 多图模式: {'开启' if self.multi_image_mode else '关闭'}")
-        
-        self.discard_prompt_from_history = llm_settings.get("discard_prompt_from_history", False)
-        self.force_draw_when_no_prompt = bool(llm_settings.get("force_draw_when_no_prompt", False))
-        self.target_image_count = self._coerce_target_image_count(
-            llm_settings.get("target_image_count", 1),
-        )
-        self.lora_control_conf = llm_settings.get("lora_control", {}) or {}
-        self.lora_control_enabled = bool(self.lora_control_conf.get("enabled", False))
+        self.admin_user_ids = set(control.admin_ids)
+        self.lockdown = control.lockdown
+        self.lockdown_command_enabled = control.lockdown_command_enabled
+        self.whitelist_group_ids = set(control.whitelist_group_ids)
+
+        self.multi_image_mode = llm.multi_image_mode
+        logger.info(f"[ComfyUI] 多图模式: {'开启' if self.multi_image_mode else '关闭'}")
+        self.discard_prompt_from_history = llm.discard_prompt_from_history
+        self.force_draw_when_no_prompt = llm.force_draw_when_no_prompt
+        self.target_image_count = llm.target_image_count
+        self.lora_control_enabled = llm.lora_control.enabled
         if self.discard_prompt_from_history:
-            logger.info("[ComfyUI] 🗑️ 绘图提示词历史丢弃: 开启")
+            logger.info("[ComfyUI] 绘图提示词历史丢弃: 开启")
         if self.force_draw_when_no_prompt:
             logger.info(
-                f"[ComfyUI] 🎯 强制画图兜底: 开启（回复正文不少于 {self._FORCE_DRAW_MIN_REPLY_LENGTH} 字时生效）",
+                f"[ComfyUI] 强制画图兜底: 开启（回复正文不少于 {self._FORCE_DRAW_MIN_REPLY_LENGTH} 字时生效）",
             )
         if self.target_image_count > 1:
-            logger.info(f"[ComfyUI] 🖼️ 目标出图数量: {self.target_image_count}")
-        # 策略配置
-        self.default_group_policy = str(control_conf.get("default_group_policy", "none")).lower()
-        self.default_private_policy = str(control_conf.get("default_private_policy", "none")).lower()
-        self.group_policies = {
-            str(k): str(v).lower()
-            for k, v in control_conf.get("group_policies", {}).items()
-        }
+            logger.info(f"[ComfyUI] 目标出图数量: {self.target_image_count}")
+
+        self.default_group_policy = control.default_group_policy
+        self.default_private_policy = control.default_private_policy
+        self.group_policies = {}
         self.policies = {
             "none": set(),
             "lite": {"legacy_lite"},
             "full": {"legacy_lite", "minors", "sexual_violence", "bestiality_incest_necrophilia", "violence_gore", "scat_urine_vomit", "self_harm", "sexual", "nudity", "fetish"},
         }
 
-        # 管理员绕过配置
-        bypass = control_conf.get("admin_bypass", {})
-        self.admin_bypass_whitelist = bypass.get("whitelist", True)
-        self.admin_bypass_cooldown = bypass.get("cooldown", True)
-        self.admin_bypass_sensitive = bypass.get("sensitive_words", True)
+        self.admin_bypass_whitelist = control.admin_bypass.whitelist
+        self.admin_bypass_cooldown = control.admin_bypass.cooldown
+        self.admin_bypass_sensitive = control.admin_bypass.sensitive_words
 
-        # 日志：显示管理员和白名单配置
         admin_count = len(self.admin_user_ids)
         group_count = len(self.whitelist_group_ids)
-        logger.info(f"[ComfyUI] 👤 超级管理员: {admin_count} 个 | 🏠 白名单群: {group_count} 个")
+        logger.info(f"[ComfyUI] 超级管理员: {admin_count} 个 | 白名单群: {group_count} 个")
         if self.lockdown:
-            logger.warning("[ComfyUI]⚠️ 绘图功能全局锁定已启用，仅超级管理员可用")
-        logger.info(f"[ComfyUI] 🔐 锁定命令开关: {'开启' if self.lockdown_command_enabled else '关闭'}")
+            logger.warning("[ComfyUI] 绘图功能全局锁定已启用，仅超级管理员可用")
+        logger.info(f"[ComfyUI] 锁定命令开关: {'开启' if self.lockdown_command_enabled else '关闭'}")
 
         # 加载敏感词
         self.lexicon = {}
@@ -164,35 +172,6 @@ class ComfyUIPlugin(Star):
                 logger.error(f"[ComfyUI] 复制敏感词文件失败: {e}")
 
     # ====== 更新 Schema ======
-    def _auto_update_schema(self):
-        """扫描持久化目录的工作流，更新 UI 下拉列表"""
-        try:
-            schema_path = PLUGIN_DIR / '_conf_schema.json'
-            workflow_dir = self.data_dir / 'workflow'
-
-            if not workflow_dir.exists():
-                return
-
-            # 排除 .steps.json 文件
-            files = sorted([
-                f.name for f in workflow_dir.glob("*.json")
-                if not self._is_workflow_aux_file(f.name)
-            ])
-        
-            with open(schema_path, 'r', encoding='utf-8') as f:
-                data = json.load(f)
-
-            target = data['workflow_settings']['items']['json_file']
-            target['options'] = files
-            target['enum'] = files
-        
-            with open(schema_path, 'w', encoding='utf-8') as f:
-                json.dump(data, f, indent=2, ensure_ascii=False)
-        
-            logger.info(f"[ComfyUI] 🔄 工作流列表已更新: {len(files)} 个可用")
-
-        except Exception as e:
-            logger.error(f"[ComfyUI] 更新工作流列表失败: {e}")
 
     # ====== 权限检查（返回原因）======
     def _check_access(self, event: AstrMessageEvent) -> tuple:
@@ -263,15 +242,6 @@ class ComfyUIPlugin(Star):
         
         return False, sensitive
 
-    def _compact_draw_prompt(self, prompt, limit: int = 240) -> str:
-        if prompt is None:
-            return ""
-        if isinstance(prompt, (list, tuple)):
-            prompt = " | ".join(str(item) for item in prompt if item is not None)
-        text = re.sub(r"\s+", " ", str(prompt)).strip()
-        if not text:
-            return ""
-        return text[:limit] + ("..." if len(text) > limit else "")
 
     def _extract_command_prompt(self, event: AstrMessageEvent) -> str:
         full_message = (getattr(event, "message_str", "") or "").strip()
@@ -299,7 +269,7 @@ class ComfyUIPlugin(Star):
         record = {
             "ts": now,
             "reason": reason_text,
-            "prompt": self._compact_draw_prompt(prompt),
+            "prompt": compact_prompt(prompt),
             "source": str(source or "绘图"),
             "user_id": str(event.get_sender_id()),
         }
@@ -434,8 +404,8 @@ class ComfyUIPlugin(Star):
                 continue
             content = entry.get("content", "")
             if isinstance(content, str):
-                stripped = self._strip_comfy_control_tags(content, remove_think=True)
-                if self._find_pic_prompt_matches(content) or "<lora " in content.lower():
+                stripped = strip_control_tags(content, remove_think=True)
+                if find_pic_prompts(content) or "<lora " in content.lower():
                     entry["content"] = stripped
                     cleaned += 1
 
@@ -448,235 +418,12 @@ class ComfyUIPlugin(Star):
     def _is_workflow_aux_file(filename: str) -> bool:
         return filename.endswith(".steps.json") or filename.endswith(".lora.json")
 
-    @staticmethod
-    def _strip_comfy_control_tags(text: str, remove_think: bool = False) -> str:
-        if not isinstance(text, str):
-            return text
-
-        cleaned = re.sub(r'<lora\s+picks=".*?"\s*/?>', "", text, flags=re.DOTALL | re.IGNORECASE)
-        pic_matches = ComfyUIPlugin._find_pic_prompt_matches(cleaned)
-        cleaned = ComfyUIPlugin._remove_text_spans(
-            cleaned,
-            [(item["start"], item["end"]) for item in pic_matches],
-        )
-        cleaned = re.sub(r"</pic>", "", cleaned, flags=re.IGNORECASE)
-        if remove_think:
-            cleaned = re.sub(r"<think>.*?</think>", "", cleaned, flags=re.DOTALL | re.IGNORECASE)
-        cleaned = re.sub(r"</?ctx>", "", cleaned, flags=re.IGNORECASE)
-        cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
-        return cleaned.strip()
-
-    @staticmethod
-    def _count_visible_text_length(text: str) -> int:
-        if not isinstance(text, str):
-            return 0
-        return len(re.sub(r"\s+", "", text))
-
-    @staticmethod
-    def _coerce_target_image_count(value) -> int:
-        try:
-            count = int(value)
-        except (TypeError, ValueError):
-            return 1
-        return max(1, count)
-
-    @staticmethod
-    def _normalize_prompt_signature(prompt: str) -> str:
-        if not isinstance(prompt, str):
-            return ""
-        return re.sub(r"\s+", " ", prompt).strip().casefold()
 
     def _should_use_multi_image_mode(self, prompt_count: int) -> bool:
         return prompt_count > 1 and (
             self.multi_image_mode or self.target_image_count > 1
         )
 
-    @staticmethod
-    def _normalize_lora_key(value) -> str:
-        if value is None:
-            return ""
-        return re.sub(r"\s+", "", str(value)).casefold()
-
-    def _parse_lora_pick_string(self, raw_text: str) -> list:
-        if not raw_text:
-            return []
-
-        selections = []
-        clear_token = self._normalize_lora_key("!clear_defaults")
-        for piece in re.split(r"[,;\n，；]+", raw_text):
-            token = piece.strip().strip("`").strip()
-            if not token:
-                continue
-
-            if self._normalize_lora_key(token) == clear_token:
-                selections.append({"name": "!clear_defaults", "control": "clear_defaults"})
-                continue
-
-            trigger_indexes = []
-            if "@" in token:
-                token, trigger_part = token.rsplit("@", 1)
-                for raw_index in re.split(r"[+|/、\s]+", trigger_part.strip()):
-                    raw_index = raw_index.strip()
-                    if not raw_index:
-                        continue
-                    try:
-                        index = int(raw_index)
-                    except (TypeError, ValueError):
-                        continue
-                    if index > 0:
-                        trigger_indexes.append(index)
-
-            parts = [part.strip() for part in token.rsplit(":", 2)]
-            name = ""
-            strength = None
-            clip_strength = None
-
-            if len(parts) == 1:
-                name = parts[0]
-            elif len(parts) == 2:
-                name, strength = parts
-            else:
-                name, strength, clip_strength = parts
-
-            if not name:
-                continue
-
-            try:
-                strength = float(strength) if strength not in ("", None) else None
-            except (TypeError, ValueError):
-                strength = None
-
-            try:
-                clip_strength = float(clip_strength) if clip_strength not in ("", None) else None
-            except (TypeError, ValueError):
-                clip_strength = None
-
-            selections.append(
-                {
-                    "name": name,
-                    "strength": strength,
-                    "clip_strength": clip_strength,
-                    "trigger_indexes": trigger_indexes,
-                }
-            )
-
-        deduped = []
-        seen = set()
-        for item in selections:
-            key = self._normalize_lora_key(item.get("name") or item.get("control"))
-            if not key or key in seen:
-                continue
-            deduped.append(item)
-            seen.add(key)
-        return deduped
-
-    def _extract_lora_control_tags(self, text: str):
-        if not isinstance(text, str) or not text:
-            return text, []
-
-        collected = []
-
-        def repl(match):
-            collected.extend(self._parse_lora_pick_string(match.group(1)))
-            return ""
-
-        cleaned = re.sub(
-            r'<lora\s+picks="(.*?)"\s*/?>',
-            repl,
-            text,
-            flags=re.DOTALL | re.IGNORECASE,
-        )
-        cleaned = re.sub(r"\s{2,}", " ", cleaned).strip()
-        return cleaned, collected
-
-    @classmethod
-    def _find_pic_prompt_matches(cls, text: str) -> list[dict]:
-        if not isinstance(text, str) or not text:
-            return []
-
-        matches = []
-        occupied = []
-
-        for match in cls._PIC_PROMPT_TAG_PATTERN.finditer(text):
-            start, end = match.span()
-            matches.append(
-                {
-                    "start": start,
-                    "end": end,
-                    "prompt": match.group("prompt") or "",
-                }
-            )
-            occupied.append((start, end))
-
-        for match in cls._PIC_PROMPT_UNCLOSED_PATTERN.finditer(text):
-            start, end = match.span()
-            if any(not (end <= s or start >= e) for s, e in occupied):
-                continue
-            matches.append(
-                {
-                    "start": start,
-                    "end": end,
-                    "prompt": match.group("prompt") or "",
-                }
-            )
-
-        matches.sort(key=lambda item: item["start"])
-        return matches
-
-    @staticmethod
-    def _remove_text_spans(text: str, spans: list[tuple[int, int]]) -> str:
-        if not isinstance(text, str) or not spans:
-            return text
-
-        parts = []
-        cursor = 0
-        for start, end in spans:
-            parts.append(text[cursor:start])
-            cursor = end
-        parts.append(text[cursor:])
-        return "".join(parts)
-
-    def _extract_prompt_lora_pairs(self, full_text: str) -> list:
-        token_pattern = re.compile(
-            r'<lora\s+picks="(.*?)"\s*/?>',
-            flags=re.DOTALL | re.IGNORECASE,
-        )
-
-        tokens = []
-        for match in token_pattern.finditer(full_text or ""):
-            tokens.append(
-                {
-                    "type": "lora",
-                    "start": match.start(),
-                    "lora_raw": match.group(1) or "",
-                }
-            )
-        for match in self._find_pic_prompt_matches(full_text or ""):
-            tokens.append(
-                {
-                    "type": "pic",
-                    "start": match["start"],
-                    "prompt_raw": match["prompt"],
-                }
-            )
-        tokens.sort(key=lambda item: item["start"])
-
-        pairs = []
-        pending_loras = []
-        for token in tokens:
-            if token["type"] == "lora":
-                pending_loras.extend(self._parse_lora_pick_string(token["lora_raw"]))
-                continue
-
-            pairs.append(
-                {
-                    "prompt": token["prompt_raw"] or "",
-                    "lora_selections": pending_loras,
-                }
-            )
-            pending_loras = []
-
-        return pairs
 
     def _format_lora_trigger_preview(self, entry: dict, limit: int = 3, preview_length: int = 60) -> str:
         options = list(entry.get("trigger_options", []) or [])[:limit]
@@ -694,8 +441,7 @@ class ComfyUIPlugin(Star):
         return " | ".join(rendered)
 
     def _get_comfy_system_prompt(self) -> str:
-        llm_settings = self.config.get("llm_settings", {}) or {}
-        my_prompt = (llm_settings.get("system_prompt", "") or "").strip()
+        my_prompt = self.cfg.llm.system_prompt.strip()
         if not my_prompt:
             return ""
 
@@ -709,80 +455,20 @@ class ComfyUIPlugin(Star):
                 my_prompt = f"{my_prompt}\n\n{lora_appendix}".strip()
         return my_prompt
 
-    @staticmethod
-    def _coerce_conversation_history(raw_history) -> list:
-        if raw_history is None:
-            return []
-
-        if isinstance(raw_history, str):
-            try:
-                raw_history = json.loads(raw_history)
-            except (json.JSONDecodeError, TypeError):
-                return []
-
-        if not isinstance(raw_history, list):
-            return []
-
-        return [copy.deepcopy(item) for item in raw_history if isinstance(item, dict)]
-
-    def _sanitize_context_content_for_prompt(self, content):
-        if isinstance(content, str):
-            return self._strip_comfy_control_tags(content, remove_think=True)
-
-        if not isinstance(content, list):
-            return content
-
-        sanitized_parts = []
-        for part in content:
-            if isinstance(part, str):
-                cleaned_part = self._strip_comfy_control_tags(part, remove_think=True)
-                if cleaned_part:
-                    sanitized_parts.append(cleaned_part)
-                continue
-
-            if not isinstance(part, dict):
-                sanitized_parts.append(copy.deepcopy(part))
-                continue
-
-            item = copy.deepcopy(part)
-            item_type = str(item.get("type", "") or "").strip().lower()
-            if item_type == "think":
-                continue
-
-            if item_type == "text":
-                if "text" in item:
-                    item["text"] = self._strip_comfy_control_tags(
-                        str(item.get("text", "") or ""),
-                        remove_think=True,
-                    )
-                    if not item["text"]:
-                        continue
-                elif isinstance(item.get("data"), dict):
-                    item["data"] = copy.deepcopy(item["data"])
-                    item["data"]["text"] = self._strip_comfy_control_tags(
-                        str(item["data"].get("text", "") or ""),
-                        remove_think=True,
-                    )
-                    if not item["data"]["text"]:
-                        continue
-
-            sanitized_parts.append(item)
-
-        return sanitized_parts
 
     def _build_force_draw_contexts(
         self,
         conversation,
         latest_reply_text: str,
     ) -> list[dict]:
-        history = self._coerce_conversation_history(
+        history = coerce_history(
             getattr(conversation, "history", None),
         )
         sanitized_contexts = []
 
         for entry in history[-self._FORCE_DRAW_CONTEXT_LIMIT :]:
             message = copy.deepcopy(entry)
-            message["content"] = self._sanitize_context_content_for_prompt(
+            message["content"] = sanitize_context_content(
                 message.get("content"),
             )
             content = message.get("content")
@@ -791,7 +477,7 @@ class ComfyUIPlugin(Star):
                     continue
             sanitized_contexts.append(message)
 
-        latest_reply_text = self._strip_comfy_control_tags(
+        latest_reply_text = strip_control_tags(
             latest_reply_text,
             remove_think=True,
         )
@@ -812,53 +498,6 @@ class ComfyUIPlugin(Star):
 
         return sanitized_contexts[-self._FORCE_DRAW_CONTEXT_LIMIT :]
 
-    def _extract_usable_prompt_entries(self, full_text: str) -> list[dict]:
-        prompt_entries = self._extract_prompt_lora_pairs(full_text)
-        if not prompt_entries:
-            return []
-
-        placeholder_patterns = [
-            r"^\.{2,}$",
-            r"^…+$",
-            r"^[.。]+$",
-            r"^[xX]{2,}$",
-            r"^[-_=]{2,}$",
-            r"^\[.*?\]$",
-            r"^\{.*?\}$",
-        ]
-
-        cleaned_entries = []
-        for entry in prompt_entries:
-            prompt_text = entry.get("prompt", "")
-            prompt_text = re.sub(r"^提示词是\s*[:：]?\s*", "", prompt_text).strip()
-            prompt_text = prompt_text.strip('`"\'""''').strip()
-            prompt_text, inline_loras = self._extract_lora_control_tags(prompt_text)
-            if not prompt_text:
-                continue
-            if len(prompt_text) < 3:
-                logger.debug(f"[ComfyUI] 跳过过短提示词: '{prompt_text}'")
-                continue
-            if any(re.match(pattern, prompt_text) for pattern in placeholder_patterns):
-                logger.debug(f"[ComfyUI] 跳过占位符提示词: '{prompt_text}'")
-                continue
-
-            lora_selections = []
-            seen_loras = set()
-            for item in (entry.get("lora_selections") or []) + inline_loras:
-                key = self._normalize_lora_key(item.get("name"))
-                if not key or key in seen_loras:
-                    continue
-                lora_selections.append(item)
-                seen_loras.add(key)
-
-            cleaned_entries.append(
-                {
-                    "prompt": prompt_text,
-                    "lora_selections": lora_selections,
-                }
-            )
-
-        return cleaned_entries
 
     async def _generate_force_draw_prompt_entries(
         self,
@@ -877,11 +516,11 @@ class ComfyUIPlugin(Star):
         if not needs_fill_when_no_prompt and not needs_fill_to_target_count:
             return []
 
-        latest_reply_text = self._strip_comfy_control_tags(
+        latest_reply_text = strip_control_tags(
             latest_reply_text,
             remove_think=True,
         )
-        reply_length = self._count_visible_text_length(latest_reply_text)
+        reply_length = count_visible_text_length(latest_reply_text)
         if reply_length < self._FORCE_DRAW_MIN_REPLY_LENGTH:
             logger.info(
                 "[ComfyUI] 跳过强制画图兜底：当前回复长度为 %s，小于阈值 %s",
@@ -914,7 +553,7 @@ class ComfyUIPlugin(Star):
         if len(latest_reply_excerpt) > 1200:
             latest_reply_excerpt = latest_reply_excerpt[:1199].rstrip() + "…"
         seen_prompts = {
-            self._normalize_prompt_signature(item.get("prompt", ""))
+            normalize_prompt_signature(item.get("prompt", ""))
             for item in current_entries
             if item.get("prompt")
         }
@@ -1002,7 +641,7 @@ class ComfyUIPlugin(Star):
                 logger.warning("[ComfyUI] 强制画图补提示词返回空内容")
                 break
 
-            round_entries = self._extract_usable_prompt_entries(fallback_text)
+            round_entries = extract_usable_prompt_entries(fallback_text)
             if not round_entries:
                 logger.warning(
                     "[ComfyUI] 强制画图补提示词后仍未提取到可用 prompt: %s",
@@ -1012,7 +651,7 @@ class ComfyUIPlugin(Star):
 
             added_this_round = 0
             for entry in round_entries:
-                prompt_signature = self._normalize_prompt_signature(entry.get("prompt", ""))
+                prompt_signature = normalize_prompt_signature(entry.get("prompt", ""))
                 if not prompt_signature or prompt_signature in seen_prompts:
                     continue
                 supplemented_entries.append(entry)
@@ -1065,7 +704,7 @@ class ComfyUIPlugin(Star):
                 return
 
             # 敏感词检查
-            prompt_to_check, _ = self._extract_lora_control_tags(prompt)
+            prompt_to_check, _ = extract_lora_control_tags(prompt)
             passed, sensitive = self._check_sensitive(prompt_to_check, event)
             if not passed:
                 tip = "、".join(sensitive[:5])  # 最多显示5个
@@ -1649,8 +1288,7 @@ class ComfyUIPlugin(Star):
             with open(save_path, 'w', encoding='utf-8') as f:
                 json.dump(json_data, f, indent=2, ensure_ascii=False)
             
-            self._auto_update_schema()
-            
+                
             logger.info(f"[ComfyUI] 管理员 {user_id} 导入工作流: {filename}")
             yield event.plain_result(
                 f"✅ 保存成功！\n"
@@ -1926,7 +1564,7 @@ class ComfyUIPlugin(Star):
                 keyword = tokens[1].strip()
 
             if keyword:
-                normalized_keyword = self._normalize_lora_key(keyword)
+                normalized_keyword = normalize_lora_key(keyword)
                 matched = []
                 for entry in catalog_entries:
                     search_fields = [
@@ -1935,7 +1573,7 @@ class ComfyUIPlugin(Star):
                         entry.get("loader_name", ""),
                         entry.get("model_name", ""),
                     ] + list(entry.get("aliases", []))
-                    if any(normalized_keyword in self._normalize_lora_key(value) for value in search_fields if value):
+                    if any(normalized_keyword in normalize_lora_key(value) for value in search_fields if value):
                         matched.append(entry)
             else:
                 matched = catalog_entries
@@ -1975,9 +1613,9 @@ class ComfyUIPlugin(Star):
             parse_text = arg_text.split(None, 1)[1].strip()
 
         if "<lora" in parse_text.lower():
-            _, parsed = self._extract_lora_control_tags(parse_text)
+            _, parsed = extract_lora_control_tags(parse_text)
         else:
-            parsed = self._parse_lora_pick_string(parse_text)
+            parsed = parse_lora_picks(parse_text)
 
         if not parsed:
             yield event.plain_result(
@@ -2198,8 +1836,8 @@ class ComfyUIPlugin(Star):
             return
     
         full_text = resp.completion_text
-        cleaned_text = self._strip_comfy_control_tags(full_text, remove_think=True)
-        cleaned_entries = self._extract_usable_prompt_entries(full_text)
+        cleaned_text = strip_control_tags(full_text, remove_think=True)
+        cleaned_entries = extract_usable_prompt_entries(full_text)
         supplemented_entries = await self._generate_force_draw_prompt_entries(
             event,
             cleaned_text,
@@ -2213,85 +1851,24 @@ class ComfyUIPlugin(Star):
         # 清理文本供其他插件使用（移除 <pic>、<think>、<ctx> 标签）
         event.set_extra("comfy_cleaned_text", cleaned_text)
 
-        cleaned_prompts = [item["prompt"] for item in cleaned_entries]
-        use_multi_image_mode = self._should_use_multi_image_mode(len(cleaned_entries))
-    
-        # 单图模式
-        if not use_multi_image_mode:
+        if not self._should_use_multi_image_mode(len(cleaned_entries)):
             event._comfy_extracted_prompt = cleaned_entries[0]["prompt"]
             event._comfy_extracted_loras = cleaned_entries[0].get("lora_selections", [])
-            logger.info(f"[ComfyUI] 📝 检测到单图模式: {cleaned_prompts[0][:50]}...")
-            # 丢弃绘图提示词，避免污染历史记录上下文
+            logger.info(f"[ComfyUI] 检测到单图模式: {cleaned_entries[0]['prompt'][:50]}...")
             if self.discard_prompt_from_history:
                 resp.completion_text = cleaned_text
                 resp.result_chain = MessageChain().message(cleaned_text)
-                logger.info("[ComfyUI] 🗑️ 已从历史记录中移除绘图提示词")
+                logger.info("[ComfyUI] 已从历史记录中移除绘图提示词")
             return
-    
-        # 多图模式
-        if use_multi_image_mode:
-            pic_matches = self._find_pic_prompt_matches(full_text)
-            parts = []
-            cursor = 0
-            for item in pic_matches:
-                parts.append(full_text[cursor:item["start"]])
-                cursor = item["end"]
-            parts.append(full_text[cursor:])
-        
-            # 检测原始文本中的 <render> 标签信息，用于补全被切割的段落
-            render_match = re.search(r'<render\b[^>]*>', full_text)
-            render_open_tag = render_match.group(0) if render_match else None
-            render_close_tag = "</render>" if render_open_tag else None
 
-            segments = []
-            prompt_idx = 0
-        
-            for i, text in enumerate(parts):
-                text = re.sub(r'<think>.*?</think>', '', text, flags=re.DOTALL)
-                text = re.sub(r'</?ctx>', '', text)
-                text = re.sub(r'</pic>', '', text, flags=re.IGNORECASE)
-                text = re.sub(r'<lora\s+picks=".*?"\s*/?>', '', text, flags=re.DOTALL | re.IGNORECASE)
-                text = text.strip()
-                if text:
-                    # 如果原文使用了 <render> 标签，确保每个文本段都有完整的标签对
-                    if render_open_tag:
-                        has_open = bool(re.search(r'<render\b', text))
-                        has_close = '</render>' in text
-                        if has_open and not has_close:
-                            text = text + render_close_tag
-                        elif has_close and not has_open:
-                            text = render_open_tag + text
-                        elif not has_open and not has_close:
-                            text = render_open_tag + text + render_close_tag
-                    segments.append({"type": "text", "content": text})
-                if prompt_idx < len(cleaned_prompts):
-                    segments.append(
-                        {
-                            "type": "prompt",
-                            "content": cleaned_prompts[prompt_idx],
-                            "lora_selections": cleaned_entries[prompt_idx].get("lora_selections", []),
-                        }
-                    )
-                    prompt_idx += 1
-
-            while prompt_idx < len(cleaned_prompts):
-                segments.append(
-                    {
-                        "type": "prompt",
-                        "content": cleaned_prompts[prompt_idx],
-                        "lora_selections": cleaned_entries[prompt_idx].get("lora_selections", []),
-                    }
-                )
-                prompt_idx += 1
-        
-            if segments:
-                event._comfy_segments = segments
-                logger.info(f"[ComfyUI] 📝 检测到多图模式，共 {len(cleaned_prompts)} 张图片")
-                # 丢弃绘图提示词，避免污染历史记录上下文
-                if self.discard_prompt_from_history:
-                    resp.completion_text = cleaned_text
-                    resp.result_chain = MessageChain().message(cleaned_text)
-                    logger.info("[ComfyUI] 🗑️ 已从历史记录中移除绘图提示词（多图模式）")            
+        segments = build_segments(full_text, cleaned_entries)
+        if segments:
+            event._comfy_segments = segments
+            logger.info(f"[ComfyUI] 检测到多图模式，共 {len(cleaned_entries)} 张图片")
+            if self.discard_prompt_from_history:
+                resp.completion_text = cleaned_text
+                resp.result_chain = MessageChain().message(cleaned_text)
+                logger.info("[ComfyUI] 已从历史记录中移除绘图提示词（多图模式）")
 
     # ====== 自动绘图逻辑保持不变 ======
     @filter.on_decorating_result(priority=99)
@@ -2551,7 +2128,7 @@ class ComfyUIPlugin(Star):
                 if entry.get("role") != "assistant":
                     continue
                 content = str(entry.get("content", ""))
-                cleaned = self._strip_comfy_control_tags(content, remove_think=True)
+                cleaned = strip_control_tags(content, remove_think=True)
                 if cleaned != content.strip():
                     entry["content"] = cleaned
                     modified = True
@@ -2709,7 +2286,7 @@ class ComfyUIPlugin(Star):
         
         try:
             # 敏感词检查
-            prompt, lora_selections = self._extract_lora_control_tags(prompt)
+            prompt, lora_selections = extract_lora_control_tags(prompt)
             passed, sensitive = self._check_sensitive(prompt, event)
             if not passed:
                 tip = "、".join(sensitive[:5])
