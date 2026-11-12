@@ -1,4 +1,3 @@
-import asyncio
 import json
 import os
 import random
@@ -6,17 +5,10 @@ import re
 import time
 from pathlib import Path
 
-import aiohttp
-import requests
-
 from astrbot.api import logger
 
+from .comfy_runner.comfy import ComfyClient, ComfyError
 
-DEFAULT_CONNECT_TIMEOUT = 10
-DEFAULT_READ_TIMEOUT = 180
-DEFAULT_REQUEST_TIMEOUT = (DEFAULT_CONNECT_TIMEOUT, DEFAULT_READ_TIMEOUT)
-DEFAULT_RETRY_TOTAL = 3
-DEFAULT_RETRY_BACKOFF = 1.0
 LORA_MANIFEST_SUFFIX = ".lora.json"
 LORA_CONTEXT_CACHE_SECONDS = 60
 LORA_FILE_EXTENSIONS = {
@@ -30,74 +22,6 @@ LORA_FILE_EXTENSIONS = {
     ".sft",
 }
 LORA_CLEAR_DEFAULTS_TOKEN = "!clear_defaults"
-_HTTP_SESSION = None
-
-
-def _normalize_server_address(server_address):
-    server_address = (server_address or "").strip()
-    if not server_address:
-        return server_address
-    if not re.match(r"^[a-zA-Z][a-zA-Z0-9+.-]*://", server_address):
-        server_address = f"http://{server_address}"
-    return server_address.rstrip("/")
-
-
-def _coerce_timeout(value):
-    if value is None or value == "":
-        return DEFAULT_REQUEST_TIMEOUT
-    if isinstance(value, (int, float)):
-        value = max(float(value), 0.1)
-        return (min(value, DEFAULT_CONNECT_TIMEOUT), value)
-    if isinstance(value, (list, tuple)) and len(value) == 2:
-        connect_timeout = max(float(value[0]), 0.1)
-        read_timeout = max(float(value[1]), 0.1)
-        return (connect_timeout, read_timeout)
-    return DEFAULT_REQUEST_TIMEOUT
-
-
-def _build_http_session():
-    global _HTTP_SESSION
-    if _HTTP_SESSION is not None:
-        return _HTTP_SESSION
-    session = requests.Session()
-    try:
-        from requests.adapters import HTTPAdapter
-        try:
-            from urllib3.util.retry import Retry
-        except Exception:
-            from requests.packages.urllib3.util.retry import Retry
-        retry = Retry(
-            total=DEFAULT_RETRY_TOTAL,
-            connect=DEFAULT_RETRY_TOTAL,
-            read=DEFAULT_RETRY_TOTAL,
-            status=DEFAULT_RETRY_TOTAL,
-            backoff_factor=DEFAULT_RETRY_BACKOFF,
-            status_forcelist=(408, 409, 425, 429, 500, 502, 503, 504),
-            allowed_methods=frozenset(["GET", "POST"]),
-            raise_on_status=False,
-            respect_retry_after_header=True,
-        )
-        adapter = HTTPAdapter(max_retries=retry, pool_connections=10, pool_maxsize=10)
-        session.mount("http://", adapter)
-        session.mount("https://", adapter)
-    except Exception:
-        pass
-    _HTTP_SESSION = session
-    return session
-
-
-def _http_request(method, url, **kwargs):
-    session = _build_http_session()
-    timeout = _coerce_timeout(kwargs.pop("timeout", None))
-    return session.request(method=method, url=url, timeout=timeout, **kwargs)
-
-
-def _http_get(url, **kwargs):
-    return _http_request("GET", url, **kwargs)
-
-
-def _http_post(url, **kwargs):
-    return _http_request("POST", url, **kwargs)
 
 
 class ComfyUI:
@@ -109,26 +33,13 @@ class ComfyUI:
             config: plugin config dict
             data_dir: persistent plugin data directory
         """
-        self.server_address = _normalize_server_address(config.get("server_address", "127.0.0.1:8188"))
-        if self.server_address.startswith("http"):
-            self.url = self.server_address
-        elif "." in self.server_address and ":" not in self.server_address:
-            self.url = f"https://{self.server_address}"
-        else:
-            self.url = f"http://{self.server_address}"
+        self.client = ComfyClient(config["server_address"])
 
-        sub_conf = config.get("sub_config", {})
-        self.steps = sub_conf.get("steps", 20)
-        self.width = sub_conf.get("width", 768)
-        self.height = sub_conf.get("height", 1024)
-        self.neg_prompt = sub_conf.get("negative_prompt", "")
-
-        wf_conf = config.get("workflow_settings", {})
-        self.wf_filename = wf_conf.get("json_file", "workflow_api.json")
-        self.input_id = str(wf_conf.get("input_node_id", "6"))
-        self.neg_node_id = str(wf_conf.get("neg_node_id", ""))
-        self.output_id = str(wf_conf.get("output_node_id", "9"))
-        self.seed_id = None
+        wf_conf = config["workflow_settings"]
+        self.wf_filename = wf_conf["json_file"]
+        self.input_id = str(wf_conf["input_node_id"])
+        self.neg_node_id = str(wf_conf["neg_node_id"])
+        self.output_id = str(wf_conf["output_node_id"])
 
         llm_conf = config.get("llm_settings", {}) or {}
         lora_conf = llm_conf.get("lora_control", {}) or {}
@@ -1090,22 +1001,6 @@ class ComfyUI:
                 inputs[key] = prompt
                 break
 
-        if self.neg_node_id and self.neg_prompt:
-            neg_node = workflow.get(self.neg_node_id)
-            if neg_node:
-                n_inputs = neg_node.get("inputs", {})
-                n_keys = ["text", "string", "negative", "text_negative", "prompt"]
-                for n_key in n_keys:
-                    if n_key in n_inputs:
-                        existing_neg = str(n_inputs.get(n_key, "")).strip()
-                        config_neg = self.neg_prompt.strip()
-
-                        if existing_neg and config_neg:
-                            n_inputs[n_key] = f"{existing_neg}, {config_neg}"
-                        elif config_neg:
-                            n_inputs[n_key] = config_neg
-                        break
-
         if self.lora_control_enabled and lora_selections:
             applied = self._apply_lora_selections(workflow, lora_selections)
             if applied:
@@ -1238,7 +1133,6 @@ class ComfyUI:
 
     async def generate(self, prompt, lora_selections=None):
         """Generate an image with the current workflow."""
-        client_id = str(random.randint(100000, 999999))
         try:
             workflow = self._load_workflow()
         except Exception as e:
@@ -1252,53 +1146,8 @@ class ComfyUI:
 
         self._inject_params(workflow, prompt, resolved_loras)
 
-        async with aiohttp.ClientSession() as session:
-            payload = {"prompt": workflow, "client_id": client_id}
-            try:
-                async with session.post(f"{self.url}/prompt", json=payload) as resp:
-                    if resp.status != 200:
-                        return None, f"连接 ComfyUI 失败: {resp.status}"
-                    res_json = await resp.json()
-                    prompt_id = res_json.get("prompt_id")
-            except Exception as e:
-                return None, f"请求报错: {str(e)}"
-
-            for _ in range(300):
-                await asyncio.sleep(1)
-                try:
-                    async with session.get(f"{self.url}/history/{prompt_id}") as h_resp:
-                        if h_resp.status != 200:
-                            continue
-                        history = await h_resp.json()
-                except Exception:
-                    continue
-
-                if prompt_id in history:
-                    outputs = history[prompt_id].get("outputs", {})
-                    img_info = None
-
-                    if self.output_id and self.output_id in outputs:
-                        imgs = outputs[self.output_id].get("images", [])
-                        if imgs:
-                            img_info = imgs[0]
-
-                    if not img_info:
-                        for node_out in outputs.values():
-                            if "images" in node_out and node_out["images"]:
-                                img_info = node_out["images"][0]
-                                break
-
-                    if img_info:
-                        fname = img_info["filename"]
-                        sfolder = img_info["subfolder"]
-                        itype = img_info["type"]
-                        img_url = f"{self.url}/view?filename={fname}&subfolder={sfolder}&type={itype}"
-
-                        async with session.get(img_url) as img_res:
-                            if img_res.status == 200:
-                                return await img_res.read(), None
-                            return None, "下载图片失败"
-
-                    return None, "工作流执行完成，但未找到输出图片"
-
-            return None, "生成超时"
+        try:
+            image = await self.client.generate(workflow, self.output_id)
+        except ComfyError as exc:
+            return None, str(exc)
+        return image, None
