@@ -29,6 +29,7 @@ Thumbs.db
 desktop.ini
 
 # 插件运行时生成的缓存/数据
+data/
 html_render_cache/
 *.png
 *.gif
@@ -42,5 +43,4 @@ html_render_cache/
 .env
 .env.*
 # Git 提交脚本（不需要提交）
-git提交.py
 git提交.py

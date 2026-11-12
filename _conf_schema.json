@@ -13,23 +13,9 @@
       "json_file": {
         "description": "工作流文件名 (自动扫描 workflow 目录)",
         "type": "string",
-        "default": "workflow.json",
-        "options": [
-          "Pornmaster_z-image-t2i_2025-11-29(3).json",
-          "workflow_api.json",
-          "爱丽丝-111.json",
-          "爱丽丝-最新-cunny-L.json",
-          "爱丽丝-最新-cunny.json",
-          "爱丽丝-最新.json"
-        ],
-        "enum": [
-          "Pornmaster_z-image-t2i_2025-11-29(3).json",
-          "workflow_api.json",
-          "爱丽丝-111.json",
-          "爱丽丝-最新-cunny-L.json",
-          "爱丽丝-最新-cunny.json",
-          "爱丽丝-最新.json"
-        ]
+        "default": "",
+        "options": [],
+        "enum": []
       },
       "input_node_id": {
         "title": "正面提示词节点 ID",

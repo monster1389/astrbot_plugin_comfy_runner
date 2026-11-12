@@ -9,19 +9,11 @@ import asyncio
 import copy
 from pathlib import Path
 from astrbot.api.event import filter, AstrMessageEvent, MessageEventResult
-from astrbot.api.star import Context, Star, register
+from astrbot.api.star import Context, Star, StarTools
 from astrbot.api.message_components import *
 from astrbot.api import llm_tool, logger
 from astrbot.api.provider import LLMResponse
 from astrbot.core.message.message_event_result import MessageChain
-# 尝试导入 StarTools（兼容不同版本）
-try:
-    from astrbot.api.star import StarTools
-    HAS_STAR_TOOLS = True
-except ImportError:
-    HAS_STAR_TOOLS = False
-    logger.warning("[ComfyUI] 无法导入 StarTools，将使用备用目录方案")
-
 # 获取插件目录（用于读取默认文件）
 PLUGIN_DIR = Path(os.path.dirname(os.path.abspath(__file__)))
 class _ComfyImageMarker:
@@ -31,13 +23,6 @@ class _ComfyImageMarker:
         self.index = index
         self.lora_selections = lora_selections or []
 
-@register(
-    "astrbot_plugin_comfyui_pro",  
-    "lumingya",                    
-    "ComfyUI Pro 连接器",           
-    "1.2.0",
-    "https://github.com/lumingya/astrbot_plugin_comfyui_pro" 
-)
 class ComfyUIPlugin(Star):
     _FORCE_DRAW_CONTEXT_LIMIT = 12
     _FORCE_DRAW_MIN_REPLY_LENGTH = 100
@@ -157,29 +142,7 @@ class ComfyUIPlugin(Star):
     # ====== 获取持久化目录 ======
     def _get_persistent_dir(self) -> Path:
         """获取插件的持久化数据目录"""
-        data_path = None
-        
-        if HAS_STAR_TOOLS:
-            try:
-                data_path = StarTools.get_data_dir(self)
-            except Exception:
-                try:
-                    data_path = StarTools.get_data_dir()
-                except Exception:
-                    try:
-                        data_path = StarTools.get_data_dir(self.context)
-                    except Exception:
-                        pass
-        
-        if data_path is None:
-            current = Path.cwd()
-            data_path = current / "data" / "plugin_data" / "astrbot_plugin_comfyui_pro"
-        
-        if not isinstance(data_path, Path):
-            data_path = Path(data_path)
-        
-        data_path.mkdir(parents=True, exist_ok=True)
-        return data_path
+        return StarTools.get_data_dir("astrbot_plugin_comfy_runner")
 
     # ====== 初始化目录结构 ======
     def _init_data_directories(self):
@@ -189,22 +152,6 @@ class ComfyUIPlugin(Star):
         
         workflow_dir.mkdir(exist_ok=True)
         output_dir.mkdir(exist_ok=True)
-        
-        # 复制默认工作流
-        plugin_workflow_dir = PLUGIN_DIR / "workflow"
-        copied_count = 0
-        if plugin_workflow_dir.exists():
-            for src_file in plugin_workflow_dir.glob("*.json"):
-                dst_file = workflow_dir / src_file.name
-                if not dst_file.exists():
-                    try:
-                        shutil.copy2(src_file, dst_file)
-                        copied_count += 1
-                    except Exception as e:
-                        logger.error(f"[ComfyUI] 复制工作流失败 {src_file.name}: {e}")
-        
-        if copied_count > 0:
-            logger.info(f"[ComfyUI] 📋 已复制 {copied_count} 个默认工作流")
         
         # 复制默认敏感词文件
         sensitive_dst = self.data_dir / "sensitive_words.json"
@@ -232,9 +179,6 @@ class ComfyUIPlugin(Star):
                 if not self._is_workflow_aux_file(f.name)
             ])
         
-            if not files:
-                files = ["workflow_api.json"]
-
             with open(schema_path, 'r', encoding='utf-8') as f:
                 data = json.load(f)
 
