@@ -32,6 +32,7 @@ from .comfy_runner.prompt import (
     sanitize_context_content,
     strip_control_tags,
 )
+from .comfy_runner.workflow import format_strength
 # 获取插件目录（用于读取默认文件）
 PLUGIN_DIR = Path(os.path.dirname(os.path.abspath(__file__)))
 class _ComfyImageMarker:
@@ -141,7 +142,7 @@ class ComfyUIPlugin(Star):
         self.api = None
         try:
             from .comfyui_api import ComfyUI
-            self.api = ComfyUI(self.config, data_dir=self.data_dir)
+            self.api = ComfyUI(self.cfg)
             logger.info(f"[ComfyUI] ✅ ComfyUI API 初始化成功")
         except Exception as e:
             logger.error(f"[ComfyUI] ❌ ComfyUI API 初始化失败: {e}")
@@ -447,7 +448,7 @@ class ComfyUIPlugin(Star):
 
         if self.lora_control_enabled and getattr(self, "api", None):
             try:
-                lora_appendix = self.api.get_lora_prompt_appendix()
+                lora_appendix = self.api.lora.prompt_appendix()
             except Exception as e:
                 logger.warning(f"[ComfyUI] 获取 LoRA prompt 附录失败: {e}")
                 lora_appendix = ""
@@ -1505,7 +1506,7 @@ class ComfyUIPlugin(Star):
             return
 
         try:
-            context = self.api.get_lora_runtime_context()
+            context = self.api.lora.runtime_context()
         except Exception as e:
             yield event.plain_result(f"❌ 读取 LoRA 上下文失败: {e}")
             return
@@ -1592,8 +1593,8 @@ class ComfyUIPlugin(Star):
             if len(matched) > limit:
                 lines.append(f"仅展示前 {limit} 个结果")
             for entry in matched[:limit]:
-                strength_text = self.api._format_lora_strength(entry.get("default_strength", 1.0))
-                clip_text = self.api._format_lora_strength(
+                strength_text = format_strength(entry.get("default_strength", 1.0))
+                clip_text = format_strength(
                     entry.get("default_clip_strength", entry.get("default_strength", 1.0))
                 )
                 status_text = "默认启用" if entry.get("default_active") else "可选"
@@ -1601,7 +1602,7 @@ class ComfyUIPlugin(Star):
                     f"- {entry.get('display_name')} | {status_text} | 默认强度 {strength_text}/{clip_text}"
                 )
                 lines.append(
-                    f"  触发词: {self._format_lora_trigger_preview(entry, limit=getattr(self.api, 'max_trigger_options_per_lora', 3))}"
+                    f"  触发词: {self._format_lora_trigger_preview(entry, limit=self.api.lora.settings.max_trigger_options_per_lora)}"
                 )
             yield event.plain_result("\n".join(lines))
             return
@@ -1625,8 +1626,8 @@ class ComfyUIPlugin(Star):
             )
             return
 
-        resolved = self.api.resolve_lora_selections(parsed)
-        preview_prompt, injected_hints = self.api._inject_selected_lora_prompt_hints(
+        resolved = self.api.lora.resolve_selections(parsed)
+        preview_prompt, injected_hints = self.api.lora.inject_prompt_hints(
             "1girl, masterpiece", resolved
         )
         clear_defaults = any(item.get("control") == "clear_defaults" for item in parsed)
@@ -1671,8 +1672,8 @@ class ComfyUIPlugin(Star):
                 lines.append("- 本次会清空工作流默认 LoRA")
                 continue
 
-            strength_text = self.api._format_lora_strength(item.get("strength", 1.0))
-            clip_text = self.api._format_lora_strength(item.get("clip_strength", item.get("strength", 1.0)))
+            strength_text = format_strength(item.get("strength", 1.0))
+            clip_text = format_strength(item.get("clip_strength", item.get("strength", 1.0)))
             trigger_indexes = item.get("trigger_indexes", []) or []
             trigger_index_text = "+".join(map(str, trigger_indexes)) if trigger_indexes else "无"
             lines.append(
