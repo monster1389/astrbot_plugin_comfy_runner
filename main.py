@@ -23,6 +23,15 @@ from .comfy_runner.access import (
     self_id,
 )
 from .comfy_runner.config import POLICIES, Config
+from .comfy_runner.delivery import (
+    chain_result,
+    forward_components,
+    image_components,
+    send_chain,
+    send_text,
+    text_result,
+)
+from .comfy_runner.draw import Drawer, DrawError
 from .comfy_runner.prompt import (
     build_segments,
     coerce_history,
@@ -39,6 +48,7 @@ from .comfy_runner.prompt import (
     sanitize_context_content,
     strip_control_tags,
 )
+from .comfyui_api import ComfyUI
 from .comfy_runner.workflow import format_strength
 # 获取插件目录（用于读取默认文件）
 PLUGIN_DIR = Path(os.path.dirname(os.path.abspath(__file__)))
@@ -116,15 +126,9 @@ class ComfyUIPlugin(Star):
             f"{'开启' if control.lockdown_command_enabled else '关闭'}"
         )
         
-        # 初始化 ComfyUI API
-        self.api = None
-        try:
-            from .comfyui_api import ComfyUI
-            self.api = ComfyUI(self.cfg)
-            logger.info(f"[ComfyUI] ✅ ComfyUI API 初始化成功")
-        except Exception as e:
-            logger.error(f"[ComfyUI] ❌ ComfyUI API 初始化失败: {e}")
-            logger.error(traceback.format_exc())
+        self.api = ComfyUI(self.cfg)
+        self.drawer = Drawer(self.api, self.access, self.output_dir)
+        logger.info("[ComfyUI] ComfyUI API 初始化成功")
 
     # ====== 获取持久化目录 ======
     def _get_persistent_dir(self) -> Path:
@@ -160,105 +164,6 @@ class ComfyUIPlugin(Star):
         parts = full_message.split(None, 1)
         return parts[1].strip() if len(parts) > 1 else ""
 
-    def _remember_draw_failure(
-        self,
-        event: AstrMessageEvent,
-        reason: str,
-        *,
-        prompt: str = "",
-        source: str = "绘图",
-        append: bool = False,
-    ) -> None:
-        origin = getattr(event, "unified_msg_origin", None)
-        if not origin:
-            return
-
-        reason_text = re.sub(r"\s+", " ", str(reason or "")).strip()
-        if not reason_text:
-            return
-
-        now = time.time()
-        record = {
-            "ts": now,
-            "reason": reason_text,
-            "prompt": compact_prompt(prompt),
-            "source": str(source or "绘图"),
-            "user_id": str(event.get_sender_id()),
-        }
-
-        records = self._recent_draw_failures.get(origin, []) if append else []
-        records = [
-            item
-            for item in records
-            if now - float(item.get("ts", 0)) <= self._DRAW_FAILURE_CONTEXT_TTL_SECONDS
-        ]
-        records.append(record)
-        self._recent_draw_failures[origin] = records[-self._DRAW_FAILURE_CONTEXT_LIMIT :]
-
-        try:
-            event.set_extra("comfy_last_draw_failure", record)
-        except Exception:
-            pass
-
-    def _clear_draw_failures(self, event: AstrMessageEvent) -> None:
-        origin = getattr(event, "unified_msg_origin", None)
-        if origin:
-            self._recent_draw_failures.pop(origin, None)
-
-    def _build_draw_failure_context(self, event: AstrMessageEvent) -> str:
-        origin = getattr(event, "unified_msg_origin", None)
-        if not origin:
-            return ""
-
-        now = time.time()
-        records = [
-            item
-            for item in self._recent_draw_failures.get(origin, [])
-            if now - float(item.get("ts", 0)) <= self._DRAW_FAILURE_CONTEXT_TTL_SECONDS
-        ]
-        if not records:
-            self._recent_draw_failures.pop(origin, None)
-            return ""
-
-        self._recent_draw_failures[origin] = records[-self._DRAW_FAILURE_CONTEXT_LIMIT :]
-        lines = [
-            "<comfyui_draw_status>",
-            "这是 ComfyUI 插件注入的内部状态，不是用户发言。",
-            "最近一次或几次绘图没有生成图片；如果用户追问刚才的画图结果，请明确说明失败，并引用下面的原因。",
-        ]
-
-        for idx, item in enumerate(records[-self._DRAW_FAILURE_CONTEXT_LIMIT :], 1):
-            ts = time.strftime("%H:%M:%S", time.localtime(float(item.get("ts", now))))
-            line = (
-                f"{idx}. 时间: {ts}; 来源: {item.get('source', '绘图')}; "
-                f"用户ID: {item.get('user_id', '')}; 失败原因: {item.get('reason', '')}"
-            )
-            if item.get("prompt"):
-                line += f"; 提示词: {item.get('prompt')}"
-            lines.append(line)
-
-        lines.append("</comfyui_draw_status>")
-        return "<!--EPHEMERAL-->\n" + "\n".join(lines) + "\n<!--/EPHEMERAL-->"
-
-    def _inject_draw_failure_context(self, event: AstrMessageEvent, req) -> None:
-        status_text = self._build_draw_failure_context(event)
-        if not status_text:
-            return
-
-        if hasattr(req, "add_user_text"):
-            try:
-                req.add_user_text(
-                    status_text,
-                    slot="comfyui_draw_status",
-                    after="system_reminder",
-                )
-            except Exception:
-                req.add_user_text(status_text, slot="comfyui_draw_status")
-        else:
-            current_prompt = getattr(req, "system_prompt", "") or ""
-            req.system_prompt = f"{current_prompt}\n\n{status_text}".strip()
-
-        logger.info("[ComfyUI] 已向本轮 LLM 请求注入最近绘图失败状态")
 
     @filter.on_llm_request(priority=100)
     async def inject_system_prompt(self, event: AstrMessageEvent, req):
@@ -278,7 +183,7 @@ class ComfyUIPlugin(Star):
             logger.error(f"[ComfyUI] 注入提示词异常: {e}")
 
         try:
-            self._inject_draw_failure_context(event, req)
+            self.drawer.failures.inject(event, req)
         except Exception as e:
             logger.error(f"[ComfyUI] 注入绘图失败状态异常: {e}")
 
@@ -592,63 +497,26 @@ class ComfyUIPlugin(Star):
     # ====== 核心绘图逻辑 ======
     async def _handle_paint_logic(self, event: AstrMessageEvent, direct_send: bool):
         """处理画图的核心逻辑"""
-        # 权限检查
-        allowed, reason = self.access.check_access(event)
-        if not allowed:
-            self._remember_draw_failure(
-                event,
-                reason,
-                prompt=self._extract_command_prompt(event),
-                source="用户指令",
-            )
-            yield event.plain_result(reason)
+        prompt = self._extract_command_prompt(event)
+        if not prompt:
+            message = "❌ 请输入提示词，例如：/画图 1girl, smile"
+            self.drawer.failures.remember(event, message, source="用户指令")
+            yield text_result(event, message)
             return
-        
+
+        prompt, lora_selections = extract_lora_control_tags(prompt)
         try:
-            full_message = event.message_str.strip()
-            parts = full_message.split(' ', 1)
-            prompt = parts[1].strip() if len(parts) > 1 else ""
+            path = await self.drawer.draw(event, prompt, lora_selections, "用户指令")
+        except DrawError as exc:
+            yield text_result(event, str(exc))
+            return
 
-            if not prompt:
-                message = "❌ 请输入提示词，例如：/画图 1girl, smile"
-                self._remember_draw_failure(event, message, source="用户指令")
-                yield event.plain_result(message)
-                return
+        yield chain_result(event, self._image_chain(event, path, direct_send))
 
-            # 敏感词检查
-            prompt_to_check, _ = extract_lora_control_tags(prompt)
-            passed, sensitive = self.access.check_sensitive(prompt_to_check, event)
-            if not passed:
-                tip = "、".join(sensitive[:5])  # 最多显示5个
-                extra = f"等 {len(sensitive)} 个" if len(sensitive) > 5 else ""
-                message = f"🚫 检测到敏感词：{tip}{extra}，无法生成图片"
-                self._remember_draw_failure(
-                    event,
-                    message,
-                    prompt=prompt,
-                    source="用户指令",
-                )
-                yield event.plain_result(message)
-                return
-
-            event.set_extra("comfy_draw_source", "用户指令")
-            async for result in self.comfyui_txt2img(event, prompt=prompt, direct_send=direct_send):
-                if isinstance(result, str):
-                    yield event.plain_result(result)
-                else:
-                    yield result
-                
-        except Exception as e:
-            logger.error(f"[ComfyUI] 绘图异常: {e}")
-            logger.error(traceback.format_exc())
-            message = f"❌ 执行出错：{str(e)[:50]}"
-            self._remember_draw_failure(
-                event,
-                message,
-                prompt=self._extract_command_prompt(event),
-                source="用户指令",
-            )
-            yield event.plain_result(message)
+    def _image_chain(self, event: AstrMessageEvent, path: Path, direct_send: bool) -> list:
+        if direct_send:
+            return image_components(path)
+        return forward_components(path, self_id(event) or "0")
     # ===== 探针：测试 event.send() 是否触发 on_decorating_result =====
     @filter.command("comfy_probe_send")
     async def cmd_probe_send(self, event: AstrMessageEvent):
@@ -1678,169 +1546,64 @@ class ComfyUIPlugin(Star):
                 logger.info("[ComfyUI] 已从历史记录中移除绘图提示词（多图模式）")
 
     # ====== 自动绘图逻辑保持不变 ======
-    @filter.on_decorating_result(priority=99)
     async def _auto_paint_from_llm(self, event: AstrMessageEvent):
         """自动绘图 - 阶段1：构建 chain（多图）或启动异步任务（单图）"""
         if getattr(event, "_comfy_auto_painted", False):
             return
 
-        # 检查是否有多图段落
         segments = getattr(event, "_comfy_segments", None)
+        prompts = [
+            item.get("content", "")
+            for item in segments or []
+            if item.get("type") == "prompt"
+        ]
 
-        # === 多图分段模式：构建带标记的 chain，交给 HtmlRender 渲染后由 priority=10 发送 ===
-        if segments and self._should_use_multi_image_mode(
-            sum(1 for item in segments if item.get("type") == "prompt"),
-        ):
+        if segments and self._should_use_multi_image_mode(len(prompts)):
             event._comfy_auto_painted = True
-
-            # 权限检查
-            allowed, reason = self.access.check_access(event)
-            if not allowed:
-                logger.warning(f"[ComfyUI] 多图请求被拒绝: {reason}")
-                self._remember_draw_failure(
-                    event,
-                    reason,
-                    prompt=[
-                        item.get("content", "")
-                        for item in segments
-                        if item.get("type") == "prompt"
-                    ],
-                    source="LLM 自动多图",
-                )
-                try:
-                    await event.send(event.plain_result(reason))
-                except Exception as e:
-                    logger.error(f"[ComfyUI] 发送权限拒绝提示失败: {e}")
+            try:
+                self.drawer.ensure_allowed(event, prompts, "LLM 自动多图")
+            except DrawError as exc:
+                logger.warning(f"[ComfyUI] 多图请求被拒绝: {exc}")
+                await send_text(event, str(exc))
                 return
 
-            # 冷却检查
-            ok, remain = self.access.check_cooldown(event)
-            if not ok:
-                logger.info(f"[ComfyUI] 用户 {event.get_sender_id()} 冷却中")
-                message = f"⏱️ 冷却中，请在 {remain} 秒后重试"
-                self._remember_draw_failure(
-                    event,
-                    message,
-                    prompt=[
-                        item.get("content", "")
-                        for item in segments
-                        if item.get("type") == "prompt"
-                    ],
-                    source="LLM 自动多图",
-                )
-                try:
-                    await event.send(event.plain_result(message))
-                except Exception as e:
-                    logger.error(f"[ComfyUI] 发送冷却提示失败: {e}")
-                return
-
-            # 敏感词预检所有 prompt
-            for s in segments:
-                if s["type"] == "prompt":
-                    passed, sensitive = self.access.check_sensitive(s["content"], event)
-                    if not passed:
-                        tip = "、".join(sensitive[:3])
-                        logger.warning(f"[ComfyUI] 多图模式触发敏感词: {tip}")
-                        message = f"🚫 检测到敏感词：{tip}，无法生成图片"
-                        self._remember_draw_failure(
-                            event,
-                            message,
-                            prompt=s["content"],
-                            source="LLM 自动多图",
-                        )
-                        try:
-                            await event.send(event.plain_result(message))
-                        except Exception as e:
-                            logger.error(f"[ComfyUI] 发送敏感词提示失败: {e}")
-                        return
-
-            # 构建新的 chain：文字段 + 图片标记交替
             result = event.get_result()
             if not result:
                 return
 
             new_chain = []
-            img_idx = 0
+            image_index = 0
             for segment in segments:
                 if segment["type"] == "text":
                     new_chain.append(Plain(segment["content"]))
                 elif segment["type"] == "prompt":
-                    img_idx += 1
+                    image_index += 1
                     new_chain.append(
                         _ComfyImageMarker(
                             segment["content"],
-                            img_idx,
+                            image_index,
                             segment.get("lora_selections", []),
                         )
                     )
 
             result.chain = new_chain
             event.set_extra("comfy_multi_image_mode", True)
-            event.set_extra("comfy_multi_prompt_count", img_idx)
-            logger.info(f"[ComfyUI] 📝 多图 chain 已构建: {len(new_chain)} 个元素, {img_idx} 张图片待生成")
-            # → HtmlRender(priority=40) 渲染文字 → _send_multi_image_results(priority=10) 分组发送
+            event.set_extra("comfy_multi_prompt_count", image_index)
+            logger.info(f"[ComfyUI] 多图 chain 已构建: {len(new_chain)} 个元素, {image_index} 张图片待生成")
             return
 
-        # === 单图模式：文字先发，图片异步后发 ===
         prompt = getattr(event, "_comfy_extracted_prompt", None)
         if not prompt:
             return
 
         event._comfy_auto_painted = True
-
-        # 权限检查
-        allowed, reason = self.access.check_access(event)
-        if not allowed:
-            logger.warning(f"[ComfyUI] 单图请求被拒绝: {reason}")
-            self._remember_draw_failure(
-                event,
-                reason,
-                prompt=prompt,
-                source="LLM 自动绘图",
-            )
-            try:
-                await event.send(event.plain_result(reason))
-            except Exception as e:
-                logger.error(f"[ComfyUI] 发送权限拒绝提示失败: {e}")
+        try:
+            self.drawer.ensure_allowed(event, [prompt], "LLM 自动绘图")
+        except DrawError as exc:
+            logger.warning(f"[ComfyUI] 单图请求被拒绝: {exc}")
+            await send_text(event, str(exc))
             return
 
-        # 敏感词检查
-        passed, sensitive = self.access.check_sensitive(prompt, event)
-        if not passed:
-            tip = "、".join(sensitive[:5])
-            logger.warning(f"[ComfyUI] 用户 {event.get_sender_id()} 触发敏感词: {tip}")
-            message = f"🚫 检测到敏感词：{tip}，无法生成图片"
-            self._remember_draw_failure(
-                event,
-                message,
-                prompt=prompt,
-                source="LLM 自动绘图",
-            )
-            try:
-                await event.send(event.plain_result(message))
-            except Exception as e:
-                logger.error(f"[ComfyUI] 发送敏感词提示失败: {e}")
-            return
-
-        # 冷却检查
-        ok, remain = self.access.check_cooldown(event)
-        if not ok:
-            logger.info(f"[ComfyUI] 用户 {event.get_sender_id()} 冷却中，图片跳过")
-            message = f"⏱️ 冷却中，请在 {remain} 秒后重试"
-            self._remember_draw_failure(
-                event,
-                message,
-                prompt=prompt,
-                source="LLM 自动绘图",
-            )
-            try:
-                await event.send(event.plain_result(message))
-            except Exception as e:
-                logger.error(f"[ComfyUI] 发送冷却提示失败: {e}")
-            return
-
-        # 不修改 result.chain → 文字由框架/HtmlRender 正常发送
-        # 图片异步生成后单独发送
         asyncio.create_task(
             self._send_image_async(
                 event,
@@ -1852,56 +1615,13 @@ class ComfyUIPlugin(Star):
     async def _send_image_async(self, event: AstrMessageEvent, prompt: str, lora_selections=None):
         """异步生成并发送图片（不阻塞文字消息发送）"""
         try:
-            if not getattr(self, 'api', None):
-                message = "❌ ComfyUI API 未初始化，无法生成图片"
-                logger.error(f"[ComfyUI] {message}")
-                self._remember_draw_failure(
-                    event,
-                    message,
-                    prompt=prompt,
-                    source="LLM 自动绘图",
-                )
-                return
+            path = await self.drawer.draw(event, prompt, lora_selections, "LLM 自动绘图")
+        except DrawError as exc:
+            await send_text(event, str(exc))
+            return
 
-            logger.info(f"[ComfyUI] 🎨 异步生成开始 | Prompt: {prompt[:50]}...")
-            img_data, error_msg = await self.api.generate(prompt, lora_selections=lora_selections)
-
-            if not img_data:
-                message = f"❌ 图片生成失败：{error_msg}"
-                logger.error(f"[ComfyUI] 异步生成失败: {error_msg}")
-                self._remember_draw_failure(
-                    event,
-                    message,
-                    prompt=prompt,
-                    source="LLM 自动绘图",
-                )
-                try:
-                    await event.send(event.plain_result(message))
-                except Exception as e:
-                    logger.error(f"[ComfyUI] 发送失败消息异常: {e}")
-                return
-
-            img_filename = f"{uuid.uuid4()}.png"
-            img_path = self.output_dir / img_filename
-            with open(img_path, 'wb') as fp:
-                fp.write(img_data)
-
-            logger.info(f"[ComfyUI] ✅ 异步图片已保存: {img_filename}")
-
-            image_component = Image.fromFileSystem(str(img_path))
-            await event.send(event.chain_result([image_component]))
-            self._clear_draw_failures(event)
-            logger.info(f"[ComfyUI] 📤 异步图片已发送: {img_filename}")
-
-        except Exception as e:
-            logger.error(f"[ComfyUI] 异步绘图异常: {e}")
-            logger.error(traceback.format_exc())
-            self._remember_draw_failure(
-                event,
-                f"❌ 异步绘图异常：{str(e)[:50]}",
-                prompt=prompt,
-                source="LLM 自动绘图",
-            )
+        await send_chain(event, image_components(path))
+        logger.info(f"[ComfyUI] 异步图片已发送: {path.name}")
     @filter.on_decorating_result(priority=5)
     async def _cleanup_history_prompts(self, event: AstrMessageEvent):
         """在所有处理完成后，直接从对话历史中移除绘图提示词"""
@@ -1950,7 +1670,6 @@ class ComfyUIPlugin(Star):
 
         except Exception as e:
             logger.error(f"[ComfyUI] 清理历史记录失败: {e}")            
-    @filter.on_decorating_result(priority=10)
     async def _send_multi_image_results(self, event: AstrMessageEvent):
         """多图模式 - 阶段2：在 HtmlRender 渲染完成后，分组发送"""
         if not event.get_extra("comfy_multi_image_mode"):
@@ -1961,112 +1680,65 @@ class ComfyUIPlugin(Star):
             return
 
         prompt_count = event.get_extra("comfy_multi_prompt_count") or 0
-        logger.info(f"[ComfyUI] 📤 多图发送阶段开始，chain 共 {len(result.chain)} 个元素")
+        logger.info(f"[ComfyUI] 多图发送阶段开始，chain 共 {len(result.chain)} 个元素")
 
-        # 按 _ComfyImageMarker 分组：每组 = [渲染后的元素...] + 一个标记
         groups = []
         current_group = []
-
         for item in result.chain:
             if isinstance(item, _ComfyImageMarker):
                 groups.append({"items": current_group, "marker": item})
                 current_group = []
             else:
                 current_group.append(item)
-
-        # 最后一组（标记之后可能还有文字）
         if current_group:
             groups.append({"items": current_group, "marker": None})
 
-        self._clear_draw_failures(event)
+        self.drawer.failures.clear(event)
 
-        # 逐组发送
         for group in groups:
             items = group["items"]
             marker = group["marker"]
 
-            # 发送本组的渲染内容（文字/图片）
-            if items:
-                # 过滤空 Plain
-                filtered = [it for it in items if not (isinstance(it, Plain) and not it.text.strip())]
-                if filtered:
-                    try:
-                        await event.send(event.chain_result(filtered))
-                        logger.info(f"[ComfyUI] 📤 文字段已发送 ({len(filtered)} 个元素)")
-                    except Exception as e:
-                        logger.error(f"[ComfyUI] 发送文字段失败: {e}")
+            filtered = [
+                item for item in items
+                if not (isinstance(item, Plain) and not item.text.strip())
+            ]
+            if filtered:
+                await send_chain(event, filtered)
+                logger.info(f"[ComfyUI] 文字段已发送 ({len(filtered)} 个元素)")
 
-            # 生成并发送图片
-            if marker:
-                try:
-                    logger.info(f"[ComfyUI] 🎨 [{marker.index}/{prompt_count}] 开始生成: {marker.prompt[:50]}...")
-                    img_data, error_msg = await self.api.generate(
-                        marker.prompt,
-                        lora_selections=marker.lora_selections,
-                    )
+            if not marker:
+                continue
 
-                    if not img_data:
-                        message = f"❌ [图片{marker.index}] 生成失败：{error_msg}"
-                        logger.error(f"[ComfyUI] 图片 {marker.index} 生成失败: {error_msg}")
-                        self._remember_draw_failure(
-                            event,
-                            message,
-                            prompt=marker.prompt,
-                            source=f"LLM 多图 图片{marker.index}",
-                            append=True,
-                        )
-                        try:
-                            await event.send(event.plain_result(message))
-                        except:
-                            pass
-                        continue
+            try:
+                path = await self.drawer.render(
+                    event,
+                    marker.prompt,
+                    marker.lora_selections,
+                    f"LLM 多图 图片{marker.index}",
+                    index=marker.index,
+                    append=True,
+                )
+            except DrawError as exc:
+                await send_text(event, str(exc))
+                continue
 
-                    img_filename = f"{uuid.uuid4()}.png"
-                    img_path = self.output_dir / img_filename
-                    with open(img_path, 'wb') as fp:
-                        fp.write(img_data)
+            await send_chain(event, image_components(path))
+            logger.info(f"[ComfyUI] [{marker.index}/{prompt_count}] 图片已发送: {path.name}")
 
-                    await event.send(event.chain_result([Image.fromFileSystem(str(img_path))]))
-                    logger.info(f"[ComfyUI] ✅ [{marker.index}/{prompt_count}] 图片已发送: {img_filename}")
-
-                except Exception as e:
-                    logger.error(f"[ComfyUI] 图片 {marker.index} 处理异常: {e}")
-                    logger.error(traceback.format_exc())
-                    self._remember_draw_failure(
-                        event,
-                        f"❌ [图片{marker.index}] 处理异常：{str(e)[:50]}",
-                        prompt=marker.prompt,
-                        source=f"LLM 多图 图片{marker.index}",
-                        append=True,
-                    )
-
-        # 清空 chain，防止框架重复发送
         result.chain.clear()
-        logger.info(f"[ComfyUI] ✅ 多图模式发送完成")
+        logger.info("[ComfyUI] 多图模式发送完成")
     @llm_tool(name="comfyui_txt2img")
-    async def comfyui_txt2img(self, event: AstrMessageEvent, ctx: Context = None, prompt: str = None, text: str = None, img_width: int = None, img_height: int = None, direct_send: bool = False) -> MessageEventResult:
+    async def comfyui_txt2img(self, event: AstrMessageEvent, prompt: str = None, text: str = None, direct_send: bool = False) -> MessageEventResult:
         """ComfyUI 文生图工具"""
         draw_source = event.get_extra("comfy_draw_source") or "LLM 工具"
-        
-        # 权限检查
-        allowed, reason = self.access.check_access(event)
-        if not allowed:
-            self._remember_draw_failure(
-                event,
-                reason,
-                prompt=prompt or text or self._extract_command_prompt(event),
-                source=draw_source,
-            )
-            yield reason  # 以字符串形式返回，让 AI 能在 tool 上下文中看到拒绝原因
-            return
 
-        # 参数处理
         if not prompt and text:
             prompt = text
 
         if not prompt:
             message = "❌ 未提供 prompt，请重试"
-            self._remember_draw_failure(event, message, source=draw_source)
+            self.drawer.failures.remember(event, message, source=draw_source)
             yield message
             return
 
@@ -2075,100 +1747,15 @@ class ComfyUIPlugin(Star):
             prompt = re.sub(r'```math\s*At:\d+```\s*', '', raw).strip()
             if not prompt:
                 message = "❌ 请输入提示词"
-                self._remember_draw_failure(event, message, source=draw_source)
+                self.drawer.failures.remember(event, message, source=draw_source)
                 yield message
                 return
 
-        # API 检查
-        if not getattr(self, 'api', None):
-            message = "❌ ComfyUI 服务未连接，请检查配置"
-            self._remember_draw_failure(
-                event,
-                message,
-                prompt=prompt,
-                source=draw_source,
-            )
-            yield message
-            return
-        
+        prompt, lora_selections = extract_lora_control_tags(prompt)
         try:
-            # 敏感词检查
-            prompt, lora_selections = extract_lora_control_tags(prompt)
-            passed, sensitive = self.access.check_sensitive(prompt, event)
-            if not passed:
-                tip = "、".join(sensitive[:5])
-                logger.warning(f"[ComfyUI] 用户 {event.get_sender_id()} 触发敏感词: {tip}")
-                message = f"🚫 检测到敏感词：{tip}，无法生成"
-                self._remember_draw_failure(
-                    event,
-                    message,
-                    prompt=prompt,
-                    source=draw_source,
-                )
-                yield message
-                return
+            path = await self.drawer.draw(event, prompt, lora_selections, draw_source)
+        except DrawError as exc:
+            yield str(exc)
+            return
 
-            # 冷却检查
-            ok, remain = self.access.check_cooldown(event)
-            if not ok:
-                message = f"⏱️ 冷却中，请在 {remain} 秒后重试"
-                self._remember_draw_failure(
-                    event,
-                    message,
-                    prompt=prompt,
-                    source=draw_source,
-                )
-                yield message
-                return
-
-            logger.info(f"[ComfyUI] 🎨 开始生成 | 用户: {event.get_sender_id()} | Prompt: {prompt[:50]}...")
-
-            # 调用 API
-            img_data, error_msg = await self.api.generate(prompt, lora_selections=lora_selections)
-
-            if not img_data:
-                logger.error(f"[ComfyUI] 生成失败: {error_msg}")
-                message = f"❌ 生成失败：{error_msg}"
-                self._remember_draw_failure(
-                    event,
-                    message,
-                    prompt=prompt,
-                    source=draw_source,
-                )
-                yield message
-                return
-
-            # 保存图片
-            img_filename = f"{uuid.uuid4()}.png"
-            img_path = self.output_dir / img_filename
-            with open(img_path, 'wb') as fp:
-                fp.write(img_data)
-            
-            logger.info(f"[ComfyUI] ✅ 图片已保存: {img_filename}")
-            self._clear_draw_failures(event)
-
-            # 发送结果
-            if direct_send:
-                image_component = Image.fromFileSystem(str(img_path))
-                yield event.chain_result([image_component])
-            else:
-                sender_id = self_id(event) or "0"
-                image_component = Image.fromFileSystem(str(img_path))
-                forward_node = Node(
-                    user_id=int(sender_id),
-                    nickname="ComfyUI",
-                    content=[image_component]
-                )
-                yield event.chain_result([forward_node])
-
-        except Exception as e:
-            logger.error(f"[ComfyUI] 执行异常: {e}")
-            logger.error(traceback.format_exc())
-            message = f"❌ 内部错误: {str(e)[:50]}"
-            self._remember_draw_failure(
-                event,
-                message,
-                prompt=prompt,
-                source=draw_source,
-            )
-            yield message
+        yield chain_result(event, self._image_chain(event, path, direct_send))
