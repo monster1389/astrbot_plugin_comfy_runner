@@ -8,8 +8,16 @@ from pathlib import Path
 from astrbot.api import logger
 
 from .comfy_runner.comfy import ComfyClient, ComfyError
+from .comfy_runner.workflow import (
+    Workflow,
+    apply_lora_selections,
+    apply_steps_override,
+    find_lora_loader_nodes,
+    inject_prompt,
+    inject_seeds,
+    load_steps_override,
+)
 
-LORA_MANIFEST_SUFFIX = ".lora.json"
 LORA_CONTEXT_CACHE_SECONDS = 60
 LORA_FILE_EXTENSIONS = {
     ".safetensors",
@@ -36,10 +44,6 @@ class ComfyUI:
         self.client = ComfyClient(config["server_address"])
 
         wf_conf = config["workflow_settings"]
-        self.wf_filename = wf_conf["json_file"]
-        self.input_id = str(wf_conf["input_node_id"])
-        self.neg_node_id = str(wf_conf["neg_node_id"])
-        self.output_id = str(wf_conf["output_node_id"])
 
         llm_conf = config.get("llm_settings", {}) or {}
         lora_conf = llm_conf.get("lora_control", {}) or {}
@@ -73,8 +77,13 @@ class ComfyUI:
             self.data_dir = Path(os.path.dirname(os.path.abspath(__file__)))
             logger.warning("[ComfyUI API] data_dir missing, fallback to plugin dir")
 
-        self.workflow_dir = self.data_dir / "workflow"
-        self.workflow_path = self.workflow_dir / self.wf_filename
+        self.workflow = Workflow(
+            directory=self.data_dir / "workflow",
+            filename=wf_conf["json_file"],
+            input_node_id=str(wf_conf["input_node_id"]),
+            neg_node_id=str(wf_conf["neg_node_id"]),
+            output_node_id=str(wf_conf["output_node_id"]),
+        )
         self._lora_context_cache = None
         self._lora_context_cache_key = None
         self._lora_context_cache_at = 0.0
@@ -83,7 +92,7 @@ class ComfyUI:
         self._lora_scan_cache_at = 0.0
 
         logger.info(
-            f"[ComfyUI API] loaded | workflow_dir: {self.workflow_dir} | workflow: {self.wf_filename}"
+            f"[ComfyUI API] loaded | workflow_dir: {self.workflow.directory} | workflow: {self.workflow.filename}"
         )
         if self.lora_scan_roots:
             logger.info(
@@ -91,29 +100,34 @@ class ComfyUI:
                 ", ".join(str(path) for path in self.lora_scan_roots),
             )
 
-    def reload_config(self, filename: str, input_id: str = None, output_id: str = None, neg_node_id: str = None):
-        """Hot-switch workflow without restarting the plugin."""
-        self.wf_filename = filename
-        self.workflow_path = self.workflow_dir / filename
+    def switch_workflow(
+        self,
+        filename: str,
+        input_id: str = None,
+        output_id: str = None,
+        neg_node_id: str = None,
+    ):
+        """切换当前工作流并可选地覆盖节点绑定。"""
+        exists = self.workflow.switch(
+            filename,
+            input_node_id=input_id,
+            neg_node_id=neg_node_id,
+            output_node_id=output_id,
+        )
         self._clear_lora_caches()
 
-        if input_id:
-            self.input_id = str(input_id)
-        if output_id:
-            self.output_id = str(output_id)
-        if neg_node_id:
-            self.neg_node_id = str(neg_node_id)
-
-        exists = self.workflow_path.exists()
         status = "exists" if exists else "missing"
-
         logger.info(
             f"[ComfyUI] switch workflow -> {filename} [{status}] | "
-            f"Input:{self.input_id} | Neg:{self.neg_node_id} | Output:{self.output_id or 'auto'}"
+            f"Input:{self.workflow.input_node_id} | "
+            f"Neg:{self.workflow.neg_node_id} | "
+            f"Output:{self.workflow.output_node_id or 'auto'}"
         )
         return exists, (
             f"已切换至 {filename}，文件状态：{status}\n"
-            f"当前节点设置: Positive={self.input_id}, Negative={self.neg_node_id}, Output={self.output_id or '自动'}"
+            f"当前节点设置: Positive={self.workflow.input_node_id}, "
+            f"Negative={self.workflow.neg_node_id}, "
+            f"Output={self.workflow.output_node_id or '自动'}"
         )
 
     @staticmethod
@@ -336,33 +350,12 @@ class ComfyUI:
 
         return base
 
-    def _get_lora_manifest_path(self) -> Path:
-        return self.workflow_path.parent / f"{self.workflow_path.stem}{LORA_MANIFEST_SUFFIX}"
-
-    def _find_lora_loader_nodes(self, workflow: dict):
-        nodes = []
-        for node_id, node_data in workflow.items():
-            if not isinstance(node_data, dict):
-                continue
-            inputs = node_data.get("inputs", {})
-            if not isinstance(inputs, dict):
-                continue
-            loras = inputs.get("loras")
-            if not isinstance(loras, dict):
-                continue
-            entries = loras.get("__value__")
-            if not isinstance(entries, list):
-                continue
-            if not any(isinstance(item, dict) and str(item.get("name", "")).strip() for item in entries):
-                continue
-            nodes.append((str(node_id), node_data))
-        return nodes
 
     def _extract_lora_catalog(self, workflow: dict):
         catalog = {}
         loader_node_ids = []
 
-        for node_id, node_data in self._find_lora_loader_nodes(workflow):
+        for node_id, node_data in find_lora_loader_nodes(workflow):
             loader_node_ids.append(node_id)
             entries = node_data.get("inputs", {}).get("loras", {}).get("__value__", [])
             for item in entries:
@@ -393,7 +386,7 @@ class ComfyUI:
         return {"catalog": catalog, "loader_node_ids": loader_node_ids}
 
     def _load_lora_manifest(self) -> dict:
-        path = self._get_lora_manifest_path()
+        path = self.workflow.manifest_path
         if not path.exists():
             return {}
 
@@ -592,7 +585,7 @@ class ComfyUI:
 
     def get_lora_runtime_context(self) -> dict:
         cache_key = (
-            str(self.workflow_path),
+            str(self.workflow.path),
             tuple(str(path) for path in self.lora_scan_roots),
         )
         now = time.monotonic()
@@ -604,14 +597,14 @@ class ComfyUI:
             return self._lora_context_cache
 
         try:
-            workflow = self._load_workflow()
+            workflow = self.workflow.load()
         except Exception as e:
             logger.warning(f"[ComfyUI] failed to read workflow for LoRA context: {e}")
             return {
                 "supported": False,
                 "catalog": {},
                 "loader_node_ids": [],
-                "manifest_path": str(self._get_lora_manifest_path()),
+                "manifest_path": str(self.workflow.manifest_path),
             }
 
         extracted = self._extract_lora_catalog(workflow)
@@ -639,7 +632,7 @@ class ComfyUI:
             "supported": bool(extracted["loader_node_ids"]),
             "catalog": sorted_catalog,
             "loader_node_ids": extracted["loader_node_ids"],
-            "manifest_path": str(self._get_lora_manifest_path()),
+            "manifest_path": str(self.workflow.manifest_path),
             "scan_roots": [str(path) for path in self.lora_scan_roots],
             "default_active_loras": default_active_loras,
         }
@@ -870,271 +863,38 @@ class ComfyUI:
         final_prompt = f"{prefix}, {str(prompt or '').strip()}".strip(", ").strip()
         return final_prompt, injected
 
-    def _rebuild_lora_text(self, items: list, active_only: bool = True) -> str:
-        tokens = []
-        for item in items:
-            if not isinstance(item, dict):
-                continue
-            if active_only and not item.get("active", False):
-                continue
-            name = str(item.get("name", "")).strip()
-            if not name:
-                continue
-
-            strength = self._format_lora_strength(self._coerce_lora_strength(item.get("strength"), 1.0))
-            clip_strength = self._format_lora_strength(
-                self._coerce_lora_strength(item.get("clipStrength"), item.get("strength") or 1.0)
-            )
-            if strength == clip_strength:
-                tokens.append(f"<lora:{name}:{strength}>")
-            else:
-                tokens.append(f"<lora:{name}:{strength}:{clip_strength}>")
-
-        return ", ".join(tokens)
-
-    def _apply_lora_selections(self, workflow: dict, selections: list):
-        if not selections:
-            return []
-
-        loader_nodes = self._find_lora_loader_nodes(workflow)
-        if not loader_nodes:
-            return []
-
-        clear_defaults = any(item.get("control") == "clear_defaults" for item in selections if isinstance(item, dict))
-        effective_selections = [item for item in selections if isinstance(item, dict) and not item.get("control")]
-        selected_lookup = {}
-        for selection in effective_selections:
-            for candidate in (
-                selection.get("name"),
-                selection.get("workflow_name"),
-                selection.get("loader_name"),
-                selection.get("display_name"),
-                selection.get("requested_name"),
-            ):
-                normalized = self._normalize_lora_key(candidate)
-                if normalized:
-                    selected_lookup.setdefault(normalized, selection)
-
-        applied = []
-
-        for _, node_data in loader_nodes:
-            inputs = node_data.get("inputs", {})
-            lora_container = inputs.get("loras", {})
-            items = lora_container.get("__value__", [])
-            if not isinstance(items, list):
-                continue
-
-            node_applied_keys = set()
-            for item in items:
-                if not isinstance(item, dict):
-                    continue
-                name = str(item.get("name", "")).strip()
-                if not name:
-                    continue
-
-                selection = selected_lookup.get(self._normalize_lora_key(name))
-                if selection:
-                    item["active"] = True
-                    item["strength"] = self._format_lora_strength(selection["strength"])
-                    item["clipStrength"] = self._format_lora_strength(selection["clip_strength"])
-                    node_applied_keys.add(self._normalize_lora_key(selection.get("name")))
-                    label = selection.get("display_name") or name
-                    if label not in applied:
-                        applied.append(label)
-                elif clear_defaults or not self.keep_workflow_defaults_when_selected:
-                    item["active"] = False
-
-            for selection in effective_selections:
-                selection_key = self._normalize_lora_key(selection.get("name"))
-                if selection_key in node_applied_keys:
-                    continue
-                runtime_name = (
-                    selection.get("loader_name")
-                    or selection.get("workflow_name")
-                    or selection.get("name")
-                )
-                if not runtime_name:
-                    continue
-                items.append(
-                    {
-                        "name": runtime_name,
-                        "strength": self._format_lora_strength(selection["strength"]),
-                        "active": True,
-                        "expanded": False,
-                        "clipStrength": self._format_lora_strength(selection["clip_strength"]),
-                    }
-                )
-                node_applied_keys.add(selection_key)
-                label = selection.get("display_name") or runtime_name
-                if label not in applied:
-                    applied.append(label)
-
-            inputs["text"] = self._rebuild_lora_text(items, active_only=True)
-
-        return applied
-
-    def _load_workflow(self):
-        if not self.workflow_path.exists():
-            raise FileNotFoundError(f"工作流文件不存在: {self.workflow_path}")
-        with open(self.workflow_path, "r", encoding="utf-8") as f:
-            return json.load(f)
 
     def _inject_params(self, workflow, prompt, lora_selections=None):
         """Inject prompt, optional LoRA selections, steps overrides, and seeds into workflow."""
-        node = workflow.get(self.input_id)
-        if not node:
-            logger.error(f"critical: input node id {self.input_id} not found in workflow")
-            return
-
-        inputs = node.get("inputs", {})
-        target_keys = [
-            "text",
-            "opt_text",
-            "string",
-            "text_positive",
-            "positive",
-            "prompt",
-            "wildcard_text",
-        ]
-        for key in target_keys:
-            if key in inputs:
-                inputs[key] = prompt
-                break
+        inject_prompt(workflow, self.workflow.input_node_id, prompt)
 
         if self.lora_control_enabled and lora_selections:
-            applied = self._apply_lora_selections(workflow, lora_selections)
+            applied = apply_lora_selections(
+                workflow,
+                lora_selections,
+                keep_defaults=self.keep_workflow_defaults_when_selected,
+            )
             if applied:
                 logger.info(f"[ComfyUI] applied LoRA selections: {', '.join(applied)}")
             else:
                 logger.info("[ComfyUI] LoRA selections detected, but no compatible LoRA stack node was found")
 
-        overrides = self._load_steps_override()
+        overrides = load_steps_override(self.workflow.steps_override_path)
         if overrides:
-            count = self._apply_steps_override(workflow, overrides)
+            count = apply_steps_override(workflow, overrides)
             if count > 0:
                 override_info = ", ".join([f"{k}:{v}步" for k, v in overrides.items()])
                 logger.info(f"[ComfyUI] steps override applied: {override_info} (updated {count} targets)")
             else:
                 logger.info("[ComfyUI] steps override configured but no matching reference was found")
 
-        base_seed = random.randint(1, 999999999999999)
-        ks_count = 0
-        offset = 0
+        inject_seeds(workflow)
 
-        for _, node_data in workflow.items():
-            if not isinstance(node_data, dict):
-                continue
-            n_inputs = node_data.get("inputs", {})
-            if not isinstance(n_inputs, dict):
-                continue
-
-            changed = False
-
-            if "seed" in n_inputs:
-                n_inputs["seed"] = base_seed + offset
-                offset += 1
-                changed = True
-
-            if "noise_seed" in n_inputs:
-                n_inputs["noise_seed"] = base_seed + offset
-                offset += 1
-                changed = True
-
-            if changed:
-                ks_count += 1
-
-        logger.info(
-            f"[ComfyUI] base seed: {base_seed}, updated {ks_count} seed/noise_seed inputs"
-        )
-
-    def _load_steps_override(self) -> dict:
-        """Load steps override sidecar for the current workflow."""
-        try:
-            stem = self.workflow_path.stem
-            sidecar = self.workflow_path.parent / f"{stem}.steps.json"
-
-            if not sidecar.exists():
-                return {}
-
-            with open(sidecar, "r", encoding="utf-8") as f:
-                data = json.load(f)
-
-            if not isinstance(data, dict):
-                return {}
-
-            result = {}
-            for key, value in data.items():
-                if isinstance(value, dict) and "steps" in value:
-                    steps = value.get("steps")
-                    if isinstance(steps, (int, float)) and steps > 0:
-                        result[str(key)] = int(steps)
-                elif isinstance(value, (int, float)) and value > 0:
-                    result[str(key)] = int(value)
-
-            return result
-
-        except Exception as e:
-            logger.warning(f"[ComfyUI] failed to read steps override file: {e}")
-            return {}
-
-    def _apply_steps_override(self, workflow: dict, overrides: dict):
-        """
-        Override steps by node id.
-
-        Only targets steps/steps_total fields that reference the requested ParameterBreak nodes.
-        """
-        if not overrides:
-            return 0
-
-        pb_nodes = {}
-        for nid, node_data in workflow.items():
-            if isinstance(node_data, dict) and node_data.get("class_type") == "ParameterBreak":
-                pb_nodes[str(nid)] = node_data
-
-        if not pb_nodes:
-            logger.debug("[ComfyUI] no ParameterBreak nodes detected")
-            return 0
-
-        valid_overrides = {}
-        for pb_id, steps in overrides.items():
-            if pb_id in pb_nodes:
-                valid_overrides[pb_id] = steps
-            else:
-                logger.warning(f"[ComfyUI] override target node {pb_id} not found in current workflow")
-
-        if not valid_overrides:
-            return 0
-
-        override_count = 0
-        steps_keys = ("steps", "steps_total")
-
-        for nid, node_data in workflow.items():
-            if not isinstance(node_data, dict):
-                continue
-
-            n_inputs = node_data.get("inputs", {})
-            if not isinstance(n_inputs, dict):
-                continue
-
-            for key in steps_keys:
-                if key not in n_inputs:
-                    continue
-
-                value = n_inputs[key]
-                if isinstance(value, list) and len(value) == 2:
-                    ref_node_id = str(value[0])
-                    if ref_node_id in valid_overrides:
-                        new_steps = valid_overrides[ref_node_id]
-                        n_inputs[key] = new_steps
-                        override_count += 1
-                        logger.debug(f"[ComfyUI] node {nid}.{key}: [{ref_node_id}] -> {new_steps}")
-
-        return override_count
 
     async def generate(self, prompt, lora_selections=None):
         """Generate an image with the current workflow."""
         try:
-            workflow = self._load_workflow()
+            workflow = self.workflow.load()
         except Exception as e:
             return None, str(e)
 
@@ -1147,7 +907,7 @@ class ComfyUI:
         self._inject_params(workflow, prompt, resolved_loras)
 
         try:
-            image = await self.client.generate(workflow, self.output_id)
+            image = await self.client.generate(workflow, self.workflow.output_node_id)
         except ComfyError as exc:
             return None, str(exc)
         return image, None

@@ -1162,7 +1162,7 @@ class ComfyUIPlugin(Star):
             yield event.plain_result("📂 目录中没有工作流文件")
             return
 
-        current_file = self.api.wf_filename if self.api else "未知"
+        current_file = self.api.workflow.filename if self.api else "未知"
     
         msg = ["📂 可用工作流列表", "━━━━━━━━━━━━━━━━━━"]
     
@@ -1239,7 +1239,7 @@ class ComfyUIPlugin(Star):
             yield event.plain_result("❌ ComfyUI API 未初始化")
             return
 
-        exists, msg = self.api.reload_config(
+        exists, msg = self.api.switch_workflow(
             filename, 
             input_id=inp_id, 
             neg_node_id=neg_id,
@@ -1357,7 +1357,7 @@ class ComfyUIPlugin(Star):
             return
     
         # 获取当前工作流的 sidecar 路径
-        current_file = self.api.wf_filename
+        current_file = self.api.workflow.filename
         stem = Path(current_file).stem
         sidecar_path = self.workflow_dir / f"{stem}.steps.json"
     
@@ -1424,7 +1424,7 @@ class ComfyUIPlugin(Star):
     async def _comfy_add_list(self, event: AstrMessageEvent):
         """列出当前工作流的步数覆盖"""
     
-        current_file = self.api.wf_filename
+        current_file = self.api.workflow.filename
         stem = Path(current_file).stem
         sidecar_path = self.workflow_dir / f"{stem}.steps.json"
     
@@ -1464,7 +1464,7 @@ class ComfyUIPlugin(Star):
     async def _comfy_add_clear(self, event: AstrMessageEvent):
         """清空当前工作流的所有步数覆盖"""
     
-        current_file = self.api.wf_filename
+        current_file = self.api.workflow.filename
         stem = Path(current_file).stem
         sidecar_path = self.workflow_dir / f"{stem}.steps.json"
     
