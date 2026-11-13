@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# 插件检查：ruff + 无注释 + 无装饰字符，全部在 astrbot 容器里跑。
+# 插件检查：ruff + 无注释 + 无装饰字符 + pytest，全部在 astrbot 容器里跑。
 # 三项都跑完再汇总退出，红了能一次看全。用法：scripts/check.sh
 set -uo pipefail
 
@@ -31,6 +31,10 @@ if [ ${#py_files[@]} -gt 0 ]; then
 fi
 
 docker exec -w "$container" astrbot python3 scripts/check_no_emoji.py "${py_files[@]}" "${json_files[@]}" || failed=1
+
+if [ -d "$root/tests" ]; then
+  docker exec -w "$container" astrbot python -m pytest tests -q || failed=1
+fi
 
 if [ "$failed" -ne 0 ]; then
   echo "检查未通过" >&2

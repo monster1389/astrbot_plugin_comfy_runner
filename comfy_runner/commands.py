@@ -83,8 +83,8 @@ async def help_command(
     is_admin = user_id in ctx.access.admin_ids
 
     tips = [
-        "🎨 ComfyUI Pro 插件帮助",
-        "━━━━━━━━━━━━━━━━━━",
+        "ComfyUI Pro 插件帮助",
+        "",
         "",
         "【基础指令】",
         "  /画图 <提示词>     生成图片（转发模式）",
@@ -99,7 +99,7 @@ async def help_command(
     if is_admin:
         tips.extend(
             [
-                "【管理员指令】 👑",
+                "【管理员指令】 ",
                 "  /comfy_ls              列出所有工作流",
                 "  /comfy_use <序号>      切换工作流",
                 "  /comfy_save            导入新工作流",
@@ -110,15 +110,14 @@ async def help_command(
             ]
         )
 
-    # 状态信息
-    tips.append("━━━━━━━━━━━━━━━━━━")
-    tips.append(f"📍 当前位置：{'群聊 ' + gid if gid else '私聊'}")
-    tips.append(f"🔒 违禁级别：{policy}")
-    tips.append(f"⏱️ 冷却时间：{ctx.cfg.control.cooldown_seconds} 秒")
-    tips.append(f"🔐 全局锁定：{'开启' if ctx.access.lockdown else '关闭'}")
+    tips.append("")
+    tips.append(f"当前位置：{'群聊 ' + gid if gid else '私聊'}")
+    tips.append(f"违禁级别：{policy}")
+    tips.append(f"冷却时间：{ctx.cfg.control.cooldown_seconds} 秒")
+    tips.append(f"全局锁定：{'开启' if ctx.access.lockdown else '关闭'}")
     if is_admin:
-        tips.append("👑 身份：管理员")
-        tips.append(f"📂 数据目录：{ctx.cfg.data_dir}")
+        tips.append("身份：管理员")
+        tips.append(f"数据目录：{ctx.cfg.data_dir}")
 
     yield event.plain_result("\n".join(tips))
 
@@ -134,10 +133,9 @@ async def set_policy(
         return
 
     if not is_group_message(event):
-        yield event.plain_result("⚠️ 该指令仅支持在群聊中使用")
+        yield event.plain_result("⚠该指令仅支持在群聊中使用")
         return
 
-    # 检查管理员权限
     user_id = str(event.get_sender_id())
     if user_id not in ctx.access.admin_ids:
         yield event.plain_result("🚫 权限不足，仅管理员可修改违禁级别")
@@ -150,13 +148,13 @@ async def set_policy(
     if len(parts) == 1:
         current = ctx.access.policy_for(event)
         yield event.plain_result(
-            f"📊 本群当前违禁级别：{current}\n"
-            f"━━━━━━━━━━━━━━\n"
+            f"本群当前违禁级别：{current}\n"
+            f"\n"
             f"可选级别：\n"
             f"  none - 不过滤\n"
             f"  lite - 轻度过滤\n"
             f"  full - 完全过滤\n"
-            f"━━━━━━━━━━━━━━\n"
+            f"\n"
             f"用法：/违禁级别 <级别>"
         )
         return
@@ -183,7 +181,7 @@ async def toggle_lockdown(
 
     if not ctx.cfg.control.lockdown_command_enabled:
         yield event.plain_result(
-            "⚠️ 锁定命令开关已关闭，请在插件配置中启用 control.lockdown_command_enabled"
+            "⚠锁定命令开关已关闭，请在插件配置中启用 control.lockdown_command_enabled"
         )
         return
 
@@ -192,8 +190,8 @@ async def toggle_lockdown(
 
     if action in ("status", "状态", "查询"):
         yield event.plain_result(
-            "🔐 全局锁定状态\n"
-            "━━━━━━━━━━━━━━━━━━\n"
+            "全局锁定状态\n"
+            "\n"
             f"当前: {'开启' if ctx.access.lockdown else '关闭'}\n"
             f"命令开关: "
             f"{'开启' if ctx.cfg.control.lockdown_command_enabled else '关闭'}\n"
@@ -204,13 +202,13 @@ async def toggle_lockdown(
     if action in ("on", "true", "1", "enable", "start", "开启"):
         ctx.access.lockdown = True
         logger.warning(f"[ComfyUI] 管理员 {user_id} 通过命令开启全局锁定")
-        yield event.plain_result("🔒 已开启全局锁定：当前仅超级管理员可用绘图功能")
+        yield event.plain_result("已开启全局锁定：当前仅超级管理员可用绘图功能")
         return
 
     if action in ("off", "false", "0", "disable", "stop", "关闭"):
         ctx.access.lockdown = False
         logger.info(f"[ComfyUI] 管理员 {user_id} 通过命令关闭全局锁定")
-        yield event.plain_result("🔓 已关闭全局锁定：恢复正常访问控制")
+        yield event.plain_result("已关闭全局锁定：恢复正常访问控制")
         return
 
     yield event.plain_result("❌ 参数无效，用法：/comfy_lock on|off|status")
@@ -230,7 +228,6 @@ async def list_workflows(
         yield event.plain_result("❌ 工作流目录不存在")
         return
 
-    # 排除 .steps.json 文件
     files = sorted(
         [
             f.name
@@ -240,18 +237,17 @@ async def list_workflows(
     )
 
     if not files:
-        yield event.plain_result("📂 目录中没有工作流文件")
+        yield event.plain_result("目录中没有工作流文件")
         return
 
     current_file = ctx.api.workflow.filename if ctx.api else "未知"
 
-    msg = ["📂 可用工作流列表", "━━━━━━━━━━━━━━━━━━"]
+    msg = ["可用工作流列表", ""]
 
     for i, f in enumerate(files, 1):
         stem = Path(f).stem
         sidecar = ctx.api.workflow.directory / f"{stem}.steps.json"
 
-        # 检查是否有步数覆盖（新格式：按节点ID存储）
         steps_info = ""
         if sidecar.exists():
             try:
@@ -269,7 +265,7 @@ async def list_workflows(
             msg.append(f"   {i}. {f}{steps_info}")
 
     msg.append("")
-    msg.append("━━━━━━━━━━━━━━━━━━")
+    msg.append("")
     msg.append("切换：/comfy_use <序号>")
     msg.append("覆盖：/comfy_add <节点ID> <步数>")
     msg.append("查看：/comfy_add list")
@@ -297,7 +293,6 @@ async def use_workflow(
         return
 
     try:
-        # 排除 .steps.json 文件
         files = sorted(
             [
                 f.name
@@ -332,7 +327,7 @@ async def use_workflow(
         filename, input_id=inp_id, neg_node_id=neg_id, output_id=out_id
     )
 
-    status = "✅" if exists else "⚠️"
+    status = "✅" if exists else "⚠"
     logger.info(f"[ComfyUI] 管理员 {user_id} 切换工作流: {filename}")
     yield event.plain_result(f"{status} {msg}")
 
@@ -390,67 +385,58 @@ async def add_steps(
     event: AstrMessageEvent,
 ) -> AsyncIterator[MessageEventResult]:
     """给当前工作流的指定节点绑定步数覆盖"""
-    # 权限检查
     user_id = str(event.get_sender_id())
     if user_id not in ctx.access.admin_ids:
         yield event.plain_result("🚫 权限不足，仅管理员可设置步数覆盖")
         return
 
-    # 检查 API
     if not ctx.api:
         yield event.plain_result("❌ ComfyUI API 未初始化")
         return
 
-    # 解析参数
     args = event.message_str.split()
 
-    # 无参数：显示帮助
     if len(args) < 2:
         yield event.plain_result(
-            "📝 步数覆盖设置（按节点ID）\n"
-            "━━━━━━━━━━━━━━━━━━\n"
+            "步数覆盖设置（按节点ID）\n"
+            "\n"
             "用法：\n"
             "  /comfy_add <节点ID> <步数>      单个设置\n"
             "  /comfy_add <ID1> <步数1> <ID2> <步数2>  批量设置\n"
             "  /comfy_add <节点ID> off         取消单个\n"
             "  /comfy_add list                 查看当前覆盖\n"
             "  /comfy_add clear                清空所有覆盖\n"
-            "━━━━━━━━━━━━━━━━━━\n"
+            "\n"
             "示例：\n"
             "  /comfy_add 3839 20              节点3839设为20步\n"
             "  /comfy_add 3839 20 4521 50      同时设置两个节点\n"
-            "━━━━━━━━━━━━━━━━━━\n"
-            "💡 节点ID可在工作流JSON中查找 ParameterBreak 节点"
+            "\n"
+            "节点ID可在工作流JSON中查找 ParameterBreak 节点"
         )
         return
 
     sub_cmd = args[1].lower()
 
-    # 子命令：list
     if sub_cmd == "list":
         async for result in _comfy_add_list(event):
             yield result
         return
 
-    # 子命令：clear
     if sub_cmd == "clear":
         async for result in _comfy_add_clear(event):
             yield result
         return
 
-    # 正常流程：解析 <节点ID> <步数> 对
     params = args[1:]
 
     if len(params) % 2 != 0:
         yield event.plain_result("❌ 参数格式错误，需要成对输入：<节点ID> <步数>")
         return
 
-    # 获取当前工作流的 sidecar 路径
     current_file = ctx.api.workflow.filename
     stem = Path(current_file).stem
     sidecar_path = ctx.api.workflow.directory / f"{stem}.steps.json"
 
-    # 读取现有配置
     existing = {}
     if sidecar_path.exists():
         try:
@@ -459,7 +445,6 @@ async def add_steps(
         except Exception:
             existing = {}
 
-    # 解析并更新
     changes = []
     removes = []
 
@@ -468,12 +453,10 @@ async def add_steps(
         value = params[i + 1].lower()
 
         if value in ("off", "0", "del", "delete", "rm", "remove"):
-            # 删除该节点的覆盖
             if node_id in existing:
                 del existing[node_id]
                 removes.append(node_id)
         else:
-            # 设置步数
             try:
                 steps = int(value)
                 if not (1 <= steps <= 200):
@@ -487,24 +470,21 @@ async def add_steps(
                 yield event.plain_result(f"❌ 无效的步数值：{value}")
                 return
 
-    # 保存
     try:
         if existing:
             with open(sidecar_path, "w", encoding="utf-8") as f:
                 json.dump(existing, f, ensure_ascii=False, indent=2)
         else:
-            # 如果清空了，删除文件
             if sidecar_path.exists():
                 sidecar_path.unlink()
 
-        # 构建反馈消息
         msg_parts = []
         if changes:
             msg_parts.append(f"✅ 已设置: {', '.join(changes)}")
         if removes:
-            msg_parts.append(f"🗑️ 已移除: {', '.join(removes)}")
+            msg_parts.append(f"已移除: {', '.join(removes)}")
 
-        msg_parts.append(f"📍 工作流: {current_file}")
+        msg_parts.append(f"工作流: {current_file}")
 
         logger.info(
             f"[ComfyUI] 管理员 {user_id} 修改步数覆盖: {current_file} -> {existing}"
@@ -525,21 +505,21 @@ async def _comfy_add_list(
     sidecar_path = ctx.api.workflow.directory / f"{stem}.steps.json"
 
     lines = [
-        "📊 当前工作流步数覆盖",
-        "━━━━━━━━━━━━━━━━━━",
-        f"📍 工作流: {current_file}",
+        "当前工作流步数覆盖",
+        "",
+        f"工作流: {current_file}",
         "",
     ]
 
     if not sidecar_path.exists():
-        lines.append("ℹ️ 暂无步数覆盖配置")
+        lines.append("ℹ暂无步数覆盖配置")
     else:
         try:
             with open(sidecar_path, encoding="utf-8") as f:
                 data = json.load(f)
 
             if not data:
-                lines.append("ℹ️ 暂无步数覆盖配置")
+                lines.append("ℹ暂无步数覆盖配置")
             else:
                 lines.append("节点覆盖列表：")
                 for node_id, value in data.items():
@@ -552,7 +532,7 @@ async def _comfy_add_list(
             lines.append(f"❌ 读取配置失败: {e}")
 
     lines.append("")
-    lines.append("━━━━━━━━━━━━━━━━━━")
+    lines.append("")
     lines.append("设置：/comfy_add <节点ID> <步数>")
     lines.append("清空：/comfy_add clear")
 
@@ -569,7 +549,7 @@ async def _comfy_add_clear(
     sidecar_path = ctx.api.workflow.directory / f"{stem}.steps.json"
 
     if not sidecar_path.exists():
-        yield event.plain_result(f"ℹ️ {current_file} 本来就没有步数覆盖")
+        yield event.plain_result(f"ℹ{current_file} 本来就没有步数覆盖")
         return
 
     try:
@@ -687,7 +667,7 @@ async def lora_test(
 
     context = ctx.api.lora.runtime_context()
     if not context.get("supported"):
-        yield event.plain_result("⚠️ 当前工作流未检测到 LoRA 堆节点")
+        yield event.plain_result("⚠当前工作流未检测到 LoRA 堆节点")
         return
 
     catalog = list(context.get("catalog", {}).values())
@@ -902,7 +882,6 @@ async def on_llm_request(
     except Exception as e:
         logger.error(f"[ComfyUI] 注入绘图失败状态异常: {e}")
 
-    # 清理历史中的绘图提示词
     if ctx.cfg.llm.discard_prompt_from_history:
         try:
             _clean_pic_tags_from_req(req)
@@ -933,7 +912,6 @@ async def on_llm_response(
     if not cleaned_entries:
         return
 
-    # 清理文本供其他插件使用（移除 <pic>、<think>、<ctx> 标签）
     event.set_extra("comfy_cleaned_text", cleaned_text)
 
     if not _multi_image_mode(ctx, len(cleaned_entries)):
@@ -1032,7 +1010,6 @@ async def stage_clean_history(ctx: CommandContext, event: AstrMessageEvent) -> N
     if not ctx.cfg.llm.discard_prompt_from_history:
         return
 
-    # 只在有提取到提示词时才需要清理
     has_prompt = hasattr(event, "_comfy_extracted_prompt") or hasattr(
         event, "_comfy_segments"
     )
@@ -1072,7 +1049,7 @@ async def stage_clean_history(ctx: CommandContext, event: AstrMessageEvent) -> N
                 conversation_id=conv_id,
                 history=history,
             )
-            logger.info("[ComfyUI] 🗑️ 已从对话历史中清理绘图提示词")
+            logger.info("[ComfyUI] 已从对话历史中清理绘图提示词")
 
     except Exception as e:
         logger.error(f"[ComfyUI] 清理历史记录失败: {e}")
@@ -1199,7 +1176,7 @@ def _clean_pic_tags_from_req(req: ProviderRequest) -> None:
     """从请求的 conversation.history 中清理 <pic> 标签"""
     conversation = getattr(req, "conversation", None)
     if conversation is None:
-        logger.warning("[ComfyUI] 🗑️ req.conversation 不存在，跳过清理")
+        logger.warning("[ComfyUI] req.conversation 不存在，跳过清理")
         return
 
     history_raw = getattr(conversation, "history", None)
@@ -1230,10 +1207,9 @@ def _clean_pic_tags_from_req(req: ProviderRequest) -> None:
                 cleaned += 1
 
     if cleaned:
-        # 写回 conversation.history
         conversation.history = json.dumps(history, ensure_ascii=False)
         logger.info(
-            f"[ComfyUI] 🗑️ 已从 conversation.history 中清理 {cleaned} 条消息的绘图提示词"
+            f"[ComfyUI] 已从 conversation.history 中清理 {cleaned} 条消息的绘图提示词"
         )
 
 
@@ -1467,7 +1443,7 @@ async def _force_draw_entries(
 
     if supplemented_entries:
         logger.info(
-            "[ComfyUI] 🎯 强制画图补提示词成功，共补出 %s 张图",
+            "[ComfyUI] 强制画图补提示词成功，共补出 %s 张图",
             len(supplemented_entries),
         )
     return supplemented_entries

@@ -18,7 +18,7 @@
 ## 操作
 
 ```bash
-scripts/check.sh                    # ruff + 无注释 + 无 emoji
+scripts/check.sh                    # ruff + 无注释 + 无 emoji + pytest
 git config core.hooksPath .githooks # 新 clone 后执行一次
 docker restart astrbot              # 改动生效
 ```

@@ -6,10 +6,10 @@ from typing import Any
 
 from astrbot.api import logger
 
-from .comfy_runner.comfy import ComfyClient, ComfyError
-from .comfy_runner.config import Config
-from .comfy_runner.lora import LoraManager
-from .comfy_runner.workflow import (
+from .comfy import ComfyClient, ComfyError
+from .config import Config
+from .lora import LoraManager
+from .workflow import (
     Workflow,
     apply_lora_selections,
     apply_steps_override,
@@ -113,20 +113,25 @@ class ComfyUI:
                 logger.info(f"[ComfyUI] applied LoRA selections: {', '.join(applied)}")
             else:
                 logger.info(
-                    "[ComfyUI] LoRA selections detected, but no compatible LoRA stack node was found"
+                    "[ComfyUI] LoRA selections detected, "
+                    "but no compatible LoRA stack node was found"
                 )
 
         overrides = load_steps_override(self.workflow.steps_override_path)
         if overrides:
             count = apply_steps_override(workflow, overrides)
             if count > 0:
-                override_info = ", ".join([f"{key}:{value}步" for key, value in overrides.items()])
+                override_info = ", ".join(
+                    f"{key}:{value}步" for key, value in overrides.items()
+                )
                 logger.info(
-                    f"[ComfyUI] steps override applied: {override_info} (updated {count} targets)"
+                    f"[ComfyUI] steps override applied: {override_info} "
+                    f"(updated {count} targets)"
                 )
             else:
                 logger.info(
-                    "[ComfyUI] steps override configured but no matching reference was found"
+                    "[ComfyUI] steps override configured "
+                    "but no matching reference was found"
                 )
 
         inject_seeds(workflow)
