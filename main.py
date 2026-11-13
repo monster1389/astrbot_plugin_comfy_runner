@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import os
-import shutil
 from pathlib import Path
 from typing import Any
 
@@ -17,6 +16,7 @@ from .comfy_runner.api import ComfyUI
 from .comfy_runner.commands import CommandContext
 from .comfy_runner.config import Config
 from .comfy_runner.draw import Drawer
+from .comfy_runner.plugin_state import WorkflowSelection, prepare_data_dir
 
 PLUGIN_DIR = Path(os.path.dirname(os.path.abspath(__file__)))
 
@@ -34,9 +34,11 @@ class ComfyUIPlugin(Star):
         super().__init__(context)
         self.data_dir = StarTools.get_data_dir("astrbot_plugin_comfy_runner")
         logger.info(f"[ComfyUI] 数据目录: {self.data_dir}")
-        self._init_data_directories()
+        prepare_data_dir(self.data_dir, PLUGIN_DIR)
 
         self.cfg = Config.from_mapping(config, data_dir=self.data_dir)
+        self.selection = WorkflowSelection(config, self.data_dir, self.cfg)
+        self.cfg = self.selection.config
         control = self.cfg.control
         llm = self.cfg.llm
 
@@ -45,12 +47,15 @@ class ComfyUIPlugin(Star):
             load_lexicon(self.cfg.sensitive_words_path),
         )
         self.api = ComfyUI(self.cfg)
+        self.selection.sync_options(self.api.workflow.list_files())
+        self.selection.log_status(self.api.workflow)
         self.drawer = Drawer(self.api, self.access, self.cfg.output_dir)
         self.cmd_ctx = CommandContext(
             self.cfg,
             self.access,
             self.api,
             self.drawer,
+            self.selection,
             self.context,
         )
 
@@ -74,21 +79,6 @@ class ComfyUIPlugin(Star):
             f"{'开启' if control.lockdown_command_enabled else '关闭'}"
         )
         logger.info("[ComfyUI] ComfyUI API 初始化成功")
-
-    def _init_data_directories(self) -> None:
-        """创建数据目录，首次安装时复制默认敏感词库。
-
-        Raises:
-            OSError: 目录或文件无法创建。
-        """
-        (self.data_dir / "workflow").mkdir(exist_ok=True)
-        (self.data_dir / "output").mkdir(exist_ok=True)
-
-        destination = self.data_dir / "sensitive_words.json"
-        if destination.exists():
-            return
-        shutil.copy2(PLUGIN_DIR / "sensitive_words.json", destination)
-        logger.info("[ComfyUI] 已复制默认敏感词文件")
 
     async def initialize(self) -> None:
         """插件加载完成后激活 LLM 工具。"""

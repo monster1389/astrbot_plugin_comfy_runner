@@ -153,7 +153,9 @@ class ComfyUI:
         try:
             workflow = self.workflow.load()
         except (OSError, ValueError) as exc:
-            return None, str(exc)
+            return None, (
+                f"{exc}；请用 /comfy_ls 查看可用工作流，并用 /comfy_use 切换"
+            )
 
         resolved = (
             self.lora.resolve_selections(lora_selections)

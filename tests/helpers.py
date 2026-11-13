@@ -1,30 +1,27 @@
-"""测试替身：假事件、假客户端与最小配置。"""
+"""测试替身：假事件与真实插件装配。"""
 
 import asyncio
+import json
 from pathlib import Path
 
-from comfy_runner.access import AccessController
-from comfy_runner.commands import CommandContext
-from comfy_runner.config import Config
-from comfy_runner.draw import Drawer
+import pytest
+from astrbot.api.star import StarTools
+from astrbot.core.config.astrbot_config import AstrBotConfig
+from astrbot_plugin_comfy_runner.main import ComfyUIPlugin
+
+PLUGIN_ROOT = Path(__file__).resolve().parents[1]
 
 
-class FakeAPI:
-    """固定返回一张图片的出图客户端。"""
+class FakeContext:
+    """只实现插件初始化用到的上下文接口。"""
 
-    def __init__(self, data: bytes = b"png-bytes") -> None:
-        """记录出图调用并准备返回内容。
+    def __init__(self) -> None:
+        """记录被激活的 LLM 工具名。"""
+        self.activated_tool: str | None = None
 
-        Args:
-            data: 出图返回的字节。
-        """
-        self.data = data
-        self.calls: list[str] = []
-
-    async def generate(self, prompt: str, lora_selections=None):
-        """记录提示词并返回固定字节。"""
-        self.calls.append(prompt)
-        return self.data, None
+    def activate_llm_tool(self, name: str) -> None:
+        """记录激活的工具。"""
+        self.activated_tool = name
 
 
 class FakeResult:
@@ -102,88 +99,36 @@ class FakeEvent:
         self._result = result
 
 
-RAW = {
-    "server_address": "127.0.0.1:8188",
-    "workflow_settings": {
-        "json_file": "wf.json",
-        "input_node_id": "1",
-        "neg_node_id": "2",
-        "output_node_id": "3",
-    },
-    "llm_settings": {
-        "multi_image_mode": False,
-        "discard_prompt_from_history": False,
-        "force_draw_when_no_prompt": False,
-        "target_image_count": 1,
-        "system_prompt": "system",
-        "lora_control": {
-            "enabled": False,
-            "inject_catalog_into_system_prompt": True,
-            "inject_selected_prompt_hints": True,
-            "keep_workflow_defaults_when_selected": True,
-            "max_lora_count": 4,
-            "scan_directories": "",
-            "max_trigger_options_per_lora": 3,
-            "trigger_option_preview_length": 80,
-        },
-    },
-    "control": {
-        "cooldown_seconds": 0,
-        "admin_ids": ["9"],
-        "whitelist_group_ids": ["2"],
-        "default_group_policy": "lite",
-        "default_private_policy": "lite",
-        "lockdown": False,
-        "lockdown_command_enabled": True,
-        "admin_bypass": {
-            "whitelist": True,
-            "cooldown": True,
-            "sensitive_words": True,
-        },
-    },
-}
+def make_astrbot_config(tmp_path: Path) -> AstrBotConfig:
+    """用插件 schema 构建 AstrBot 配置对象。"""
+    schema = json.loads(
+        (PLUGIN_ROOT / "_conf_schema.json").read_text(encoding="utf-8")
+    )
+    return AstrBotConfig(config_path=str(tmp_path / "config.json"), schema=schema)
 
 
-def make_config(tmp_path: Path, **overrides) -> Config:
-    """用最小配置构建 Config。
-
-    Args:
-        tmp_path: 数据目录。
-        overrides: 按顶层键覆盖的配置片段。
-
-    Returns:
-        配置对象。
-    """
-    raw = {
-        key: dict(value) if isinstance(value, dict) else value
-        for key, value in RAW.items()
-    }
-    raw["llm_settings"] = dict(RAW["llm_settings"])
-    raw["control"] = dict(RAW["control"])
+def make_plugin(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    **overrides: object,
+) -> tuple[ComfyUIPlugin, AstrBotConfig]:
+    """在临时数据目录里装配真实插件。"""
+    data_dir = tmp_path / "plugin_data"
+    data_dir.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setattr(
+        StarTools,
+        "get_data_dir",
+        classmethod(lambda cls, plugin_name=None: data_dir),
+    )
+    config = make_astrbot_config(tmp_path)
     for section, values in overrides.items():
         if isinstance(values, dict):
-            raw[section] = {**raw[section], **values}
+            config[section].update(values)
         else:
-            raw[section] = values
-    return Config.from_mapping(raw, tmp_path)
+            config[section] = values
+    config.save_config()
 
-
-def make_ctx(tmp_path: Path, api: FakeAPI | None = None, **overrides) -> CommandContext:
-    """构建命令上下文。
-
-    Args:
-        tmp_path: 数据目录，也是图片落盘目录。
-        api: 出图客户端替身。
-        overrides: 配置覆盖。
-
-    Returns:
-        命令上下文。
-    """
-    cfg = make_config(tmp_path, **overrides)
-    access = AccessController(cfg.control, {})
-    api = api or FakeAPI()
-    drawer = Drawer(api, access, tmp_path)
-    return CommandContext(cfg, access, api, drawer, None)
+    return ComfyUIPlugin(FakeContext(), config), config
 
 
 def collect(gen) -> list:

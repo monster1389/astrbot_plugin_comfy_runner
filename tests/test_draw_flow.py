@@ -1,63 +1,85 @@
 """出图与多图发送的用户可见行为。"""
 
 import asyncio
+from pathlib import Path
 
 from astrbot.api.message_components import Plain
-from helpers import FakeAPI, FakeEvent, FakeResult, collect, make_ctx
+from helpers import FakeEvent, FakeResult, collect, make_plugin
 
-from comfy_runner.commands import (
-    _ComfyImageMarker,
-    paint,
-    stage_build_chain,
-    stage_send_images,
-)
+FIXTURE = Path(__file__).with_name("fixtures") / "workflow_min.json"
 
 
-def test_paint_returns_forward_node(tmp_path):
-    """/画图 出图后返回合并转发节点。"""
-    api = FakeAPI()
-    ctx = make_ctx(tmp_path, api=api)
-    event = FakeEvent("/画图 one girl, smile")
-
-    results = collect(paint(ctx, event, direct_send=False))
-
-    assert len(results) == 1
-    kind, components = results[0]
-    assert kind == "chain"
-    assert type(components[0]).__name__ == "Node"
-    assert api.calls == ["one girl, smile"]
-    assert len(list(tmp_path.glob("*.png"))) == 1
-
-
-def test_paint_rejects_empty_prompt(tmp_path):
+def test_paint_rejects_empty_prompt(tmp_path, monkeypatch):
     """没有提示词时不调用客户端。"""
-    ctx = make_ctx(tmp_path)
-    results = collect(paint(ctx, FakeEvent("/画图"), direct_send=False))
+    plugin, _ = make_plugin(
+        tmp_path,
+        monkeypatch,
+        control={"admin_ids": ["9"], "whitelist_group_ids": ["2"]},
+    )
+
+    results = collect(plugin.cmd_paint(FakeEvent("/画图", sender="9", group="2")))
+
     assert results[0][0] == "text"
     assert "/画图" in results[0][1]
-    assert ctx.api.calls == []
 
 
-def test_paint_rejects_sensitive_prompt(tmp_path):
+def test_paint_rejects_sensitive_prompt(tmp_path, monkeypatch):
     """普通用户命中敏感词时拒绝出图。"""
-    ctx = make_ctx(tmp_path)
-    ctx.access.lexicon = {"legacy_lite": ["blood"]}
-    ctx.access.patterns = ctx.access._build_patterns()
-    ctx.access.set_policy("2", "full")
+    plugin, _ = make_plugin(
+        tmp_path,
+        monkeypatch,
+        control={
+            "admin_ids": ["9"],
+            "whitelist_group_ids": ["2"],
+            "default_group_policy": "full",
+        },
+    )
+    calls = []
 
-    event = FakeEvent("/画图 blood, smile", sender="5")
-    results = collect(paint(ctx, event, direct_send=False))
+    async def fake_generate(graph, output_node_id):
+        calls.append((graph, output_node_id))
+        return b"unexpected"
+
+    monkeypatch.setattr(plugin.api.client, "generate", fake_generate)
+
+    event = FakeEvent("/画图 blood, smile", sender="5", group="2")
+    results = collect(plugin.cmd_paint(event))
 
     assert results[0][0] == "text"
     assert "敏感词" in results[0][1]
-    assert ctx.api.calls == []
+    assert calls == []
 
 
-def test_multi_image_chain_and_send_order(tmp_path):
+def test_multi_image_sends_text_and_images_in_order(tmp_path, monkeypatch):
     """多图模式按文字段、图片交替发送。"""
-    api = FakeAPI()
-    ctx = make_ctx(tmp_path, api=api, llm_settings={"multi_image_mode": True})
-    event = FakeEvent()
+    workflow_dir = tmp_path / "plugin_data" / "workflow"
+    workflow_dir.mkdir(parents=True)
+    (workflow_dir / "wf.json").write_text(
+        FIXTURE.read_text(encoding="utf-8"),
+        encoding="utf-8",
+    )
+
+    plugin, _ = make_plugin(
+        tmp_path,
+        monkeypatch,
+        workflow_settings={
+            "json_file": "wf.json",
+            "input_node_id": "1",
+            "neg_node_id": "2",
+            "output_node_id": "4",
+        },
+        llm_settings={"multi_image_mode": True},
+        control={"admin_ids": ["9"], "whitelist_group_ids": ["2"]},
+    )
+    prompts = []
+
+    async def fake_generate(graph, output_node_id):
+        prompts.append(graph["1"]["inputs"]["text"])
+        return b"png-bytes"
+
+    monkeypatch.setattr(plugin.api.client, "generate", fake_generate)
+
+    event = FakeEvent(sender="9", group="2")
     event._comfy_segments = [
         {"type": "text", "content": "第一段"},
         {"type": "prompt", "content": "one girl, smile", "lora_selections": []},
@@ -66,16 +88,10 @@ def test_multi_image_chain_and_send_order(tmp_path):
     ]
     event.set_result(FakeResult([Plain("原始")]))
 
-    asyncio.run(stage_build_chain(ctx, event))
-    chain = event.get_result().chain
-
-    assert type(chain[0]).__name__ == "Plain"
-    assert isinstance(chain[1], _ComfyImageMarker)
-    assert type(chain[2]).__name__ == "Plain"
-    assert isinstance(chain[3], _ComfyImageMarker)
-
-    asyncio.run(stage_send_images(ctx, event))
+    asyncio.run(plugin._auto_paint_from_llm(event))
+    asyncio.run(plugin._send_multi_image_results(event))
 
     assert [kind for kind, _ in event.sent] == ["chain", "chain", "chain", "chain"]
-    assert api.calls == ["one girl, smile", "blue sky, clouds"]
+    assert prompts == ["one girl, smile", "blue sky, clouds"]
     assert event.get_result().chain == []
+    assert len(list((tmp_path / "plugin_data" / "output").glob("*.png"))) == 2

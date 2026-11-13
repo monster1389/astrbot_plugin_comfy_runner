@@ -172,8 +172,10 @@ class Workflow:
             工作流图。
 
         Raises:
-            FileNotFoundError: 工作流文件不存在。
+            FileNotFoundError: 工作流文件不存在或未配置。
         """
+        if not self.filename:
+            raise FileNotFoundError("未配置工作流文件")
         if not self.path.exists():
             raise FileNotFoundError(f"工作流文件不存在: {self.path}")
         with open(self.path, encoding="utf-8") as fh:

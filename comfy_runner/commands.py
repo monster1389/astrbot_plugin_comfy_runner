@@ -29,6 +29,7 @@ from .delivery import (
     text_result,
 )
 from .draw import Drawer, DrawError
+from .plugin_state import WorkflowSelection
 from .prompt import (
     build_segments,
     coerce_history,
@@ -64,6 +65,7 @@ class CommandContext:
     access: AccessController
     api: Any
     drawer: Drawer
+    selection: WorkflowSelection
     context: Any
 
 
@@ -326,6 +328,8 @@ async def use_workflow(
     exists, msg = ctx.api.switch_workflow(
         filename, input_id=inp_id, neg_node_id=neg_id, output_id=out_id
     )
+    if exists:
+        ctx.selection.persist(filename)
 
     status = "✅" if exists else "⚠"
     logger.info(f"[ComfyUI] 管理员 {user_id} 切换工作流: {filename}")
@@ -371,13 +375,15 @@ async def save_workflow(
     try:
         with open(save_path, "w", encoding="utf-8") as f:
             json.dump(json_data, f, indent=2, ensure_ascii=False)
-
-        logger.info(f"[ComfyUI] 管理员 {user_id} 导入工作流: {filename}")
-        yield event.plain_result(
-            f"✅ 保存成功！\n文件：{filename}\n使用 /comfy_ls 查看列表"
-        )
     except Exception as e:
         yield event.plain_result(f"❌ 保存失败: {e}")
+        return
+
+    ctx.selection.sync_options(ctx.api.workflow.list_files())
+    logger.info(f"[ComfyUI] 管理员 {user_id} 导入工作流: {filename}")
+    yield event.plain_result(
+        f"✅ 保存成功！\n文件：{filename}\n使用 /comfy_ls 查看列表"
+    )
 
 
 async def add_steps(
