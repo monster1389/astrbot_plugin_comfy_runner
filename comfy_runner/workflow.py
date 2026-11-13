@@ -5,10 +5,13 @@ from __future__ import annotations
 import json
 import random
 import re
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
 from astrbot.api import logger
+
+from .config import NodeBinding
 
 LORA_MANIFEST_SUFFIX = ".lora.json"
 STEPS_OVERRIDE_SUFFIX = ".steps.json"
@@ -92,24 +95,31 @@ class Workflow:
         self,
         directory: Path,
         filename: str,
-        input_node_id: str,
-        neg_node_id: str,
-        output_node_id: str,
+        bindings: Mapping[str, NodeBinding],
     ) -> None:
-        """记录工作流目录、文件名与三个节点 ID。
+        """记录工作流目录、文件名与该文件名对应的节点绑定。
 
         Args:
             directory: 工作流文件目录。
             filename: 当前工作流文件名。
-            input_node_id: 正面提示词节点 ID。
-            neg_node_id: 负面提示词节点 ID。
-            output_node_id: 输出节点 ID，留空表示自动发现。
+            bindings: 工作流文件名到节点绑定的映射。
         """
         self.directory = directory
         self.filename = filename
-        self.input_node_id = input_node_id
-        self.neg_node_id = neg_node_id
-        self.output_node_id = output_node_id
+        self.bindings = bindings
+        self.registered = False
+        self.input_node_id = ""
+        self.neg_node_id = ""
+        self.output_node_id = ""
+        self._apply_binding(filename)
+
+    def _apply_binding(self, filename: str) -> None:
+        """把指定文件名的绑定写成当前节点 ID，未登记时清空。"""
+        binding = self.bindings.get(filename)
+        self.registered = binding is not None
+        self.input_node_id = binding.input_node_id if binding else ""
+        self.neg_node_id = binding.neg_node_id if binding else ""
+        self.output_node_id = binding.output_node_id if binding else ""
 
     @property
     def path(self) -> Path:
@@ -138,31 +148,17 @@ class Workflow:
             if not is_aux_file(entry.name)
         )
 
-    def switch(
-        self,
-        filename: str,
-        input_node_id: str | None = None,
-        neg_node_id: str | None = None,
-        output_node_id: str | None = None,
-    ) -> bool:
-        """切换当前工作流并可选地覆盖节点绑定。
+    def switch(self, filename: str) -> bool:
+        """切换当前工作流并应用该文件名的绑定。
 
         Args:
             filename: 新的工作流文件名。
-            input_node_id: 新的正面提示词节点 ID。
-            neg_node_id: 新的负面提示词节点 ID。
-            output_node_id: 新的输出节点 ID。
 
         Returns:
             新工作流文件是否存在。
         """
         self.filename = filename
-        if input_node_id:
-            self.input_node_id = str(input_node_id)
-        if neg_node_id:
-            self.neg_node_id = str(neg_node_id)
-        if output_node_id:
-            self.output_node_id = str(output_node_id)
+        self._apply_binding(filename)
         return self.path.exists()
 
     def load(self) -> dict[str, Any]:

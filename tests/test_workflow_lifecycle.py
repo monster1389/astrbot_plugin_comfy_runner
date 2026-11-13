@@ -1,5 +1,6 @@
 """WebUI 工作流下拉反映数据目录的当前内容。"""
 
+import json
 from pathlib import Path
 
 import pytest
@@ -24,7 +25,10 @@ def test_webui_lists_workflows_and_follows_save(tmp_path, monkeypatch):
     plugin, config = make_plugin(
         tmp_path,
         monkeypatch,
-        workflow_settings={"json_file": "a.json"},
+        workflow_settings={
+            "json_file": "a.json",
+            "bindings": json.dumps({"a.json": {"input": "1"}}),
+        },
         control={"admin_ids": ["9"], "whitelist_group_ids": ["2"]},
     )
     item = config.schema["workflow_settings"]["items"]["json_file"]
@@ -32,7 +36,8 @@ def test_webui_lists_workflows_and_follows_save(tmp_path, monkeypatch):
     assert item["enum"] == ["a.json", "b.json"]
 
     listing = collect(plugin.cmd_comfy_list(FakeEvent("/comfy_ls", sender="9")))
-    assert "a.json" in listing[0][1]
+    assert "a.json [绑定]" in listing[0][1]
+    assert "b.json [绑定]" not in listing[0][1]
     assert "b.json" in listing[0][1]
     assert "a.steps.json" not in listing[0][1]
     assert "a.lora.json" not in listing[0][1]
@@ -107,9 +112,9 @@ def test_paint_loads_workflow_and_injects_prompt(tmp_path, monkeypatch):
         monkeypatch,
         workflow_settings={
             "json_file": "wf.json",
-            "input_node_id": "1",
-            "neg_node_id": "2",
-            "output_node_id": "4",
+            "bindings": json.dumps(
+                {"wf.json": {"input": 1, "neg": 2, "output": 4}}
+            ),
         },
         control={"admin_ids": ["9"], "whitelist_group_ids": ["2"]},
     )
@@ -132,13 +137,30 @@ def test_paint_loads_workflow_and_injects_prompt(tmp_path, monkeypatch):
     assert len(list((tmp_path / "plugin_data" / "output").glob("*.png"))) == 1
 
 
-@pytest.mark.parametrize("filename", ["missing.json", ""])
-def test_paint_reports_missing_workflow(tmp_path, monkeypatch, filename):
-    """/画图 在工作流未配置或文件缺失时给出明确错误。"""
+@pytest.mark.parametrize(
+    ("filename", "bindings", "expected"),
+    [
+        ("missing.json", "{}", "未在 bindings 中登记"),
+        (
+            "missing.json",
+            json.dumps({"missing.json": {"input": "6"}}),
+            "/comfy_ls",
+        ),
+        ("", "{}", "/comfy_ls"),
+    ],
+)
+def test_paint_reports_missing_workflow(
+    tmp_path,
+    monkeypatch,
+    filename,
+    bindings,
+    expected,
+):
+    """/画图 在工作流未配置、未登记或文件缺失时给出明确错误。"""
     plugin, _ = make_plugin(
         tmp_path,
         monkeypatch,
-        workflow_settings={"json_file": filename},
+        workflow_settings={"json_file": filename, "bindings": bindings},
         control={"admin_ids": ["9"], "whitelist_group_ids": ["2"]},
     )
     calls = []
@@ -152,6 +174,118 @@ def test_paint_reports_missing_workflow(tmp_path, monkeypatch, filename):
     results = collect(plugin.cmd_paint(FakeEvent("/画图 one girl")))
 
     assert results[0][0] == "text"
-    assert "工作流" in results[0][1]
-    assert "/comfy_ls" in results[0][1]
+    assert expected in results[0][1]
     assert calls == []
+
+
+def test_switch_applies_each_workflow_binding(tmp_path, monkeypatch):
+    """切换工作流后使用该工作流自己的正面与输出节点。"""
+    workflow_dir = tmp_path / "plugin_data" / "workflow"
+    workflow_dir.mkdir(parents=True)
+    (workflow_dir / "a.json").write_text(
+        FIXTURE.read_text(encoding="utf-8"),
+        encoding="utf-8",
+    )
+    second = {
+        "10": {"class_type": "CLIPTextEncode", "inputs": {"text": ""}},
+        "11": {
+            "class_type": "KSampler",
+            "inputs": {"seed": 1, "steps": 20, "positive": ["10", 0]},
+        },
+        "20": {"class_type": "SaveImage", "inputs": {"images": ["11", 0]}},
+    }
+    (workflow_dir / "b.json").write_text(json.dumps(second), encoding="utf-8")
+
+    plugin, _ = make_plugin(
+        tmp_path,
+        monkeypatch,
+        workflow_settings={
+            "json_file": "a.json",
+            "bindings": json.dumps(
+                {
+                    "a.json": {"input": "1", "output": "4"},
+                    "b.json": {"input": "10", "output": "20"},
+                }
+            ),
+        },
+        control={
+            "admin_ids": ["9"],
+            "whitelist_group_ids": ["2"],
+            "cooldown_seconds": 0,
+        },
+    )
+    captured = []
+
+    async def fake_generate(graph, output_node_id):
+        captured.append((graph, output_node_id))
+        return b"png-bytes"
+
+    monkeypatch.setattr(plugin.api.client, "generate", fake_generate)
+
+    collect(plugin.cmd_paint(FakeEvent("/画图 first", sender="5", group="2")))
+    collect(plugin.cmd_comfy_use(FakeEvent("/comfy_use 2", sender="9", group="2")))
+    collect(plugin.cmd_paint(FakeEvent("/画图 second", sender="5", group="2")))
+
+    first_graph, first_output = captured[0]
+    second_graph, second_output = captured[1]
+    assert first_graph["1"]["inputs"]["text"] == "first"
+    assert first_output == "4"
+    assert second_graph["10"]["inputs"]["text"] == "second"
+    assert second_output == "20"
+
+
+def test_unregistered_workflow_is_rejected(tmp_path, monkeypatch):
+    """未登记绑定的工作流不出图，并指向登记位置。"""
+    workflow_dir = tmp_path / "plugin_data" / "workflow"
+    workflow_dir.mkdir(parents=True)
+    _touch(workflow_dir / "a.json")
+    _touch(workflow_dir / "b.json")
+
+    plugin, _ = make_plugin(
+        tmp_path,
+        monkeypatch,
+        workflow_settings={
+            "json_file": "a.json",
+            "bindings": json.dumps({"a.json": {"input": "1"}}),
+        },
+        control={"admin_ids": ["9"], "whitelist_group_ids": ["2"]},
+    )
+    calls = []
+
+    async def fake_generate(graph, output_node_id):
+        calls.append(output_node_id)
+        return b"unexpected"
+
+    monkeypatch.setattr(plugin.api.client, "generate", fake_generate)
+
+    switched = collect(
+        plugin.cmd_comfy_use(FakeEvent("/comfy_use 2", sender="9", group="2"))
+    )
+    assert "未在 bindings 中登记" in switched[0][1]
+
+    current = collect(plugin.cmd_comfy_current(FakeEvent("/当前工作流", sender="9")))
+    assert "未登记" in current[0][1]
+
+    results = collect(
+        plugin.cmd_paint(FakeEvent("/画图 one girl", sender="5", group="2"))
+    )
+
+    assert results[0][0] == "text"
+    assert "未在 bindings 中登记" in results[0][1]
+    assert calls == []
+
+
+def test_use_workflow_rejects_node_id_arguments(tmp_path, monkeypatch):
+    """ID 参数已移除，命令指向配置字段。"""
+    plugin, _ = make_plugin(
+        tmp_path,
+        monkeypatch,
+        control={"admin_ids": ["9"], "whitelist_group_ids": ["2"]},
+    )
+
+    results = collect(
+        plugin.cmd_comfy_use(FakeEvent("/comfy_use 1 6 7 9", sender="9"))
+    )
+
+    assert results[0][0] == "text"
+    assert "bindings" in results[0][1]

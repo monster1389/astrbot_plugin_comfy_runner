@@ -1,6 +1,7 @@
 """出图与多图发送的用户可见行为。"""
 
 import asyncio
+import json
 from pathlib import Path
 
 from astrbot.api.message_components import Plain
@@ -64,9 +65,9 @@ def test_multi_image_sends_text_and_images_in_order(tmp_path, monkeypatch):
         monkeypatch,
         workflow_settings={
             "json_file": "wf.json",
-            "input_node_id": "1",
-            "neg_node_id": "2",
-            "output_node_id": "4",
+            "bindings": json.dumps(
+                {"wf.json": {"input": "1", "neg": "2", "output": "4"}}
+            ),
         },
         llm_settings={"multi_image_mode": True},
         control={"admin_ids": ["9"], "whitelist_group_ids": ["2"]},

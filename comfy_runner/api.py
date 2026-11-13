@@ -32,9 +32,7 @@ class ComfyUI:
         self.workflow = Workflow(
             directory=config.workflow_dir,
             filename=config.workflow.json_file,
-            input_node_id=config.workflow.input_node_id,
-            neg_node_id=config.workflow.neg_node_id,
-            output_node_id=config.workflow.output_node_id,
+            bindings=config.workflow.bindings,
         )
         self.lora = LoraManager(config.llm.lora_control, self.workflow)
 
@@ -48,45 +46,36 @@ class ComfyUI:
                 ", ".join(str(path) for path in self.lora.scan_roots),
             )
 
-    def switch_workflow(
-        self,
-        filename: str,
-        input_id: str | None = None,
-        output_id: str | None = None,
-        neg_node_id: str | None = None,
-    ) -> tuple[bool, str]:
-        """切换当前工作流并可选地覆盖节点绑定。
+    def switch_workflow(self, filename: str) -> tuple[bool, str]:
+        """切换当前工作流并应用该文件名的节点绑定。
 
         Args:
             filename: 新的工作流文件名。
-            input_id: 新的正面提示词节点 ID。
-            output_id: 新的输出节点 ID。
-            neg_node_id: 新的负面提示词节点 ID。
 
         Returns:
             文件是否存在，以及给用户看的提示文本。
         """
-        exists = self.workflow.switch(
-            filename,
-            input_node_id=input_id,
-            neg_node_id=neg_node_id,
-            output_node_id=output_id,
-        )
+        exists = self.workflow.switch(filename)
         self.lora.clear_caches()
 
         status = "exists" if exists else "missing"
         logger.info(
             f"[ComfyUI] switch workflow -> {filename} [{status}] | "
-            f"Input:{self.workflow.input_node_id} | "
-            f"Neg:{self.workflow.neg_node_id} | "
-            f"Output:{self.workflow.output_node_id or 'auto'}"
+            f"Input:{self.workflow.input_node_id or '-'} | "
+            f"Neg:{self.workflow.neg_node_id or '-'} | "
+            f"Output:{self.workflow.output_node_id or 'auto'} | "
+            f"registered:{self.workflow.registered}"
         )
-        return exists, (
-            f"已切换至 {filename}，文件状态：{status}\n"
-            f"当前节点设置: Positive={self.workflow.input_node_id}, "
-            f"Negative={self.workflow.neg_node_id}, "
-            f"Output={self.workflow.output_node_id or '自动'}"
-        )
+        if self.workflow.registered:
+            detail = (
+                "当前节点设置: "
+                f"Positive={self.workflow.input_node_id}, "
+                f"Negative={self.workflow.neg_node_id or '未绑定'}, "
+                f"Output={self.workflow.output_node_id or '自动'}"
+            )
+        else:
+            detail = "⚠ 该工作流未在 bindings 中登记，出图前请补上节点绑定"
+        return exists, f"已切换至 {filename}，文件状态：{status}\n{detail}"
 
     def inject_params(
         self,
@@ -150,6 +139,17 @@ class ComfyUI:
         Returns:
             图片字节与错误文本，成功时错误文本为 None。
         """
+        if not self.workflow.filename:
+            return None, (
+                "未配置工作流文件；请用 /comfy_ls 查看可用工作流，"
+                "并用 /comfy_use 切换"
+            )
+        if not self.workflow.registered:
+            return None, (
+                f"工作流 {self.workflow.filename} 未在 bindings 中登记，"
+                "请在 WebUI 的 ComfyUI 工作流节点配置里补上正面与输出节点"
+            )
+
         try:
             workflow = self.workflow.load()
         except (OSError, ValueError) as exc:

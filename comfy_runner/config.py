@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -58,13 +59,74 @@ def _policy(section: Mapping[str, Any], key: str) -> str:
 
 
 @dataclass(frozen=True, slots=True)
-class WorkflowSettings:
-    """当前工作流的默认配置。"""
+class NodeBinding:
+    """一个工作流文件的节点 ID 绑定。"""
 
-    json_file: str
     input_node_id: str
     neg_node_id: str
     output_node_id: str
+
+
+def _binding_field(
+    filename: str,
+    field: str,
+    entry: Mapping[str, Any],
+    *,
+    required: bool,
+) -> str:
+    """取单个绑定字段并校验类型。"""
+    value = entry.get(field)
+    if value is None:
+        if required:
+            raise ConfigError(f"配置项 bindings 的 {filename} 缺少 {field}")
+        return ""
+    if isinstance(value, bool) or not isinstance(value, (str, int)):
+        raise ConfigError(
+            f"配置项 bindings 的 {filename}.{field} 必须是字符串或整数，"
+            f"实际为 {type(value).__name__}"
+        )
+    text = str(value).strip()
+    if required and not text:
+        raise ConfigError(f"配置项 bindings 的 {filename}.{field} 不能为空")
+    return text
+
+
+def _bindings(section: Mapping[str, Any], key: str) -> dict[str, NodeBinding]:
+    """解析按工作流文件名索引的节点绑定 JSON。"""
+    raw = _text(section, key)
+    if not raw.strip():
+        return {}
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise ConfigError(f"配置项 {key} 不是合法 JSON: {exc}") from exc
+    if not isinstance(data, dict):
+        raise ConfigError(f"配置项 {key} 必须是 JSON 对象")
+
+    allowed = {"input", "neg", "output"}
+    result: dict[str, NodeBinding] = {}
+    for filename, entry in data.items():
+        if not isinstance(entry, Mapping):
+            raise ConfigError(f"配置项 {key} 的 {filename} 必须是对象")
+        unknown = sorted(set(entry) - allowed)
+        if unknown:
+            raise ConfigError(
+                f"配置项 {key} 的 {filename} 含未知字段: {', '.join(unknown)}"
+            )
+        result[filename] = NodeBinding(
+            input_node_id=_binding_field(filename, "input", entry, required=True),
+            neg_node_id=_binding_field(filename, "neg", entry, required=False),
+            output_node_id=_binding_field(filename, "output", entry, required=False),
+        )
+    return result
+
+
+@dataclass(frozen=True, slots=True)
+class WorkflowSettings:
+    """当前工作流与各工作流的节点绑定。"""
+
+    json_file: str
+    bindings: dict[str, NodeBinding]
 
 
 @dataclass(frozen=True, slots=True)
@@ -171,9 +233,7 @@ class Config:
             server_address=_text(raw, "server_address"),
             workflow=WorkflowSettings(
                 json_file=_text(workflow, "json_file"),
-                input_node_id=_text(workflow, "input_node_id"),
-                neg_node_id=_text(workflow, "neg_node_id"),
-                output_node_id=_text(workflow, "output_node_id"),
+                bindings=_bindings(workflow, "bindings"),
             ),
             llm=LlmSettings(
                 multi_image_mode=_boolean(llm, "multi_image_mode"),

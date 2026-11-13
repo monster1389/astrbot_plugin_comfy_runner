@@ -261,10 +261,12 @@ async def list_workflows(
             except Exception:
                 pass
 
+        binding_info = " [绑定]" if f in ctx.api.workflow.bindings else ""
+
         if f == current_file:
-            msg.append(f"✅ {i}. {f}{steps_info} (当前)")
+            msg.append(f"✅ {i}. {f}{steps_info}{binding_info} (当前)")
         else:
-            msg.append(f"   {i}. {f}{steps_info}")
+            msg.append(f"   {i}. {f}{steps_info}{binding_info}")
 
     msg.append("")
     msg.append("")
@@ -286,11 +288,17 @@ async def use_workflow(
         return
 
     args = event.message_str.split()
+    if len(args) > 2:
+        yield event.plain_result(
+            "❌ /comfy_use 不再接受节点 ID 参数\n"
+            "节点绑定已改为在 WebUI 的 workflow_settings.bindings 中登记"
+        )
+        return
     if len(args) < 2:
         yield event.plain_result(
             "❌ 参数不足\n"
-            "用法：/comfy_use <序号> [正面ID] [负面ID] [输出ID]\n"
-            "示例：/comfy_use 1 6 7 9"
+            "用法：/comfy_use <序号>\n"
+            "示例：/comfy_use 1"
         )
         return
 
@@ -317,17 +325,11 @@ async def use_workflow(
         yield event.plain_result(f"❌ 查找工作流失败: {e}")
         return
 
-    inp_id = args[2] if len(args) > 2 else None
-    neg_id = args[3] if len(args) > 3 else None
-    out_id = args[4] if len(args) > 4 else None
-
     if not ctx.api:
         yield event.plain_result("❌ ComfyUI API 未初始化")
         return
 
-    exists, msg = ctx.api.switch_workflow(
-        filename, input_id=inp_id, neg_node_id=neg_id, output_id=out_id
-    )
+    exists, msg = ctx.api.switch_workflow(filename)
     if exists:
         ctx.selection.persist(filename)
 
@@ -571,15 +573,31 @@ async def current_workflow(
     ctx: CommandContext,
     event: AstrMessageEvent,
 ) -> AsyncIterator[MessageEventResult]:
-    """显示当前工作流与三个节点绑定。"""
+    """显示当前工作流与节点绑定来源。"""
     workflow = ctx.api.workflow
     lines = [
         "当前 ComfyUI 工作流",
-        f"- 文件: {workflow.filename}",
-        f"- 正面节点: {workflow.input_node_id}",
-        f"- 负面节点: {workflow.neg_node_id or '未绑定'}",
-        f"- 输出节点: {workflow.output_node_id or '自动'}",
+        f"- 文件: {workflow.filename or '未配置'}",
     ]
+    if workflow.registered:
+        lines.extend(
+            [
+                f"- 正面节点: {workflow.input_node_id}",
+                f"- 负面节点: {workflow.neg_node_id or '未绑定'}",
+                f"- 输出节点: {workflow.output_node_id or '自动'}",
+                "- 绑定: 已登记（WebUI: workflow_settings.bindings）",
+            ]
+        )
+    else:
+        lines.extend(
+            [
+                "- 正面节点: 未登记",
+                "- 负面节点: 未登记",
+                "- 输出节点: 未登记",
+                "- 绑定: 未登记，请在 WebUI 的 "
+                "workflow_settings.bindings 中补上",
+            ]
+        )
     yield event.plain_result("\n".join(lines))
 
 

@@ -17,27 +17,14 @@
         "options": [],
         "enum": []
       },
-      "input_node_id": {
-        "title": "正面提示词节点 ID",
-        "description": "正面提示词的节点 ID",
-        "type": "string",
-        "hint": "通常是连接到 KSampler 'positive' 输入端的 CLIP Text Encode 节点",
-        "default": "6",
-        "obvious_hint": true
-      },
-      "neg_node_id": {
-        "title": "负面提示词节点 ID",
-        "description": "负面提示词的节点 ID",
-        "type": "string",
-        "hint": "通常是连接到 KSampler 'negative' 输入端的 CLIP Text Encode 节点，如果没有这个，可以乱填比如10000",
-        "default": "7",
-        "obvious_hint": true
-      },
-      "output_node_id": {
-        "description": "图片输出节点 ID (Image)",
-        "type": "string",
-        "hint": "留空则自动寻找第一个包含图片的输出节点",
-        "default": ""
+      "bindings": {
+        "title": "各工作流节点绑定",
+        "description": "按工作流文件名登记节点 ID 的 JSON 对象",
+        "type": "text",
+        "editor_mode": true,
+        "editor_language": "json",
+        "default": "{\n  \"workflow.json\": {\n    \"input\": \"6\",\n    \"neg\": \"7\",\n    \"output\": \"\"\n  }\n}",
+        "hint": "键是 workflow 目录里的文件名；input 必填，output 留空表示自动寻找输出节点，neg 目前仅记录。切换工作流时自动套用。"
       }
     }
   },
