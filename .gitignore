@@ -44,3 +44,6 @@ html_render_cache/
 .env.*
 # Git 提交脚本（不需要提交）
 git提交.py
+
+# 参考文件
+docs/references
