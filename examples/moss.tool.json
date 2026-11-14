@@ -1,0 +1,64 @@
+{
+  "version": 1,
+  "name": "comfy_moss_t2i",
+  "description": "使用 MOSS 工作流根据提示词生成图片",
+  "enabled": true,
+  "inputs": {
+    "prompt": {
+      "type": "string",
+      "description": "描述期望画面的完整提示词",
+      "required": true,
+      "minLength": 1,
+      "target": {
+        "node": "18:17",
+        "field": "value"
+      }
+    },
+    "aspect_ratio": {
+      "type": "string",
+      "description": "生成图片的画幅比例",
+      "target": {
+        "node": "19",
+        "field": "aspect_ratio"
+      },
+      "enum": [
+        "1:1 (Square)",
+        "2:3 (Portrait Photo)",
+        "3:2 (Photo)",
+        "3:4 (Portrait Standard)",
+        "4:3 (Standard)",
+        "9:16 (Portrait Widescreen)",
+        "16:9 (Widescreen)",
+        "21:9 (Ultrawide)"
+      ]
+    },
+    "megapixels": {
+      "type": "number",
+      "description": "生成图片的总像素量级",
+      "minimum": 0.1,
+      "maximum": 16.0,
+      "target": {
+        "node": "19",
+        "field": "megapixels"
+      }
+    },
+    "seed": {
+      "type": "integer",
+      "description": "随机种子；不提供时使用工作流原值",
+      "minimum": 0,
+      "target": {
+        "node": "26",
+        "field": "seed"
+      }
+    }
+  },
+  "outputs": {
+    "image": {
+      "type": "image",
+      "target": {
+        "node": "9",
+        "field": "images"
+      }
+    }
+  }
+}
