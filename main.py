@@ -16,6 +16,7 @@ from .comfy_runner.api import ComfyUI
 from .comfy_runner.commands import CommandContext
 from .comfy_runner.config import Config
 from .comfy_runner.draw import Drawer
+from .comfy_runner.execution import ConcurrencyGate, WorkflowExecutor
 from .comfy_runner.plugin_state import WorkflowSelection, prepare_data_dir
 from .comfy_runner.registry import build_tools
 from .comfy_runner.tools import build_function_tools
@@ -47,13 +48,20 @@ class ComfyUIPlugin(Star):
         control = self.cfg.control
 
         self.workflow_tools = build_tools(self.cfg.workflow_dir, PLUGIN_DIR)
-        self.function_tools = build_function_tools(self.workflow_tools, __name__)
+        self.api = ComfyUI(self.cfg)
+        self.executor = WorkflowExecutor(self.api.client)
+        self.gate = ConcurrencyGate(self.cfg.execution.max_concurrency)
+        self.function_tools = build_function_tools(
+            self.workflow_tools,
+            __name__,
+            self.executor,
+            self.gate,
+        )
 
         self.access = AccessController(
             control,
             load_lexicon(self.cfg.sensitive_words_path),
         )
-        self.api = ComfyUI(self.cfg)
         self.selection.sync_options(self.api.workflow.list_files())
         self.selection.log_status(self.api.workflow)
         self.drawer = Drawer(self.api, self.access, self.cfg.output_dir)
@@ -75,6 +83,11 @@ class ComfyUIPlugin(Star):
         )
         tool_names = ", ".join(tool.name for tool in self.function_tools) or "无"
         logger.info(f"[ComfyUI] 启用的工作流工具: {tool_names}")
+        logger.info(
+            f"[ComfyUI] 执行上限: 并发 {self.gate.limit} | "
+            f"超时 {self.cfg.execution.timeout_seconds} 秒 | "
+            f"轮询 {self.cfg.execution.poll_interval_seconds} 秒"
+        )
         if self.access.lockdown:
             logger.warning("[ComfyUI] 绘图功能全局锁定已启用，仅超级管理员可用")
         logger.info("[ComfyUI] ComfyUI API 初始化成功")

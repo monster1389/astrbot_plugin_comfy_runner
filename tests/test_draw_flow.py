@@ -5,7 +5,7 @@ import json
 from pathlib import Path
 
 from astrbot.api.message_components import Plain
-from helpers import FakeEvent, FakeResult, collect, make_plugin
+from helpers import FakeComfyServer, FakeEvent, FakeResult, collect, make_plugin
 
 FIXTURE = Path(__file__).with_name("fixtures") / "workflow_min.json"
 
@@ -35,20 +35,14 @@ def test_paint_rejects_sensitive_prompt(tmp_path, monkeypatch):
             "default_group_policy": "full",
         },
     )
-    calls = []
-
-    async def fake_generate(graph, output_node_id):
-        calls.append((graph, output_node_id))
-        return b"unexpected"
-
-    monkeypatch.setattr(plugin.api.client, "generate", fake_generate)
+    server = FakeComfyServer().install(monkeypatch)
 
     event = FakeEvent("/画图 blood, smile", sender="5", group="2")
     results = collect(plugin.cmd_paint(event))
 
     assert results[0][0] == "text"
     assert "敏感词" in results[0][1]
-    assert calls == []
+    assert server.submissions == []
 
 
 def test_multi_image_sends_text_and_images_in_order(tmp_path, monkeypatch):
@@ -72,13 +66,17 @@ def test_multi_image_sends_text_and_images_in_order(tmp_path, monkeypatch):
         llm_settings={"multi_image_mode": True},
         control={"admin_ids": ["9"], "whitelist_group_ids": ["2"]},
     )
-    prompts = []
-
-    async def fake_generate(graph, output_node_id):
-        prompts.append(graph["1"]["inputs"]["text"])
-        return b"png-bytes"
-
-    monkeypatch.setattr(plugin.api.client, "generate", fake_generate)
+    server = FakeComfyServer().install(monkeypatch)
+    server.history_reply = {
+        "p1": {
+            "status": {"status_str": "success", "completed": True},
+            "outputs": {
+                "4": {
+                    "images": [{"filename": "a.png", "subfolder": "", "type": "output"}]
+                }
+            },
+        }
+    }
 
     event = FakeEvent(sender="9", group="2")
     event._comfy_segments = [
@@ -93,6 +91,9 @@ def test_multi_image_sends_text_and_images_in_order(tmp_path, monkeypatch):
     asyncio.run(plugin._send_multi_image_results(event))
 
     assert [kind for kind, _ in event.sent] == ["chain", "chain", "chain", "chain"]
-    assert prompts == ["one girl, smile", "blue sky, clouds"]
+    assert [graph["1"]["inputs"]["text"] for graph in server.submissions] == [
+        "one girl, smile",
+        "blue sky, clouds",
+    ]
     assert event.get_result().chain == []
     assert len(list((tmp_path / "plugin_data" / "output").glob("*.png"))) == 2

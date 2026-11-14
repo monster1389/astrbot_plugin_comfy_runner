@@ -43,6 +43,13 @@ def _boolean(section: Mapping[str, Any], key: str) -> bool:
     return value
 
 
+def _number(section: Mapping[str, Any], key: str) -> float:
+    value = section.get(key)
+    if isinstance(value, bool) or not isinstance(value, int | float):
+        raise ConfigError(f"配置项 {key} 必须是数字，实际为 {type(value).__name__}")
+    return float(value)
+
+
 def _id_set(section: Mapping[str, Any], key: str) -> frozenset[str]:
     value = section.get(key)
     if not isinstance(value, list):
@@ -179,6 +186,15 @@ class ControlSettings:
 
 
 @dataclass(frozen=True, slots=True)
+class ExecutionSettings:
+    """单次执行的边界配置。"""
+
+    max_concurrency: int
+    timeout_seconds: int
+    poll_interval_seconds: float
+
+
+@dataclass(frozen=True, slots=True)
 class Config:
     """插件配置的只读快照。"""
 
@@ -186,6 +202,7 @@ class Config:
     workflow: WorkflowSettings
     llm: LlmSettings
     control: ControlSettings
+    execution: ExecutionSettings
     data_dir: Path
 
     @property
@@ -222,11 +239,29 @@ class Config:
         lora = _section(llm, "lora_control")
         control = _section(raw, "control")
         bypass = _section(control, "admin_bypass")
+        execution = _section(raw, "execution")
 
         target_image_count = _integer(llm, "target_image_count")
         if target_image_count < 1:
             raise ConfigError(
                 f"配置项 target_image_count 必须大于 0，实际为 {target_image_count}",
+            )
+
+        max_concurrency = _integer(execution, "max_concurrency")
+        if max_concurrency < 1:
+            raise ConfigError(
+                f"配置项 max_concurrency 必须大于 0，实际为 {max_concurrency}",
+            )
+        timeout_seconds = _integer(execution, "timeout_seconds")
+        if timeout_seconds < 1:
+            raise ConfigError(
+                f"配置项 timeout_seconds 必须大于 0，实际为 {timeout_seconds}",
+            )
+        poll_interval_seconds = _number(execution, "poll_interval_seconds")
+        if poll_interval_seconds <= 0:
+            raise ConfigError(
+                "配置项 poll_interval_seconds 必须大于 0，"
+                f"实际为 {poll_interval_seconds}",
             )
 
         return cls(
@@ -283,6 +318,11 @@ class Config:
                     cooldown=_boolean(bypass, "cooldown"),
                     sensitive_words=_boolean(bypass, "sensitive_words"),
                 ),
+            ),
+            execution=ExecutionSettings(
+                max_concurrency=max_concurrency,
+                timeout_seconds=timeout_seconds,
+                poll_interval_seconds=poll_interval_seconds,
             ),
             data_dir=data_dir,
         )

@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 from astrbot_plugin_comfy_runner.comfy_runner.contract import ContractError
-from helpers import FakeEvent, collect, make_plugin
+from helpers import FakeComfyServer, FakeEvent, collect, make_plugin
 
 WORKFLOW = {
     "1": {"class_type": "CLIPTextEncode", "inputs": {"text": ""}},
@@ -224,3 +224,38 @@ def test_check_command_requires_admin(tmp_path, monkeypatch):
     results = collect(plugin.cmd_comfy_check(FakeEvent("/comfy check", sender="5")))
 
     assert "权限不足" in results[0][1]
+
+
+def test_check_command_remote_reports_unknown_field(tmp_path, monkeypatch):
+    """Remote 模式用节点定义核对目标字段。"""
+    write_contract(tmp_path)
+    plugin, _ = make_plugin(tmp_path, monkeypatch, control=admin_overrides())
+    server = FakeComfyServer().install(monkeypatch)
+    server.object_info = {"CLIPTextEncode": {"input": {"required": {}}}}
+
+    results = collect(
+        plugin.cmd_comfy_check(FakeEvent("/comfy check remote", sender="9"))
+    )
+
+    assert "已附带 ComfyUI 节点定义核对" in results[0][1]
+    assert "参数 prompt 的字段 1.text 不在节点类型 CLIPTextEncode 的输入中" in (
+        results[0][1]
+    )
+
+
+def test_check_command_remote_accepts_known_field(tmp_path, monkeypatch):
+    """远端字段存在时检查通过。"""
+    write_contract(tmp_path)
+    plugin, _ = make_plugin(tmp_path, monkeypatch, control=admin_overrides())
+    server = FakeComfyServer().install(monkeypatch)
+    server.object_info = {
+        "CLIPTextEncode": {"input": {"required": {"text": ["STRING", {}]}}},
+        "KSampler": {"input": {"required": {"seed": ["INT", {}]}}},
+    }
+
+    results = collect(
+        plugin.cmd_comfy_check(FakeEvent("/comfy check remote", sender="9"))
+    )
+
+    assert "moss.tool.json -> comfy_moss_t2i [启用]" in results[0][1]
+    assert "不在节点类型" not in results[0][1]

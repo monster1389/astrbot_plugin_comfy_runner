@@ -4,6 +4,7 @@ import asyncio
 import json
 from pathlib import Path
 
+import aiohttp
 import pytest
 from astrbot.api.star import StarTools
 from astrbot.core.config.astrbot_config import AstrBotConfig
@@ -148,3 +149,100 @@ def collect(gen) -> list:
 
 async def _collect(gen) -> list:
     return [item async for item in gen]
+
+
+class FakeResponse:
+    """假 HTTP 响应，供真实客户端解析。"""
+
+    def __init__(self, status: int, body: bytes) -> None:
+        """记录状态码与响应体。
+
+        Args:
+            status: HTTP 状态码。
+            body: 响应体字节。
+        """
+        self.status = status
+        self._body = body
+
+    async def text(self) -> str:
+        """返回响应体文本。"""
+        return self._body.decode("utf-8")
+
+    async def json(self, content_type=None):
+        """返回解析后的响应体。"""
+        return json.loads(self._body)
+
+    async def read(self) -> bytes:
+        """返回响应体字节。"""
+        return self._body
+
+    async def __aenter__(self) -> "FakeResponse":
+        """进入上下文。"""
+        return self
+
+    async def __aexit__(self, *exc_info) -> bool:
+        """退出上下文。"""
+        return False
+
+
+class FakeComfyServer:
+    """按路由回复的假 ComfyUI，用于断言真实客户端的解析结果。"""
+
+    def __init__(self) -> None:
+        """设置默认响应。"""
+        self.submissions: list[dict] = []
+        self.history_queries: list[str] = []
+        self.downloads: list[str] = []
+        self.prompt_response = (200, {"prompt_id": "p1", "node_errors": {}})
+        self.history_queue: list[dict] = []
+        self.history_reply: dict = {}
+        self.view_response = (200, b"png-bytes")
+        self.object_info: dict[str, dict] = {}
+
+    def install(self, monkeypatch: pytest.MonkeyPatch) -> "FakeComfyServer":
+        """把 aiohttp 会话替换成这个假服务。"""
+        server = self
+
+        class FakeSession:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *exc_info):
+                return False
+
+            def post(self, url, json=None, timeout=None):
+                return server._post(str(url), json or {})
+
+            def get(self, url, timeout=None):
+                return server._get(str(url))
+
+        monkeypatch.setattr(aiohttp, "ClientSession", FakeSession)
+        return self
+
+    def _post(self, url: str, payload: dict) -> FakeResponse:
+        if url.endswith("/prompt"):
+            self.submissions.append(payload["prompt"])
+            return _response(*self.prompt_response)
+        raise AssertionError(f"未预期的 POST: {url}")
+
+    def _get(self, url: str) -> FakeResponse:
+        if "/history/" in url:
+            self.history_queries.append(url.rsplit("/", 1)[-1])
+            reply = (
+                self.history_queue.pop(0) if self.history_queue else self.history_reply
+            )
+            return _response(200, reply)
+        if "/view?" in url:
+            self.downloads.append(url)
+            return _response(*self.view_response)
+        if "/object_info/" in url:
+            return _response(200, self.object_info)
+        raise AssertionError(f"未预期的 GET: {url}")
+
+
+def _response(status: int, body: object) -> FakeResponse:
+    if isinstance(body, bytes):
+        return FakeResponse(status, body)
+    if isinstance(body, str):
+        return FakeResponse(status, body.encode("utf-8"))
+    return FakeResponse(status, json.dumps(body).encode("utf-8"))

@@ -6,21 +6,21 @@ from typing import Any
 
 from astrbot.api import logger
 
-from .comfy import ComfyClient, ComfyError
+from .comfy import (
+    ArtifactRef,
+    ComfyClient,
+    ComfyError,
+    OutputError,
+    artifact_ref,
+    ensure_success,
+)
 from .config import Config
 from .lora import LoraManager
-from .workflow import (
-    Workflow,
-    apply_lora_selections,
-    apply_steps_override,
-    inject_prompt,
-    inject_seeds,
-    load_steps_override,
-)
+from .workflow import Workflow, inject_prompt
 
 
 class ComfyUI:
-    """一次出图所需的三件东西：HTTP 客户端、当前工作流、LoRA 管理器。"""
+    """旧出图路径的装配：HTTP 客户端、当前工作流、LoRA 管理器。"""
 
     def __init__(self, config: Config) -> None:
         """按配置装配客户端。
@@ -28,7 +28,11 @@ class ComfyUI:
         Args:
             config: 插件配置。
         """
-        self.client = ComfyClient(config.server_address)
+        self.client = ComfyClient(
+            config.server_address,
+            timeout=config.execution.timeout_seconds,
+            poll_interval=config.execution.poll_interval_seconds,
+        )
         self.workflow = Workflow(
             directory=config.workflow_dir,
             filename=config.workflow.json_file,
@@ -81,49 +85,14 @@ class ComfyUI:
         self,
         workflow: dict[str, Any],
         prompt: str,
-        lora_selections: list[dict[str, Any]] | None = None,
     ) -> None:
-        """把提示词、LoRA、步数覆盖与随机种子写进工作流。
+        """把提示词写进工作流。
 
         Args:
             workflow: 工作流图。
             prompt: 正面提示词。
-            lora_selections: 已解析的 LoRA 选择。
         """
         inject_prompt(workflow, self.workflow.input_node_id, prompt)
-
-        if self.lora.settings.enabled and lora_selections:
-            applied = apply_lora_selections(
-                workflow,
-                lora_selections,
-                keep_defaults=self.lora.settings.keep_workflow_defaults_when_selected,
-            )
-            if applied:
-                logger.info(f"[ComfyUI] applied LoRA selections: {', '.join(applied)}")
-            else:
-                logger.info(
-                    "[ComfyUI] LoRA selections detected, "
-                    "but no compatible LoRA stack node was found"
-                )
-
-        overrides = load_steps_override(self.workflow.steps_override_path)
-        if overrides:
-            count = apply_steps_override(workflow, overrides)
-            if count > 0:
-                override_info = ", ".join(
-                    f"{key}:{value}步" for key, value in overrides.items()
-                )
-                logger.info(
-                    f"[ComfyUI] steps override applied: {override_info} "
-                    f"(updated {count} targets)"
-                )
-            else:
-                logger.info(
-                    "[ComfyUI] steps override configured "
-                    "but no matching reference was found"
-                )
-
-        inject_seeds(workflow)
 
     async def generate(
         self,
@@ -141,8 +110,7 @@ class ComfyUI:
         """
         if not self.workflow.filename:
             return None, (
-                "未配置工作流文件；请用 /comfy_ls 查看可用工作流，"
-                "并用 /comfy_use 切换"
+                "未配置工作流文件；请用 /comfy ls 查看可用工作流，并用 /comfy_use 切换"
             )
         if not self.workflow.registered:
             return None, (
@@ -153,9 +121,7 @@ class ComfyUI:
         try:
             workflow = self.workflow.load()
         except (OSError, ValueError) as exc:
-            return None, (
-                f"{exc}；请用 /comfy_ls 查看可用工作流，并用 /comfy_use 切换"
-            )
+            return None, (f"{exc}；请用 /comfy ls 查看可用工作流，并用 /comfy_use 切换")
 
         resolved = (
             self.lora.resolve_selections(lora_selections)
@@ -166,10 +132,37 @@ class ComfyUI:
         if hints:
             logger.info(f"[ComfyUI] injected LoRA prompt hints: {', '.join(hints)}")
 
-        self.inject_params(workflow, prompt, resolved)
+        self.inject_params(workflow, prompt)
 
         try:
-            image = await self.client.generate(workflow, self.workflow.output_node_id)
+            prompt_id = await self.client.submit(workflow)
+            entry = await self.client.wait(prompt_id)
+            ref = _first_image(entry, self.workflow.output_node_id)
+            image = await self.client.download(ref)
         except ComfyError as exc:
             return None, str(exc)
         return image, None
+
+
+def _first_image(entry: dict[str, Any], output_node_id: str) -> ArtifactRef:
+    """旧路径取图：指定节点或第一个有图的节点。"""
+    ensure_success(entry)
+    outputs = entry.get("outputs")
+    if not isinstance(outputs, dict):
+        raise OutputError("执行结果缺少 outputs")
+
+    candidates = [outputs.get(output_node_id)] if output_node_id else []
+    if not output_node_id:
+        candidates = list(outputs.values())
+
+    for node_output in candidates:
+        if not isinstance(node_output, dict):
+            continue
+        for item in node_output.get("images") or []:
+            ref = artifact_ref(item)
+            if ref is not None:
+                return ref
+
+    if output_node_id:
+        raise OutputError(f"输出节点 {output_node_id} 没有图片")
+    raise OutputError("工作流执行完成，但未找到输出图片")

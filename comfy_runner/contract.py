@@ -184,7 +184,7 @@ def validate_contract(contract: ToolContract) -> list[str]:
     except ContractError as exc:
         return errors + [f"{label}: 缺少可用的配对工作流: {exc}"]
 
-    errors.extend(_input_target_errors(contract, graph, label))
+    errors.extend(input_target_errors(contract, graph, label))
     errors.extend(_output_target_errors(contract, graph, label))
     return errors
 
@@ -393,11 +393,21 @@ def _output_type_errors(contract: ToolContract, label: str) -> list[str]:
     return errors
 
 
-def _input_target_errors(
+def input_target_errors(
     contract: ToolContract,
     graph: dict[str, Any],
     label: str,
 ) -> list[str]:
+    """检查参数映射在当前工作流里是否成立。
+
+    Args:
+        contract: 工具契约。
+        graph: 工作流图。
+        label: 出现在错误里的文件名。
+
+    Returns:
+        面向管理员的问题描述；为空表示映射成立。
+    """
     errors: list[str] = []
     for name in sorted(contract.inputs):
         parameter = contract.inputs[name]

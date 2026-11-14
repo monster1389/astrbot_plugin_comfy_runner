@@ -4,7 +4,7 @@ import json
 from pathlib import Path
 
 import pytest
-from helpers import FakeEvent, collect, make_plugin
+from helpers import FakeComfyServer, FakeEvent, collect, make_plugin
 
 FIXTURE = Path(__file__).with_name("fixtures") / "workflow_min.json"
 
@@ -112,28 +112,29 @@ def test_paint_loads_workflow_and_injects_prompt(tmp_path, monkeypatch):
         monkeypatch,
         workflow_settings={
             "json_file": "wf.json",
-            "bindings": json.dumps(
-                {"wf.json": {"input": 1, "neg": 2, "output": 4}}
-            ),
+            "bindings": json.dumps({"wf.json": {"input": 1, "neg": 2, "output": 4}}),
         },
         control={"admin_ids": ["9"], "whitelist_group_ids": ["2"]},
     )
-    captured = {}
-
-    async def fake_generate(graph, output_node_id):
-        captured["graph"] = graph
-        captured["output_node_id"] = output_node_id
-        return b"png-bytes"
-
-    monkeypatch.setattr(plugin.api.client, "generate", fake_generate)
+    server = FakeComfyServer().install(monkeypatch)
+    server.history_reply = {
+        "p1": {
+            "status": {"status_str": "success", "completed": True},
+            "outputs": {
+                "4": {
+                    "images": [{"filename": "a.png", "subfolder": "", "type": "output"}]
+                }
+            },
+        }
+    }
 
     results = collect(plugin.cmd_paint(FakeEvent("/画图 one girl, smile")))
 
+    graph = server.submissions[0]
     assert results[0][0] == "chain"
     assert type(results[0][1][0]).__name__ == "Node"
-    assert captured["graph"]["1"]["inputs"]["text"] == "one girl, smile"
-    assert captured["graph"]["3"]["inputs"]["seed"] != 1
-    assert captured["output_node_id"] == "4"
+    assert graph["1"]["inputs"]["text"] == "one girl, smile"
+    assert graph["3"]["inputs"]["seed"] == 1
     assert len(list((tmp_path / "plugin_data" / "output").glob("*.png"))) == 1
 
 
@@ -144,9 +145,9 @@ def test_paint_loads_workflow_and_injects_prompt(tmp_path, monkeypatch):
         (
             "missing.json",
             json.dumps({"missing.json": {"input": "6"}}),
-            "/comfy_ls",
+            "/comfy ls",
         ),
-        ("", "{}", "/comfy_ls"),
+        ("", "{}", "/comfy ls"),
     ],
 )
 def test_paint_reports_missing_workflow(
@@ -163,19 +164,13 @@ def test_paint_reports_missing_workflow(
         workflow_settings={"json_file": filename, "bindings": bindings},
         control={"admin_ids": ["9"], "whitelist_group_ids": ["2"]},
     )
-    calls = []
-
-    async def fake_generate(graph, output_node_id):
-        calls.append((graph, output_node_id))
-        return b"unexpected"
-
-    monkeypatch.setattr(plugin.api.client, "generate", fake_generate)
+    server = FakeComfyServer().install(monkeypatch)
 
     results = collect(plugin.cmd_paint(FakeEvent("/画图 one girl")))
 
     assert results[0][0] == "text"
     assert expected in results[0][1]
-    assert calls == []
+    assert server.submissions == []
 
 
 def test_switch_applies_each_workflow_binding(tmp_path, monkeypatch):
@@ -214,24 +209,28 @@ def test_switch_applies_each_workflow_binding(tmp_path, monkeypatch):
             "cooldown_seconds": 0,
         },
     )
-    captured = []
-
-    async def fake_generate(graph, output_node_id):
-        captured.append((graph, output_node_id))
-        return b"png-bytes"
-
-    monkeypatch.setattr(plugin.api.client, "generate", fake_generate)
+    server = FakeComfyServer().install(monkeypatch)
+    server.history_reply = {
+        "p1": {
+            "status": {"status_str": "success", "completed": True},
+            "outputs": {
+                "4": {
+                    "images": [{"filename": "a.png", "subfolder": "", "type": "out"}]
+                },
+                "20": {
+                    "images": [{"filename": "b.png", "subfolder": "", "type": "out"}]
+                },
+            },
+        }
+    }
 
     collect(plugin.cmd_paint(FakeEvent("/画图 first", sender="5", group="2")))
     collect(plugin.cmd_comfy_use(FakeEvent("/comfy_use 2", sender="9", group="2")))
     collect(plugin.cmd_paint(FakeEvent("/画图 second", sender="5", group="2")))
 
-    first_graph, first_output = captured[0]
-    second_graph, second_output = captured[1]
+    first_graph, second_graph = server.submissions
     assert first_graph["1"]["inputs"]["text"] == "first"
-    assert first_output == "4"
     assert second_graph["10"]["inputs"]["text"] == "second"
-    assert second_output == "20"
 
 
 def test_unregistered_workflow_is_rejected(tmp_path, monkeypatch):
@@ -250,13 +249,7 @@ def test_unregistered_workflow_is_rejected(tmp_path, monkeypatch):
         },
         control={"admin_ids": ["9"], "whitelist_group_ids": ["2"]},
     )
-    calls = []
-
-    async def fake_generate(graph, output_node_id):
-        calls.append(output_node_id)
-        return b"unexpected"
-
-    monkeypatch.setattr(plugin.api.client, "generate", fake_generate)
+    server = FakeComfyServer().install(monkeypatch)
 
     switched = collect(
         plugin.cmd_comfy_use(FakeEvent("/comfy_use 2", sender="9", group="2"))
@@ -272,7 +265,7 @@ def test_unregistered_workflow_is_rejected(tmp_path, monkeypatch):
 
     assert results[0][0] == "text"
     assert "未在 bindings 中登记" in results[0][1]
-    assert calls == []
+    assert server.submissions == []
 
 
 def test_use_workflow_rejects_node_id_arguments(tmp_path, monkeypatch):
@@ -283,9 +276,7 @@ def test_use_workflow_rejects_node_id_arguments(tmp_path, monkeypatch):
         control={"admin_ids": ["9"], "whitelist_group_ids": ["2"]},
     )
 
-    results = collect(
-        plugin.cmd_comfy_use(FakeEvent("/comfy_use 1 6 7 9", sender="9"))
-    )
+    results = collect(plugin.cmd_comfy_use(FakeEvent("/comfy_use 1 6 7 9", sender="9")))
 
     assert results[0][0] == "text"
     assert "bindings" in results[0][1]

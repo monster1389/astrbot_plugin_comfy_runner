@@ -6,6 +6,27 @@
     "obvious_hint": true,
     "default": "127.0.0.1:8188"
   },
+  "execution": {
+    "description": "工作流执行限制",
+    "type": "object",
+    "items": {
+      "max_concurrency": {
+        "description": "同时执行的工作流上限，超过上限的调用直接拒绝，不排队",
+        "type": "int",
+        "default": 2
+      },
+      "timeout_seconds": {
+        "description": "单次执行同步等待的总时长上限（秒）",
+        "type": "int",
+        "default": 300
+      },
+      "poll_interval_seconds": {
+        "description": "查询执行状态的间隔（秒）",
+        "type": "float",
+        "default": 1.0
+      }
+    }
+  },
   "workflow_settings": {
     "description": "ComfyUI 工作流节点配置",
     "type": "object",
