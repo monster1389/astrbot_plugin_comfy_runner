@@ -1,4 +1,4 @@
-"""AstrBot 插件入口：注册命令与钩子，装配依赖。"""
+"""AstrBot 插件入口：注册命令与工作流工具，装配依赖。"""
 
 from __future__ import annotations
 
@@ -19,7 +19,7 @@ from .comfy_runner.draw import Drawer
 from .comfy_runner.execution import ConcurrencyGate, WorkflowExecutor
 from .comfy_runner.plugin_state import WorkflowSelection, prepare_data_dir
 from .comfy_runner.registry import build_tools
-from .comfy_runner.tools import build_function_tools
+from .comfy_runner.tools import WorkflowToolAdapter, build_function_tools
 
 PLUGIN_DIR = Path(os.path.dirname(os.path.abspath(__file__)))
 
@@ -47,21 +47,26 @@ class ComfyUIPlugin(Star):
         self.cfg = self.selection.config
         control = self.cfg.control
 
-        self.workflow_tools = build_tools(self.cfg.workflow_dir, PLUGIN_DIR)
-        self.api = ComfyUI(self.cfg)
-        self.executor = WorkflowExecutor(self.api.client)
-        self.gate = ConcurrencyGate(self.cfg.execution.max_concurrency)
-        self.function_tools = build_function_tools(
-            self.workflow_tools,
-            __name__,
-            self.executor,
-            self.gate,
-        )
-
         self.access = AccessController(
             control,
             load_lexicon(self.cfg.sensitive_words_path),
         )
+        self.api = ComfyUI(self.cfg)
+        self.executor = WorkflowExecutor(self.api.client)
+        self.gate = ConcurrencyGate(self.cfg.execution.max_concurrency)
+        self.adapter = WorkflowToolAdapter(
+            self.access,
+            self.executor,
+            self.gate,
+            self.cfg.output_dir,
+        )
+        self.workflow_tools = build_tools(self.cfg.workflow_dir, PLUGIN_DIR)
+        self.function_tools = build_function_tools(
+            self.workflow_tools,
+            __name__,
+            self.adapter,
+        )
+
         self.selection.sync_options(self.api.workflow.list_files())
         self.selection.log_status(self.api.workflow)
         self.drawer = Drawer(self.api, self.access, self.cfg.output_dir)
@@ -89,15 +94,14 @@ class ComfyUIPlugin(Star):
             f"轮询 {self.cfg.execution.poll_interval_seconds} 秒"
         )
         if self.access.lockdown:
-            logger.warning("[ComfyUI] 绘图功能全局锁定已启用，仅超级管理员可用")
+            logger.warning("[ComfyUI] 工作流工具全局锁定已启用，仅超级管理员可用")
         logger.info("[ComfyUI] ComfyUI API 初始化成功")
 
     async def initialize(self) -> None:
-        """插件加载完成后注册工作流工具并激活旧工具。"""
+        """插件加载完成后注册工作流工具。"""
         if self.function_tools:
             self.context.add_llm_tools(*self.function_tools)
             logger.info(f"[ComfyUI] 已注册 {len(self.function_tools)} 个工作流工具")
-        self.context.activate_llm_tool("comfyui_txt2img")
         logger.info("[ComfyUI] 插件初始化完成")
 
     @filter.command_group("comfy")
@@ -124,7 +128,7 @@ class ComfyUIPlugin(Star):
 
     @comfy.command("ls")
     async def cmd_comfy_list(self, event: AstrMessageEvent):
-        """列出可用工作流。"""
+        """列出工作流与契约状态。"""
         async for result in commands.list_workflows(self.cmd_ctx, event):
             yield result
 
@@ -138,30 +142,6 @@ class ComfyUIPlugin(Star):
     async def cmd_comfy_save(self, event: AstrMessageEvent):
         """保存或导入工作流。"""
         async for result in commands.save_workflow(self.cmd_ctx, event):
-            yield result
-
-    @filter.command("comfy_use")
-    async def cmd_comfy_use(self, event: AstrMessageEvent):
-        """切换当前工作流。"""
-        async for result in commands.use_workflow(self.cmd_ctx, event):
-            yield result
-
-    @filter.command("comfy_add")
-    async def cmd_comfy_add(self, event: AstrMessageEvent):
-        """绑定或查看步数覆盖。"""
-        async for result in commands.add_steps(self.cmd_ctx, event):
-            yield result
-
-    @filter.command("当前工作流", aliases=["comfy_current", "当前wf"])
-    async def cmd_comfy_current(self, event: AstrMessageEvent):
-        """显示当前工作流与节点绑定。"""
-        async for result in commands.current_workflow(self.cmd_ctx, event):
-            yield result
-
-    @filter.command("测试lora", aliases=["lora_test", "lora测试"])
-    async def cmd_lora_test(self, event: AstrMessageEvent):
-        """查看 LoRA 清单或预演选择解析。"""
-        async for result in commands.lora_test(self.cmd_ctx, event):
             yield result
 
     @filter.command("重绘", aliases=["重抽", "reroll"])
@@ -190,35 +170,6 @@ class ComfyUIPlugin(Star):
         """生成一张图并直接发出。"""
         async for result in commands.paint(self.cmd_ctx, event, direct_send=True):
             yield result
-
-    @filter.on_llm_request(priority=100)
-    async def inject_system_prompt(self, event: AstrMessageEvent, req) -> None:
-        """注入绘图 system prompt 与最近的失败状态。"""
-        await commands.on_llm_request(self.cmd_ctx, event, req)
-
-    @filter.on_llm_response(priority=70)
-    async def _extract_prompt_before_filter(
-        self,
-        event: AstrMessageEvent,
-        resp,
-    ) -> None:
-        """从 LLM 回复里提取绘图标签。"""
-        await commands.on_llm_response(self.cmd_ctx, event, resp)
-
-    @filter.on_decorating_result(priority=99)
-    async def _auto_paint_from_llm(self, event: AstrMessageEvent) -> None:
-        """多图模式下改写消息链，单图模式下启动异步出图。"""
-        await commands.stage_build_chain(self.cmd_ctx, event)
-
-    @filter.on_decorating_result(priority=5)
-    async def _cleanup_history_prompts(self, event: AstrMessageEvent) -> None:
-        """按配置清理历史里的绘图提示词。"""
-        await commands.stage_clean_history(self.cmd_ctx, event)
-
-    @filter.on_decorating_result(priority=10)
-    async def _send_multi_image_results(self, event: AstrMessageEvent) -> None:
-        """按图片占位标记分组发送。"""
-        await commands.stage_send_images(self.cmd_ctx, event)
 
     @llm_tool(name="comfyui_txt2img")
     async def comfyui_txt2img(

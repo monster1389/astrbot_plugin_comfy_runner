@@ -6,7 +6,6 @@ from pathlib import Path
 
 import pytest
 from astrbot_plugin_comfy_runner.comfy_runner.comfy import (
-    ComfyError,
     DownloadError,
     ExecutionFailed,
     ExecutionTimeout,
@@ -14,6 +13,7 @@ from astrbot_plugin_comfy_runner.comfy_runner.comfy import (
     SubmitError,
 )
 from astrbot_plugin_comfy_runner.comfy_runner.contract import ContractError
+from astrbot_plugin_comfy_runner.comfy_runner.tools import WorkflowRejected
 from helpers import FakeComfyServer, FakeEvent, make_plugin
 
 WORKFLOW = {
@@ -139,7 +139,7 @@ def test_success_returns_summary_and_downloads_artifact(tmp_path, monkeypatch):
 
     summary = run(plugin, prompt="一次")
 
-    assert summary == "已生成 1 个产物"
+    assert summary == "已生成 1 个产物并发送到当前会话"
     assert len(server.downloads) == 1
 
 
@@ -251,7 +251,7 @@ def test_concurrency_limit_rejects_without_queueing(tmp_path, monkeypatch):
     plugin, server = setup(tmp_path, monkeypatch, execution={"max_concurrency": 1})
     assert plugin.gate.try_acquire()
 
-    with pytest.raises(ComfyError, match="并发已满（上限 1）"):
+    with pytest.raises(WorkflowRejected, match="并发已满（上限 1）"):
         run(plugin, prompt="一次")
 
     plugin.gate.release()
@@ -278,4 +278,4 @@ def test_slot_is_released_after_timeout(tmp_path, monkeypatch):
     assert plugin.gate.active == 0
 
     server.history_reply = SUCCESS
-    assert run(plugin, prompt="二次") == "已生成 1 个产物"
+    assert run(plugin, prompt="二次") == "已生成 1 个产物并发送到当前会话"

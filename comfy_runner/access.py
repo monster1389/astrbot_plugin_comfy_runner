@@ -136,7 +136,7 @@ class AccessController:
         is_admin = user_id in self.admin_ids
 
         if self.lockdown and not is_admin:
-            return False, "🚫 绘图失败:绘图功能锁定中，仅超级管理员可用"
+            return False, "🚫 工作流工具已全局锁定，仅管理员可用"
 
         if is_group_message(event):
             gid = group_id(event)

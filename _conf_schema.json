@@ -171,7 +171,7 @@
         "default": false
       },
       "lockdown_command_enabled": {
-        "description": "启用 /comfy_lock 命令开关（管理员可动态开关全局锁定）",
+        "description": "启用 /comfy lock 命令开关（管理员可动态开关全局锁定）",
         "type": "bool",
         "default": true
       },

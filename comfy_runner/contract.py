@@ -157,6 +157,8 @@ def read_workflow(path: Path) -> dict[str, Any]:
     """
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError as exc:
+        raise ContractError(f"缺少配对工作流 {path.name}") from exc
     except OSError as exc:
         raise ContractError(f"无法读取工作流 {path.name}: {exc}") from exc
     except json.JSONDecodeError as exc:
@@ -182,7 +184,7 @@ def validate_contract(contract: ToolContract) -> list[str]:
     try:
         graph = read_workflow(contract.workflow_path)
     except ContractError as exc:
-        return errors + [f"{label}: 缺少可用的配对工作流: {exc}"]
+        return errors + [f"{label}: {exc}"]
 
     errors.extend(input_target_errors(contract, graph, label))
     errors.extend(_output_target_errors(contract, graph, label))

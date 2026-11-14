@@ -110,7 +110,8 @@ class ComfyUI:
         """
         if not self.workflow.filename:
             return None, (
-                "未配置工作流文件；请用 /comfy ls 查看可用工作流，并用 /comfy_use 切换"
+                "未配置工作流文件；请用 /comfy ls 查看可用工作流，"
+                "并在插件配置里选择工作流"
             )
         if not self.workflow.registered:
             return None, (
@@ -121,7 +122,10 @@ class ComfyUI:
         try:
             workflow = self.workflow.load()
         except (OSError, ValueError) as exc:
-            return None, (f"{exc}；请用 /comfy ls 查看可用工作流，并用 /comfy_use 切换")
+            return None, (
+                f"{exc}；请用 /comfy ls 查看可用工作流，"
+                "并在插件配置里选择工作流"
+            )
 
         resolved = (
             self.lora.resolve_selections(lora_selections)

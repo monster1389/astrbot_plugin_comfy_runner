@@ -35,14 +35,13 @@ def test_webui_lists_workflows_and_follows_save(tmp_path, monkeypatch):
     assert item["options"] == ["a.json", "b.json"]
     assert item["enum"] == ["a.json", "b.json"]
 
-    listing = collect(plugin.cmd_comfy_list(FakeEvent("/comfy_ls", sender="9")))
-    assert "a.json [绑定]" in listing[0][1]
-    assert "b.json [绑定]" not in listing[0][1]
-    assert "b.json" in listing[0][1]
+    listing = collect(plugin.cmd_comfy_list(FakeEvent("/comfy ls", sender="9")))
+    assert "⚠ a.json 无配套契约" in listing[0][1]
+    assert "⚠ b.json 无配套契约" in listing[0][1]
     assert "a.steps.json" not in listing[0][1]
     assert "a.lora.json" not in listing[0][1]
 
-    event = FakeEvent("/comfy_save c.json {}", sender="9", group="2")
+    event = FakeEvent("/comfy save c.json {}", sender="9", group="2")
     collect(plugin.cmd_comfy_save(event))
 
     assert (workflow_dir / "c.json").exists()
@@ -56,46 +55,6 @@ def test_webui_lists_workflows_and_follows_save(tmp_path, monkeypatch):
     )
     reloaded_item = reloaded.schema["workflow_settings"]["items"]["json_file"]
     assert reloaded_item["options"] == ["a.json", "b.json", "c.json"]
-
-
-def test_use_workflow_persists_and_webui_change_wins(tmp_path, monkeypatch):
-    """命令切换跨重启保持，WebUI 改配置后由 WebUI 接管。"""
-    workflow_dir = tmp_path / "plugin_data" / "workflow"
-    workflow_dir.mkdir(parents=True)
-    _touch(workflow_dir / "a.json")
-    _touch(workflow_dir / "b.json")
-    _touch(workflow_dir / "c.json")
-
-    plugin, _ = make_plugin(
-        tmp_path,
-        monkeypatch,
-        workflow_settings={"json_file": "a.json"},
-        control={"admin_ids": ["9"], "whitelist_group_ids": ["2"]},
-    )
-    event = FakeEvent("/comfy_use 2", sender="9", group="2")
-    collect(plugin.cmd_comfy_use(event))
-
-    assert plugin.api.workflow.filename == "b.json"
-
-    current = collect(plugin.cmd_comfy_current(FakeEvent("/当前工作流", sender="9")))
-    assert "b.json" in current[0][1]
-
-    reloaded, _ = make_plugin(
-        tmp_path,
-        monkeypatch,
-        control={"admin_ids": ["9"], "whitelist_group_ids": ["2"]},
-    )
-    assert reloaded.api.workflow.filename == "b.json"
-
-    reloaded.selection.raw_config["workflow_settings"]["json_file"] = "c.json"
-    reloaded.selection.raw_config.save_config()
-
-    overridden, _ = make_plugin(
-        tmp_path,
-        monkeypatch,
-        control={"admin_ids": ["9"], "whitelist_group_ids": ["2"]},
-    )
-    assert overridden.api.workflow.filename == "c.json"
 
 
 def test_paint_loads_workflow_and_injects_prompt(tmp_path, monkeypatch):
@@ -173,110 +132,36 @@ def test_paint_reports_missing_workflow(
     assert server.submissions == []
 
 
-def test_switch_applies_each_workflow_binding(tmp_path, monkeypatch):
-    """切换工作流后使用该工作流自己的正面与输出节点。"""
-    workflow_dir = tmp_path / "plugin_data" / "workflow"
-    workflow_dir.mkdir(parents=True)
-    (workflow_dir / "a.json").write_text(
-        FIXTURE.read_text(encoding="utf-8"),
-        encoding="utf-8",
-    )
-    second = {
-        "10": {"class_type": "CLIPTextEncode", "inputs": {"text": ""}},
-        "11": {
-            "class_type": "KSampler",
-            "inputs": {"seed": 1, "steps": 20, "positive": ["10", 0]},
-        },
-        "20": {"class_type": "SaveImage", "inputs": {"images": ["11", 0]}},
-    }
-    (workflow_dir / "b.json").write_text(json.dumps(second), encoding="utf-8")
 
+
+def test_policy_command_sets_group_level(tmp_path, monkeypatch):
+    """/comfy policy 设置本群违禁级别。"""
     plugin, _ = make_plugin(
         tmp_path,
         monkeypatch,
-        workflow_settings={
-            "json_file": "a.json",
-            "bindings": json.dumps(
-                {
-                    "a.json": {"input": "1", "output": "4"},
-                    "b.json": {"input": "10", "output": "20"},
-                }
-            ),
-        },
-        control={
-            "admin_ids": ["9"],
-            "whitelist_group_ids": ["2"],
-            "cooldown_seconds": 0,
-        },
-    )
-    server = FakeComfyServer().install(monkeypatch)
-    server.history_reply = {
-        "p1": {
-            "status": {"status_str": "success", "completed": True},
-            "outputs": {
-                "4": {
-                    "images": [{"filename": "a.png", "subfolder": "", "type": "out"}]
-                },
-                "20": {
-                    "images": [{"filename": "b.png", "subfolder": "", "type": "out"}]
-                },
-            },
-        }
-    }
-
-    collect(plugin.cmd_paint(FakeEvent("/画图 first", sender="5", group="2")))
-    collect(plugin.cmd_comfy_use(FakeEvent("/comfy_use 2", sender="9", group="2")))
-    collect(plugin.cmd_paint(FakeEvent("/画图 second", sender="5", group="2")))
-
-    first_graph, second_graph = server.submissions
-    assert first_graph["1"]["inputs"]["text"] == "first"
-    assert second_graph["10"]["inputs"]["text"] == "second"
-
-
-def test_unregistered_workflow_is_rejected(tmp_path, monkeypatch):
-    """未登记绑定的工作流不出图，并指向登记位置。"""
-    workflow_dir = tmp_path / "plugin_data" / "workflow"
-    workflow_dir.mkdir(parents=True)
-    _touch(workflow_dir / "a.json")
-    _touch(workflow_dir / "b.json")
-
-    plugin, _ = make_plugin(
-        tmp_path,
-        monkeypatch,
-        workflow_settings={
-            "json_file": "a.json",
-            "bindings": json.dumps({"a.json": {"input": "1"}}),
-        },
         control={"admin_ids": ["9"], "whitelist_group_ids": ["2"]},
     )
-    server = FakeComfyServer().install(monkeypatch)
-
-    switched = collect(
-        plugin.cmd_comfy_use(FakeEvent("/comfy_use 2", sender="9", group="2"))
-    )
-    assert "未在 bindings 中登记" in switched[0][1]
-
-    current = collect(plugin.cmd_comfy_current(FakeEvent("/当前工作流", sender="9")))
-    assert "未登记" in current[0][1]
 
     results = collect(
-        plugin.cmd_paint(FakeEvent("/画图 one girl", sender="5", group="2"))
+        plugin.cmd_set_policy(FakeEvent("/comfy policy full", sender="9", group="2"))
     )
 
-    assert results[0][0] == "text"
-    assert "未在 bindings 中登记" in results[0][1]
-    assert server.submissions == []
+    assert "已将本群违禁级别设置为：full" in results[0][1]
+    assert plugin.access.policy_for(FakeEvent(sender="5", group="2")) == "full"
 
 
-def test_use_workflow_rejects_node_id_arguments(tmp_path, monkeypatch):
-    """ID 参数已移除，命令指向配置字段。"""
+def test_lock_command_toggles_lockdown(tmp_path, monkeypatch):
+    """/comfy lock on|off 切换全局锁定。"""
     plugin, _ = make_plugin(
         tmp_path,
         monkeypatch,
         control={"admin_ids": ["9"], "whitelist_group_ids": ["2"]},
     )
 
-    results = collect(plugin.cmd_comfy_use(FakeEvent("/comfy_use 1 6 7 9", sender="9")))
+    on = collect(plugin.cmd_comfy_lock(FakeEvent("/comfy lock on", sender="9")))
+    assert "已开启全局锁定" in on[0][1]
+    assert plugin.access.lockdown is True
 
-    assert results[0][0] == "text"
-    assert "bindings" in results[0][1]
+    off = collect(plugin.cmd_comfy_lock(FakeEvent("/comfy lock off", sender="9")))
+    assert "已关闭全局锁定" in off[0][1]
+    assert plugin.access.lockdown is False

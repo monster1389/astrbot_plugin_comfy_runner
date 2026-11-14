@@ -106,7 +106,7 @@ class WorkflowSelection:
             f"[ComfyUI] 可用工作流: {', '.join(files) if files else '无'}",
         )
         if not workflow.filename:
-            logger.warning("[ComfyUI] 未配置工作流，请用 /comfy_ls 查看")
+            logger.warning("[ComfyUI] 未配置工作流，请用 /comfy ls 查看")
         elif not workflow.path.exists():
             logger.warning(f"[ComfyUI] 当前工作流不存在: {workflow.filename}")
 
