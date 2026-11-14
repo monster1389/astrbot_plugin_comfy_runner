@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -16,7 +15,6 @@ from .comfy import ComfyClient, ComfyError
 from .config import POLICIES, Config
 from .contract import (
     CONTRACT_SUFFIX,
-    WORKFLOW_SUFFIX,
     ContractError,
     read_workflow,
     remote_target_errors,
@@ -82,7 +80,6 @@ async def help_command(
                 "【管理员指令】",
                 "  /comfy ls            工作流与契约状态",
                 "  /comfy check [remote] 检查工具契约",
-                "  /comfy save          导入工作流或契约",
                 "  /comfy lock on|off   切换全局锁定",
                 "  /comfy policy        设置群违禁级别",
             ]
@@ -315,7 +312,7 @@ async def _apply_remote_check(
     ctx: CommandContext,
     reports: list[ContractReport],
 ) -> list[ContractReport]:
-    """用 ComfyUI 节点定义核对参数映射的目标字段。"""
+    """用 ComfyUI 节点定义核对参数与产物的映射目标。"""
     graphs: dict[Path, dict[str, Any]] = {}
     class_types: set[str] = set()
     for report in reports:
@@ -327,17 +324,20 @@ async def _apply_remote_check(
         except ContractError:
             continue
         graph = graphs[report.path]
-        for parameter in contract.inputs.values():
-            node = graph.get(parameter.node)
+        node_ids = [parameter.node for parameter in contract.inputs.values()]
+        node_ids.extend(output.node for output in contract.outputs.values())
+        for node_id in node_ids:
+            node = graph.get(node_id)
             if isinstance(node, dict) and node.get("class_type"):
                 class_types.add(str(node["class_type"]))
 
     node_defs: dict[str, dict[str, Any]] = {}
+    failures: dict[str, str] = {}
     for class_type in sorted(class_types):
         try:
             node_defs[class_type] = await ctx.client.object_info(class_type)
         except ComfyError as exc:
-            node_defs[class_type] = {}
+            failures[class_type] = str(exc)
             logger.warning(f"[ComfyUI] 读取节点定义失败 {class_type}: {exc}")
 
     checked: list[ContractReport] = []
@@ -347,54 +347,8 @@ async def _apply_remote_check(
         if contract is None or graph is None:
             checked.append(report)
             continue
-        errors = remote_target_errors(contract, graph, node_defs)
+        errors = remote_target_errors(contract, graph, node_defs, failures)
         checked.append(
             replace(report, errors=report.errors + tuple(errors)) if errors else report
         )
     return checked
-
-
-async def save_workflow(
-    ctx: CommandContext,
-    event: AstrMessageEvent,
-) -> AsyncIterator[MessageEventResult]:
-    """导入工作流或工具契约。"""
-    user_id = str(event.get_sender_id())
-    if user_id not in ctx.access.admin_ids:
-        yield event.plain_result("🚫 权限不足，仅管理员可导入文件")
-        return
-
-    content = command_arguments(event).split(None, 1)
-    if len(content) < 2:
-        yield event.plain_result(
-            "❌ 参数不足\n"
-            "用法：/comfy save <文件名> <JSON内容>\n"
-            '示例：/comfy save my_workflow.json {"1":{...}}\n'
-            "示例：/comfy save my_workflow.tool.json {...}"
-        )
-        return
-
-    filename = content[0]
-    json_str = content[1]
-    if not filename.endswith((WORKFLOW_SUFFIX, CONTRACT_SUFFIX)):
-        filename += WORKFLOW_SUFFIX
-
-    try:
-        json_str = json_str.replace("```json", "").replace("```", "").strip()
-        json_data = json.loads(json_str)
-    except json.JSONDecodeError as exc:
-        yield event.plain_result(f"❌ JSON 解析失败：{str(exc)[:50]}")
-        return
-
-    save_path = ctx.cfg.workflow_dir / filename
-    try:
-        with open(save_path, "w", encoding="utf-8") as handle:
-            json.dump(json_data, handle, indent=2, ensure_ascii=False)
-    except OSError as exc:
-        yield event.plain_result(f"❌ 保存失败: {exc}")
-        return
-
-    logger.info(f"[ComfyUI] 管理员 {user_id} 导入文件: {filename}")
-    yield event.plain_result(
-        f"✅ 保存成功\n文件：{filename}\n重载插件后生效，/comfy check 可先检查契约"
-    )

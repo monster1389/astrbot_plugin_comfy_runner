@@ -106,6 +106,81 @@ def test_inspect_returns_public_contract(tmp_path, monkeypatch):
     assert view["outputs"] == {"image": {"type": "image"}}
 
 
+def test_inspect_shows_optional_default_from_workflow(tmp_path, monkeypatch):
+    """可选参数带工作流原值作为默认值，必填参数不带。"""
+    workflow_dir = tmp_path / "plugin_data" / "workflow"
+    workflow_dir.mkdir(parents=True, exist_ok=True)
+    contract = json.loads(json.dumps(CONTRACT))
+    contract["inputs"].update(
+        seed={
+            "type": "integer",
+            "description": "随机种子",
+            "target": {"node": "3", "field": "seed"},
+        }
+    )
+    workflow = {
+        "1": {"class_type": "CLIPTextEncode", "inputs": {"text": ""}},
+        "3": {"class_type": "KSampler", "inputs": {"seed": 4242}},
+        "4": {"class_type": "SaveImage", "inputs": {"images": ["3", 0]}},
+    }
+    (workflow_dir / "moss.json").write_text(json.dumps(workflow), encoding="utf-8")
+    (workflow_dir / "moss.tool.json").write_text(
+        json.dumps(contract),
+        encoding="utf-8",
+    )
+    plugin, _ = make_plugin(
+        tmp_path,
+        monkeypatch,
+        control={"admin_ids": ["9"], "whitelist_group_ids": ["2"]},
+    )
+    event = FakeEvent(sender="9", group="2")
+
+    view = json.loads(
+        run_tool(plugin, "comfy_inspect", event, workflow="comfy_moss_t2i")
+    )
+
+    assert view["parameters"]["properties"]["seed"]["default"] == 4242
+    assert "default" not in view["parameters"]["properties"]["prompt"]
+
+
+def test_inspect_reads_default_from_current_workflow(tmp_path, monkeypatch):
+    """工作流文件改动后，查看到的默认值跟着变。"""
+    workflow_dir = tmp_path / "plugin_data" / "workflow"
+    workflow_dir.mkdir(parents=True, exist_ok=True)
+    contract = json.loads(json.dumps(CONTRACT))
+    contract["inputs"].update(
+        seed={
+            "type": "integer",
+            "description": "随机种子",
+            "target": {"node": "3", "field": "seed"},
+        }
+    )
+    workflow = {
+        "1": {"class_type": "CLIPTextEncode", "inputs": {"text": ""}},
+        "3": {"class_type": "KSampler", "inputs": {"seed": 1}},
+        "4": {"class_type": "SaveImage", "inputs": {"images": ["3", 0]}},
+    }
+    (workflow_dir / "moss.json").write_text(json.dumps(workflow), encoding="utf-8")
+    (workflow_dir / "moss.tool.json").write_text(
+        json.dumps(contract),
+        encoding="utf-8",
+    )
+    plugin, _ = make_plugin(
+        tmp_path,
+        monkeypatch,
+        control={"admin_ids": ["9"], "whitelist_group_ids": ["2"]},
+    )
+    event = FakeEvent(sender="9", group="2")
+
+    workflow["3"]["inputs"]["seed"] = 77
+    (workflow_dir / "moss.json").write_text(json.dumps(workflow), encoding="utf-8")
+    view = json.loads(
+        run_tool(plugin, "comfy_inspect", event, workflow="comfy_moss_t2i")
+    )
+
+    assert view["parameters"]["properties"]["seed"]["default"] == 77
+
+
 def test_inspect_hides_node_mapping(tmp_path, monkeypatch):
     """查看结果不含节点 ID、字段名与文件路径。"""
     plugin, _ = setup(tmp_path, monkeypatch)

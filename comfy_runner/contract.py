@@ -13,13 +13,14 @@ from jsonschema.exceptions import ValidationError
 CONTRACT_SUFFIX = ".tool.json"
 WORKFLOW_SUFFIX = ".json"
 SCHEMA_RELATIVE_PATH = Path("schemas") / "tool-contract-v1.schema.json"
-SUPPORTED_OUTPUT_TYPES = frozenset({"image"})
 JSON_TYPES = {
     "string": "string",
     "integer": "integer",
     "number": "number",
     "boolean": "boolean",
 }
+TEXT_OUTPUT_TYPE = "text"
+FILE_OUTPUT_TYPES = frozenset({"image", "video", "audio", "file"})
 
 
 class ContractError(ValueError):
@@ -179,7 +180,6 @@ def validate_contract(contract: ToolContract) -> list[str]:
     """
     label = contract.path.name
     errors = _limit_errors(contract, label)
-    errors.extend(_output_type_errors(contract, label))
 
     try:
         graph = read_workflow(contract.workflow_path)
@@ -188,6 +188,7 @@ def validate_contract(contract: ToolContract) -> list[str]:
 
     errors.extend(input_target_errors(contract, graph, label))
     errors.extend(_output_target_errors(contract, graph, label))
+    errors.extend(_optional_value_errors(contract, graph, label))
     return errors
 
 
@@ -195,13 +196,15 @@ def remote_target_errors(
     contract: ToolContract,
     graph: dict[str, Any],
     node_defs: dict[str, dict[str, Any]],
+    failures: dict[str, str],
 ) -> list[str]:
-    """用 ComfyUI 节点定义核对参数映射的目标字段。
+    """用 ComfyUI 节点定义核对参数与产物映射的目标字段。
 
     Args:
         contract: 工具契约。
         graph: 配对的工作流图。
-        node_defs: 节点类型到 ``/object_info`` 条目的映射。
+        node_defs: 取到定义的节点类型到 ``/object_info`` 条目的映射。
+        failures: 取不到定义的节点类型到失败原因的映射。
 
     Returns:
         面向管理员的问题描述；为空表示远端核对通过。
@@ -209,52 +212,59 @@ def remote_target_errors(
     label = contract.path.name
     errors: list[str] = []
     for parameter in contract.inputs.values():
-        node = graph.get(parameter.node)
-        if not isinstance(node, dict):
+        class_type, definition, problem = _remote_definition(
+            graph,
+            parameter.node,
+            node_defs,
+            failures,
+        )
+        if problem is not None:
+            errors.append(f"{label}: 参数 {parameter.name} {problem}")
             continue
-        class_type = node.get("class_type")
-        definition = node_defs.get(str(class_type))
-        if definition is None:
-            errors.append(
-                f"{label}: 参数 {parameter.name} 的节点类型 {class_type} 不存在"
-            )
-            continue
-        fields = _declared_fields(definition)
-        if parameter.field not in fields:
+        if parameter.field not in _declared_fields(definition):
             errors.append(
                 f"{label}: 参数 {parameter.name} 的字段 {parameter.target} "
                 f"不在节点类型 {class_type} 的输入中"
             )
+
+    for output in contract.outputs.values():
+        class_type, definition, problem = _remote_definition(
+            graph,
+            output.node,
+            node_defs,
+            failures,
+        )
+        if problem is not None:
+            errors.append(f"{label}: 产物 {output.name} {problem}")
+            continue
+        if definition.get("output_node") is not True:
+            errors.append(
+                f"{label}: 产物 {output.name} 的节点类型 {class_type} 不是输出节点"
+            )
     return errors
 
 
-def build_parameter_schema(contract: ToolContract) -> dict[str, Any]:
+def build_parameter_schema(
+    contract: ToolContract,
+    defaults: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     """生成给模型看的参数 Schema。
 
     Args:
         contract: 工具契约。
+        defaults: 可选参数名到工作流原值的映射；只对这里的参数写 ``default``。
 
     Returns:
         根对象为 ``type: object`` 且带 ``additionalProperties: false`` 的 Schema。
     """
+    shown = defaults or {}
     properties: dict[str, Any] = {}
     required: list[str] = []
     for name in sorted(contract.inputs):
         parameter = contract.inputs[name]
-        schema: dict[str, Any] = {
-            "type": JSON_TYPES[parameter.type],
-            "description": parameter.description,
-        }
-        if parameter.enum:
-            schema["enum"] = list(parameter.enum)
-        if parameter.min_length is not None:
-            schema["minLength"] = parameter.min_length
-        if parameter.max_length is not None:
-            schema["maxLength"] = parameter.max_length
-        if parameter.minimum is not None:
-            schema["minimum"] = parameter.minimum
-        if parameter.maximum is not None:
-            schema["maximum"] = parameter.maximum
+        schema = _parameter_schema(parameter)
+        if name in shown:
+            schema["default"] = shown[name]
         properties[name] = schema
         if parameter.required:
             required.append(name)
@@ -267,11 +277,15 @@ def build_parameter_schema(contract: ToolContract) -> dict[str, Any]:
     }
 
 
-def contract_view(contract: ToolContract) -> dict[str, Any]:
+def contract_view(
+    contract: ToolContract,
+    graph: dict[str, Any],
+) -> dict[str, Any]:
     """生成给模型看的契约视图。
 
     Args:
         contract: 工具契约。
+        graph: 配对的工作流图，提供可选参数的工作流原值。
 
     Returns:
         只含名称、说明、参数 Schema 与产物类型的字典。
@@ -279,12 +293,56 @@ def contract_view(contract: ToolContract) -> dict[str, Any]:
     return {
         "name": contract.name,
         "description": contract.description,
-        "parameters": build_parameter_schema(contract),
+        "parameters": build_parameter_schema(
+            contract,
+            parameter_defaults(contract, graph),
+        ),
         "outputs": {
             name: {"type": contract.outputs[name].type}
             for name in sorted(contract.outputs)
         },
     }
+
+
+def parameter_defaults(
+    contract: ToolContract,
+    graph: dict[str, Any],
+) -> dict[str, Any]:
+    """取出可选参数在工作流里的原值。
+
+    Args:
+        contract: 工具契约。
+        graph: 配对的工作流图。
+
+    Returns:
+        可选参数名到工作流原值的映射；必填参数不在其中。
+
+    Raises:
+        ContractError: 可选参数的目标节点或字段在本次读取的工作流里不存在。
+    """
+    label = contract.path.name
+    defaults: dict[str, Any] = {}
+    for name in sorted(contract.inputs):
+        parameter = contract.inputs[name]
+        if parameter.required:
+            continue
+        node = graph.get(parameter.node)
+        if not isinstance(node, dict) or not isinstance(node.get("inputs"), dict):
+            raise ContractError(
+                f"{label}: 参数 {name} 的目标节点 {parameter.node} 不存在"
+            )
+        inputs = node["inputs"]
+        if parameter.field not in inputs:
+            raise ContractError(
+                f"{label}: 参数 {name} 的目标字段 {parameter.target} 不存在"
+            )
+        value = inputs[parameter.field]
+        if _is_link(value):
+            raise ContractError(
+                f"{label}: 参数 {name} 的目标字段 {parameter.target} 是连线，不能映射"
+            )
+        defaults[name] = value
+    return defaults
 
 
 def validate_arguments(contract: ToolContract, arguments: dict[str, Any]) -> None:
@@ -403,18 +461,6 @@ def _enum_errors(parameter: ParameterMapping, label: str) -> list[str]:
     return errors
 
 
-def _output_type_errors(contract: ToolContract, label: str) -> list[str]:
-    errors: list[str] = []
-    for name in sorted(contract.outputs):
-        output = contract.outputs[name]
-        if output.type not in SUPPORTED_OUTPUT_TYPES:
-            errors.append(
-                f"{label}: 产物 {name} 的类型 {output.type} 尚未支持，"
-                "当前只能交付 image"
-            )
-    return errors
-
-
 def input_target_errors(
     contract: ToolContract,
     graph: dict[str, Any],
@@ -469,6 +515,70 @@ def _output_target_errors(
         if not isinstance(graph.get(output.node), dict):
             errors.append(f"{label}: 产物 {name} 的输出节点 {output.node} 不存在")
     return errors
+
+
+def _optional_value_errors(
+    contract: ToolContract,
+    graph: dict[str, Any],
+    label: str,
+) -> list[str]:
+    errors: list[str] = []
+    for name in sorted(contract.inputs):
+        parameter = contract.inputs[name]
+        if parameter.required:
+            continue
+        node = graph.get(parameter.node)
+        if not isinstance(node, dict) or not isinstance(node.get("inputs"), dict):
+            continue
+        inputs = node["inputs"]
+        if parameter.field not in inputs:
+            continue
+        value = inputs[parameter.field]
+        if _is_link(value):
+            continue
+        validator = Draft202012Validator(_parameter_schema(parameter))
+        for error in validator.iter_errors(value):
+            errors.append(
+                f"{label}: 参数 {name} 的工作流原值不满足契约: {error.message}"
+            )
+    return errors
+
+
+def _parameter_schema(parameter: ParameterMapping) -> dict[str, Any]:
+    schema: dict[str, Any] = {
+        "type": JSON_TYPES[parameter.type],
+        "description": parameter.description,
+    }
+    if parameter.enum:
+        schema["enum"] = list(parameter.enum)
+    if parameter.min_length is not None:
+        schema["minLength"] = parameter.min_length
+    if parameter.max_length is not None:
+        schema["maxLength"] = parameter.max_length
+    if parameter.minimum is not None:
+        schema["minimum"] = parameter.minimum
+    if parameter.maximum is not None:
+        schema["maximum"] = parameter.maximum
+    return schema
+
+
+def _remote_definition(
+    graph: dict[str, Any],
+    node_id: str,
+    node_defs: dict[str, dict[str, Any]],
+    failures: dict[str, str],
+) -> tuple[str, dict[str, Any], str | None]:
+    node = graph.get(node_id)
+    if not isinstance(node, dict):
+        return "", {}, f"的目标节点 {node_id} 不是节点对象"
+    class_type = str(node.get("class_type"))
+    problem = failures.get(class_type)
+    if problem is not None:
+        return class_type, {}, f"的节点类型 {class_type} 无法核对: {problem}"
+    definition = node_defs.get(class_type)
+    if definition is None:
+        return class_type, {}, f"的节点类型 {class_type} 不存在"
+    return class_type, definition, None
 
 
 def _declared_fields(definition: dict[str, Any]) -> set[str]:

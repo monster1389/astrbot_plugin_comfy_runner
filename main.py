@@ -137,9 +137,3 @@ class ComfyUIPlugin(Star):
         """检查工具契约。"""
         async for result in commands.check_contracts(self.cmd_ctx, event):
             yield result
-
-    @comfy.command("save")
-    async def cmd_comfy_save(self, event: AstrMessageEvent):
-        """导入工作流或契约。"""
-        async for result in commands.save_workflow(self.cmd_ctx, event):
-            yield result

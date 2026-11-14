@@ -134,8 +134,8 @@ def test_no_contract_loads_without_tools(tmp_path, monkeypatch):
             id="linked-target",
         ),
         pytest.param(
-            lambda c: c["outputs"]["image"].update(type="video"),
-            id="unsupported-output",
+            lambda c: c["outputs"]["image"].update(type="mesh"),
+            id="unknown-output-type",
         ),
         pytest.param(
             lambda c: c["outputs"]["image"]["target"].update(node="99"),
@@ -155,6 +155,21 @@ def test_invalid_enabled_contract_prevents_load(tmp_path, monkeypatch, mutate):
 
     with pytest.raises(ContractError):
         make_plugin(tmp_path, monkeypatch, control=admin_overrides())
+
+
+def test_optional_parameter_value_violating_contract_prevents_load(
+    tmp_path,
+    monkeypatch,
+):
+    """工作流原值不满足可选参数约束时插件拒绝加载。"""
+    workflow = json.loads(json.dumps(WORKFLOW))
+    workflow["3"]["inputs"]["seed"] = -1
+    write_contract(tmp_path, workflow=workflow)
+
+    with pytest.raises(ContractError) as error:
+        make_plugin(tmp_path, monkeypatch, control=admin_overrides())
+
+    assert "参数 seed 的工作流原值不满足契约" in str(error.value)
 
 
 def test_duplicate_tool_names_prevent_load(tmp_path, monkeypatch):
@@ -233,13 +248,14 @@ def test_check_command_remote_reports_unknown_field(tmp_path, monkeypatch):
 
 
 def test_check_command_remote_accepts_known_field(tmp_path, monkeypatch):
-    """远端字段存在时检查通过。"""
+    """远端字段与输出节点都存在时检查通过。"""
     write_contract(tmp_path)
     plugin, _ = make_plugin(tmp_path, monkeypatch, control=admin_overrides())
     server = FakeComfyServer().install(monkeypatch)
     server.object_info = {
         "CLIPTextEncode": {"input": {"required": {"text": ["STRING", {}]}}},
         "KSampler": {"input": {"required": {"seed": ["INT", {}]}}},
+        "SaveImage": {"output_node": True},
     }
 
     results = collect(
@@ -248,3 +264,37 @@ def test_check_command_remote_accepts_known_field(tmp_path, monkeypatch):
 
     assert "moss.tool.json -> comfy_moss_t2i [启用]" in results[0][1]
     assert "不在节点类型" not in results[0][1]
+    assert "不是输出节点" not in results[0][1]
+
+
+def test_check_command_remote_rejects_non_output_node(tmp_path, monkeypatch):
+    """产物映射指向非输出节点时检查报告出来。"""
+    write_contract(tmp_path)
+    plugin, _ = make_plugin(tmp_path, monkeypatch, control=admin_overrides())
+    server = FakeComfyServer().install(monkeypatch)
+    server.object_info = {
+        "CLIPTextEncode": {"input": {"required": {"text": ["STRING", {}]}}},
+        "KSampler": {"input": {"required": {"seed": ["INT", {}]}}},
+        "SaveImage": {"output_node": False},
+    }
+
+    results = collect(
+        plugin.cmd_comfy_check(FakeEvent("/comfy check remote", sender="9"))
+    )
+
+    assert "产物 image 的节点类型 SaveImage 不是输出节点" in results[0][1]
+
+
+def test_check_command_remote_reports_unreachable_object_info(tmp_path, monkeypatch):
+    """远端节点定义读不到时如实报告，不声称节点类型不存在。"""
+    write_contract(tmp_path)
+    plugin, _ = make_plugin(tmp_path, monkeypatch, control=admin_overrides())
+    server = FakeComfyServer().install(monkeypatch)
+    server.object_info_status = 503
+
+    results = collect(
+        plugin.cmd_comfy_check(FakeEvent("/comfy check remote", sender="9"))
+    )
+
+    assert "无法核对: 读取节点定义失败: HTTP 503" in results[0][1]
+    assert "不存在" not in results[0][1]

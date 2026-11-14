@@ -46,44 +46,6 @@ def write_workflow_dir(tmp_path: Path) -> Path:
     return workflow_dir
 
 
-def test_save_command_imports_workflow_and_contract(tmp_path, monkeypatch):
-    """/comfy save 写入工作流与契约文件。"""
-    plugin, _ = make_plugin(tmp_path, monkeypatch, control=admin_overrides())
-    workflow_dir = tmp_path / "plugin_data" / "workflow"
-
-    workflow_event = FakeEvent(
-        '/comfy save my_flow {"1": {}}',
-        sender="9",
-        group="2",
-    )
-    results = collect(plugin.cmd_comfy_save(workflow_event))
-
-    assert "保存成功" in results[0][1]
-    assert (workflow_dir / "my_flow.json").exists()
-
-    contract_event = FakeEvent(
-        f"/comfy save my_flow.tool.json {json.dumps(CONTRACT)}",
-        sender="9",
-        group="2",
-    )
-    collect(plugin.cmd_comfy_save(contract_event))
-
-    assert (workflow_dir / "my_flow.tool.json").exists()
-
-
-def test_save_command_rejects_broken_json(tmp_path, monkeypatch):
-    """JSON 无法解析时不写文件。"""
-    plugin, _ = make_plugin(tmp_path, monkeypatch, control=admin_overrides())
-    workflow_dir = tmp_path / "plugin_data" / "workflow"
-
-    results = collect(
-        plugin.cmd_comfy_save(FakeEvent("/comfy save bad.json {", sender="9"))
-    )
-
-    assert "JSON 解析失败" in results[0][1]
-    assert not (workflow_dir / "bad.json").exists()
-
-
 def test_list_command_shows_pairing(tmp_path, monkeypatch):
     """/comfy ls 展示工作流与契约的配对、启用与校验状态。"""
     workflow_dir = write_workflow_dir(tmp_path)
@@ -125,6 +87,7 @@ def test_help_command_lists_enabled_workflows(tmp_path, monkeypatch):
 
     assert "已启用工作流：comfy_moss_t2i" in results[0][1]
     assert "/comfy check" in results[0][1]
+    assert "/comfy save" not in results[0][1]
 
 
 def test_policy_command_sets_group_level(tmp_path, monkeypatch):

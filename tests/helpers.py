@@ -234,6 +234,7 @@ class FakeComfyServer:
         self.history_reply: dict = {}
         self.view_response = (200, b"png-bytes")
         self.object_info: dict[str, dict] = {}
+        self.object_info_status = 200
 
     def install(self, monkeypatch: pytest.MonkeyPatch) -> "FakeComfyServer":
         """把 aiohttp 会话替换成这个假服务。"""
@@ -272,7 +273,7 @@ class FakeComfyServer:
             self.downloads.append(url)
             return _response(*self.view_response)
         if "/object_info/" in url:
-            return _response(200, self.object_info)
+            return _response(self.object_info_status, self.object_info)
         raise AssertionError(f"未预期的 GET: {url}")
 
 

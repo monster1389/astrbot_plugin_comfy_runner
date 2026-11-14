@@ -16,7 +16,9 @@ from .comfy import (
     ensure_success,
 )
 from .contract import (
+    TEXT_OUTPUT_TYPE,
     ContractError,
+    OutputMapping,
     ToolContract,
     input_target_errors,
     read_workflow,
@@ -24,17 +26,34 @@ from .contract import (
 
 
 @dataclass(frozen=True, slots=True)
-class Artifact:
-    """一个下载完成的正式产物。"""
+class FileArtifact:
+    """一个下载完成的文件类正式产物。"""
 
     output: str
+    type: str
     ref: ArtifactRef
     content: bytes
 
     @property
     def suffix(self) -> str:
         """产物文件的扩展名。"""
-        return Path(self.ref.filename).suffix or ".png"
+        return Path(self.ref.filename).suffix
+
+    @property
+    def filename(self) -> str:
+        """产物在 ComfyUI 里的原文件名。"""
+        return Path(self.ref.filename).name
+
+
+@dataclass(frozen=True, slots=True)
+class TextArtifact:
+    """一个从执行结果直接取到的文本正式产物。"""
+
+    output: str
+    text: str
+
+
+Artifact = FileArtifact | TextArtifact
 
 
 @dataclass(frozen=True, slots=True)
@@ -155,9 +174,24 @@ class WorkflowExecutor:
         entry = await self.client.wait(prompt_id)
 
         artifacts: list[Artifact] = []
-        for output, ref in declared_refs(contract, entry):
+        for output, mapping, index, value in declared_outputs(contract, entry):
+            if mapping.type == TEXT_OUTPUT_TYPE:
+                if not isinstance(value, str) or not value:
+                    raise OutputError(f"产物 {output} 的第 {index} 项不是文本")
+                artifacts.append(TextArtifact(output=output, text=value))
+                continue
+            ref = artifact_ref(value)
+            if ref is None:
+                raise OutputError(f"产物 {output} 的第 {index} 项不是可下载的产物")
             content = await self.client.download(ref)
-            artifacts.append(Artifact(output=output, ref=ref, content=content))
+            artifacts.append(
+                FileArtifact(
+                    output=output,
+                    type=mapping.type,
+                    ref=ref,
+                    content=content,
+                )
+            )
 
         logger.info(
             f"[ComfyUI] 执行完成 {contract.name} | prompt_id: {prompt_id} | "
@@ -184,24 +218,24 @@ def apply_arguments(
         logger.debug(f"[ComfyUI] 覆盖 {parameter.target} <- {name}")
 
 
-def declared_refs(
+def declared_outputs(
     contract: ToolContract,
     entry: dict[str, Any],
-) -> list[tuple[str, ArtifactRef]]:
-    """从执行结果里取出全部正式产物位置。
+) -> list[tuple[str, OutputMapping, int, Any]]:
+    """从执行结果里取出全部正式产物的原始条目。
 
     Args:
         contract: 工具契约。
         entry: ``history`` 里的任务结果。
 
     Returns:
-        产物名与下载位置，同一字段内保持 ComfyUI 返回顺序，
-        不同输出映射按产物名排序。
+        产物名、输出映射、项序号与原始条目，同一字段内保持 ComfyUI
+        返回顺序，不同输出映射按产物名排序。
 
     Raises:
         ExecutionFailed: 执行状态为失败。
         ExecutionUnknown: 执行状态不完整。
-        OutputError: 声明的产物缺失或类型不符。
+        OutputError: 声明的产物缺失或为空。
     """
     ensure_success(entry)
 
@@ -209,20 +243,17 @@ def declared_refs(
     if not isinstance(outputs, dict):
         raise OutputError("执行结果缺少 outputs")
 
-    refs: list[tuple[str, ArtifactRef]] = []
+    items: list[tuple[str, OutputMapping, int, Any]] = []
     for name in sorted(contract.outputs):
         mapping = contract.outputs[name]
         node_output = outputs.get(mapping.node)
         if not isinstance(node_output, dict):
             raise OutputError(f"产物 {name} 的输出节点 {mapping.node} 没有结果")
 
-        items = node_output.get(mapping.field)
-        if not isinstance(items, list) or not items:
+        values = node_output.get(mapping.field)
+        if not isinstance(values, list) or not values:
             raise OutputError(f"产物 {name} 的字段 {mapping.target} 没有内容")
 
-        for index, item in enumerate(items, start=1):
-            ref = artifact_ref(item)
-            if ref is None:
-                raise OutputError(f"产物 {name} 的第 {index} 项不是可下载的产物")
-            refs.append((name, ref))
-    return refs
+        for index, value in enumerate(values, start=1):
+            items.append((name, mapping, index, value))
+    return items

@@ -55,13 +55,19 @@ SUCCESS = {
 }
 
 
-def setup(tmp_path: Path, monkeypatch, execution: dict | None = None, control=None):
+def setup(
+    tmp_path: Path,
+    monkeypatch,
+    execution: dict | None = None,
+    control=None,
+    contract: dict | None = None,
+):
     """写一对契约与工作流、装配插件并接管 HTTP。"""
     workflow_dir = tmp_path / "plugin_data" / "workflow"
     workflow_dir.mkdir(parents=True, exist_ok=True)
     (workflow_dir / "wf.json").write_text(json.dumps(WORKFLOW), encoding="utf-8")
     (workflow_dir / "wf.tool.json").write_text(
-        json.dumps(CONTRACT),
+        json.dumps(contract or CONTRACT),
         encoding="utf-8",
     )
     plugin, _ = make_plugin(
@@ -74,6 +80,15 @@ def setup(tmp_path: Path, monkeypatch, execution: dict | None = None, control=No
     server = FakeComfyServer().install(monkeypatch)
     server.history_reply = SUCCESS
     return plugin, server
+
+
+def contract_with(outputs: dict, inputs: dict | None = None) -> dict:
+    """把基础契约的产物映射换成给定类型。"""
+    contract = json.loads(json.dumps(CONTRACT))
+    contract["outputs"] = outputs
+    if inputs is not None:
+        contract["inputs"] = inputs
+    return contract
 
 
 def execute(plugin, event=None, params=None) -> str:
@@ -349,6 +364,177 @@ def test_timeout_notifies_unknown_state_without_resubmitting(tmp_path, monkeypat
 
     assert sent_texts(event) == ["⚠️ 工作流 comfy_test_t2i 等待超时，执行状态未知"]
     assert len(server.submissions) == 1
+
+
+def test_video_artifact_is_delivered_as_video_message(tmp_path, monkeypatch):
+    """视频产物下载落盘并以视频消息发送。"""
+    plugin, server = setup(
+        tmp_path,
+        monkeypatch,
+        contract=contract_with(
+            {"video": {"type": "video", "target": {"node": "3", "field": "images"}}}
+        ),
+    )
+    server.history_reply = {
+        "p1": {
+            "status": {"status_str": "success", "completed": True},
+            "outputs": {
+                "3": {
+                    "images": [
+                        {
+                            "filename": "MiniMax_H3_00006_.mp4",
+                            "subfolder": "video",
+                            "type": "output",
+                        }
+                    ]
+                }
+            },
+        }
+    }
+    event = FakeEvent(sender="9", group="2")
+
+    execute(plugin, event, {"prompt": "一次"})
+
+    assert len(event.sent) == 1
+    kind, components = event.sent[0]
+    assert kind == "chain"
+    assert [type(item).__name__ for item in components] == ["Video"]
+    assert len(list((tmp_path / "plugin_data" / "output").glob("*.mp4"))) == 1
+
+
+def test_audio_artifact_is_delivered_as_record_message(tmp_path, monkeypatch):
+    """音频产物以语音消息发送。"""
+    plugin, server = setup(
+        tmp_path,
+        monkeypatch,
+        contract=contract_with(
+            {"audio": {"type": "audio", "target": {"node": "3", "field": "audio"}}}
+        ),
+    )
+    server.history_reply = {
+        "p1": {
+            "status": {"status_str": "success", "completed": True},
+            "outputs": {
+                "3": {
+                    "audio": [
+                        {"filename": "voice.wav", "subfolder": "", "type": "output"}
+                    ]
+                }
+            },
+        }
+    }
+    event = FakeEvent(sender="9", group="2")
+
+    execute(plugin, event, {"prompt": "一次"})
+
+    assert len(event.sent) == 1
+    _, components = event.sent[0]
+    assert [type(item).__name__ for item in components] == ["Record"]
+
+
+def test_file_artifact_keeps_original_filename(tmp_path, monkeypatch):
+    """普通文件产物用原文件名作为文件消息名。"""
+    plugin, server = setup(
+        tmp_path,
+        monkeypatch,
+        contract=contract_with(
+            {"file": {"type": "file", "target": {"node": "3", "field": "files"}}}
+        ),
+    )
+    server.history_reply = {
+        "p1": {
+            "status": {"status_str": "success", "completed": True},
+            "outputs": {
+                "3": {
+                    "files": [
+                        {"filename": "报告.pdf", "subfolder": "doc", "type": "output"}
+                    ]
+                }
+            },
+        }
+    }
+    event = FakeEvent(sender="9", group="2")
+
+    execute(plugin, event, {"prompt": "一次"})
+
+    _, components = event.sent[0]
+    assert [type(item).__name__ for item in components] == ["File"]
+    assert components[0].name == "报告.pdf"
+    assert len(list((tmp_path / "plugin_data" / "output").glob("*.pdf"))) == 1
+
+
+def test_text_artifact_is_sent_without_download(tmp_path, monkeypatch):
+    """文本产物直接发送，不下载也不落盘。"""
+    plugin, server = setup(
+        tmp_path,
+        monkeypatch,
+        contract=contract_with(
+            {"caption": {"type": "text", "target": {"node": "3", "field": "text"}}}
+        ),
+    )
+    server.history_reply = {
+        "p1": {
+            "status": {"status_str": "success", "completed": True},
+            "outputs": {"3": {"text": ["一只猫坐在窗台上"]}},
+        }
+    }
+    event = FakeEvent(sender="9", group="2")
+
+    execute(plugin, event, {"prompt": "一次"})
+
+    assert sent_texts(event) == ["一只猫坐在窗台上"]
+    assert server.downloads == []
+    assert list((tmp_path / "plugin_data" / "output").iterdir()) == []
+
+
+def test_each_artifact_is_sent_as_its_own_message(tmp_path, monkeypatch):
+    """同一次执行的多个产物各自单独发送。"""
+    plugin, server = setup(tmp_path, monkeypatch)
+    server.history_reply = {
+        "p1": {
+            "status": {"status_str": "success", "completed": True},
+            "outputs": {
+                "3": {
+                    "images": [
+                        {"filename": "a.png", "subfolder": "", "type": "output"},
+                        {"filename": "b.png", "subfolder": "", "type": "output"},
+                    ]
+                }
+            },
+        }
+    }
+    event = FakeEvent(sender="9", group="2")
+
+    execute(plugin, event, {"prompt": "一次"})
+
+    assert len(event.sent) == 2
+    for kind, components in event.sent:
+        assert kind == "chain"
+        assert [type(item).__name__ for item in components] == ["Image"]
+
+
+def test_text_artifact_rejects_non_string_entry(tmp_path, monkeypatch):
+    """文本产物里出现非字符串条目时按产物缺失处理。"""
+    plugin, server = setup(
+        tmp_path,
+        monkeypatch,
+        contract=contract_with(
+            {"caption": {"type": "text", "target": {"node": "3", "field": "text"}}}
+        ),
+    )
+    server.history_reply = {
+        "p1": {
+            "status": {"status_str": "success", "completed": True},
+            "outputs": {"3": {"text": [{"filename": "a.txt"}]}},
+        }
+    }
+    event = FakeEvent(sender="9", group="2")
+
+    execute(plugin, event, {"prompt": "一次"})
+
+    assert sent_texts(event) == [
+        "❌ 工作流 comfy_test_t2i 执行失败：产物 caption 的第 1 项不是文本"
+    ]
 
 
 def test_concurrency_limit_rejects_without_submitting(tmp_path, monkeypatch):

@@ -1,0 +1,63 @@
+{
+  "version": 1,
+  "name": "comfy_minimax_h3_t2v",
+  "description": "使用 MiniMax H3 工作流根据提示词生成带音频的短视频",
+  "enabled": true,
+  "inputs": {
+    "prompt": {
+      "type": "string",
+      "description": "描述期望画面、镜头与声音的完整提示词",
+      "required": true,
+      "minLength": 1,
+      "target": {
+        "node": "140:131",
+        "field": "prompt"
+      }
+    },
+    "aspect_ratio": {
+      "type": "string",
+      "description": "生成视频的画幅比例",
+      "target": {
+        "node": "115",
+        "field": "aspect_ratio"
+      },
+      "enum": [
+        "1:1 (Square)",
+        "2:3 (Portrait Photo)",
+        "3:2 (Photo)",
+        "3:4 (Portrait Standard)",
+        "4:3 (Standard)",
+        "9:16 (Portrait Widescreen)",
+        "16:9 (Widescreen)",
+        "21:9 (Ultrawide)"
+      ]
+    },
+    "duration": {
+      "type": "number",
+      "description": "视频时长，单位秒；实际帧数按工作流的表达式取整",
+      "minimum": 1,
+      "target": {
+        "node": "140:133",
+        "field": "value"
+      }
+    },
+    "seed": {
+      "type": "integer",
+      "description": "随机种子；不提供时使用工作流原值",
+      "minimum": 0,
+      "target": {
+        "node": "140:129",
+        "field": "noise_seed"
+      }
+    }
+  },
+  "outputs": {
+    "video": {
+      "type": "video",
+      "target": {
+        "node": "92",
+        "field": "images"
+      }
+    }
+  }
+}

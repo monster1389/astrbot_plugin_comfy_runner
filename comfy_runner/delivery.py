@@ -6,19 +6,39 @@ from pathlib import Path
 from typing import Any
 
 from astrbot.api.event import AstrMessageEvent
-from astrbot.api.message_components import Image, Plain
+from astrbot.api.message_components import File, Image, Plain, Record, Video
+
+FILE_OUTPUT_TYPES = {
+    "image": Image,
+    "video": Video,
+    "audio": Record,
+}
 
 
-def image_components(path: Path) -> list[Any]:
-    """把本地图片文件包装成消息组件。
+def artifact_components(
+    path: Path,
+    output_type: str,
+    filename: str,
+) -> list[Any]:
+    """把一个落盘产物包装成消息组件。
 
     Args:
-        path: 图片路径。
+        path: 产物路径。
+        output_type: 契约声明的产物类型。
+        filename: 产物的原始文件名。
 
     Returns:
-        只含一张图片的组件列表。
+        只含一个组件的列表。
+
+    Raises:
+        ValueError: 产物类型不是文件类产物。
     """
-    return [Image.fromFileSystem(str(path))]
+    component = FILE_OUTPUT_TYPES.get(output_type)
+    if component is not None:
+        return [component.fromFileSystem(str(path))]
+    if output_type == "file":
+        return [File(name=filename, file=str(path))]
+    raise ValueError(f"产物类型 {output_type} 不是文件类产物")
 
 
 async def send_chain(event: AstrMessageEvent, components: list[Any]) -> None:

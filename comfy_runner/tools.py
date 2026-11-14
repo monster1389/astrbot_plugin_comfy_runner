@@ -15,9 +15,22 @@ from astrbot.api.event import AstrMessageEvent
 from .access import AccessController
 from .background import BackgroundJobs
 from .comfy import ComfyError, ExecutionTimeout, ExecutionUnknown
-from .contract import ContractError, ToolContract, contract_view, validate_arguments
-from .delivery import image_components, send_chain, send_text
-from .execution import ConcurrencyGate, ExecutionResult, WorkflowExecutor
+from .contract import (
+    ContractError,
+    ToolContract,
+    contract_view,
+    input_target_errors,
+    read_workflow,
+    validate_arguments,
+)
+from .delivery import artifact_components, send_chain, send_text
+from .execution import (
+    ConcurrencyGate,
+    ExecutionResult,
+    FileArtifact,
+    TextArtifact,
+    WorkflowExecutor,
+)
 
 ToolHandler = Callable[..., Awaitable[str]]
 
@@ -139,8 +152,13 @@ class WorkflowToolAdapter:
             ContractError: 工作流不存在。
         """
         self._admit(event)
+        contract = self._contract(workflow)
+        graph = read_workflow(contract.workflow_path)
+        problems = input_target_errors(contract, graph, contract.path.name)
+        if problems:
+            raise ContractError("\n".join(problems))
         return json.dumps(
-            contract_view(self._contract(workflow)),
+            contract_view(contract, graph),
             ensure_ascii=False,
             indent=2,
         )
@@ -271,8 +289,7 @@ class WorkflowToolAdapter:
         """
         try:
             result = await self.executor.collect(contract, prompt_id)
-            paths = await self._store(result)
-            await self._send_artifacts(event, paths)
+            await self._deliver_artifacts(event, result)
         except ExecutionTimeout:
             logger.warning(f"[ComfyUI] {contract.name} 等待超时 | {prompt_id}")
             await send_text(
@@ -300,38 +317,42 @@ class WorkflowToolAdapter:
         """
         self.gate.release()
 
-    async def _store(self, result: ExecutionResult) -> list[Path]:
-        """把全部正式产物写到落盘目录。
+    async def _store(self, artifact: FileArtifact) -> Path:
+        """把一个文件类产物写到落盘目录。
 
         Args:
-            result: 一次执行的结果。
+            artifact: 已经下载完成的文件类产物。
 
         Returns:
             落盘后的产物路径。
         """
-        paths: list[Path] = []
-        for artifact in result.artifacts:
-            path = self.output_dir / f"{uuid.uuid4().hex}{artifact.suffix}"
-            await asyncio.to_thread(path.write_bytes, artifact.content)
-            paths.append(path)
-        return paths
+        path = self.output_dir / f"{uuid.uuid4().hex}{artifact.suffix}"
+        await asyncio.to_thread(path.write_bytes, artifact.content)
+        return path
 
-    async def _send_artifacts(
+    async def _deliver_artifacts(
         self,
         event: AstrMessageEvent,
-        paths: list[Path],
+        result: ExecutionResult,
     ) -> None:
-        """把全部产物作为一条消息链发到原会话。
+        """把每个正式产物各自作为一条消息发到原会话。
 
         Args:
             event: 触发本次调用的消息事件。
-            paths: 落盘后的产物路径。
+            result: 一次执行的结果。
         """
-        components = [
-            component for path in paths for component in image_components(path)
-        ]
-        await send_chain(event, components)
-        logger.info(f"[ComfyUI] 已发送 {len(paths)} 个产物到当前会话")
+        for artifact in result.artifacts:
+            if isinstance(artifact, TextArtifact):
+                await send_text(event, artifact.text)
+                continue
+            path = await self._store(artifact)
+            await send_chain(
+                event,
+                artifact_components(path, artifact.type, artifact.filename),
+            )
+        logger.info(
+            f"[ComfyUI] 已发送 {len(result.artifacts)} 个产物到当前会话"
+        )
 
 
 def build_function_tools(
