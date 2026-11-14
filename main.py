@@ -12,12 +12,13 @@ from astrbot.api.star import Context, Star, StarTools
 
 from .comfy_runner import commands
 from .comfy_runner.access import AccessController, load_lexicon
+from .comfy_runner.background import BackgroundJobs
 from .comfy_runner.comfy import ComfyClient
 from .comfy_runner.commands import CommandContext
 from .comfy_runner.config import Config
 from .comfy_runner.execution import ConcurrencyGate, WorkflowExecutor
 from .comfy_runner.paths import prepare_data_dir
-from .comfy_runner.registry import build_tools
+from .comfy_runner.registry import load_enabled_contracts
 from .comfy_runner.tools import WorkflowToolAdapter, build_function_tools
 
 PLUGIN_DIR = Path(os.path.dirname(os.path.abspath(__file__)))
@@ -55,24 +56,23 @@ class ComfyUIPlugin(Star):
             poll_interval=execution.poll_interval_seconds,
         )
         self.gate = ConcurrencyGate(execution.max_concurrency)
+        self.jobs = BackgroundJobs()
+        self.contracts = load_enabled_contracts(self.cfg.workflow_dir, PLUGIN_DIR)
         self.adapter = WorkflowToolAdapter(
             self.access,
             WorkflowExecutor(self.client),
             self.gate,
+            self.jobs,
+            {contract.name: contract for contract in self.contracts},
             self.cfg.output_dir,
         )
-        self.workflow_tools = build_tools(self.cfg.workflow_dir, PLUGIN_DIR)
-        self.function_tools = build_function_tools(
-            self.workflow_tools,
-            __name__,
-            self.adapter,
-        )
+        self.function_tools = build_function_tools(self.adapter, __name__)
         self.cmd_ctx = CommandContext(
             self.cfg,
             self.access,
             self.client,
             PLUGIN_DIR,
-            tuple(tool.name for tool in self.function_tools),
+            tuple(contract.name for contract in self.contracts),
         )
 
         word_count = sum(len(words) for words in self.access.lexicon.values())
@@ -81,8 +81,8 @@ class ComfyUIPlugin(Star):
             f"管理员: {len(self.access.admin_ids)} 个 | "
             f"白名单群: {len(self.access.whitelist_group_ids)} 个"
         )
-        tool_names = ", ".join(self.cmd_ctx.tool_names) or "无"
-        logger.info(f"[ComfyUI] 启用的工作流工具: {tool_names}")
+        workflow_names = ", ".join(self.cmd_ctx.workflow_names) or "无"
+        logger.info(f"[ComfyUI] 启用的工作流: {workflow_names}")
         logger.info(
             f"[ComfyUI] 执行上限: 并发 {self.gate.limit} | "
             f"超时 {execution.timeout_seconds} 秒 | "
@@ -98,6 +98,11 @@ class ComfyUIPlugin(Star):
             self.context.add_llm_tools(*self.function_tools)
             logger.info(f"[ComfyUI] 已注册 {len(self.function_tools)} 个工作流工具")
         logger.info("[ComfyUI] 插件初始化完成")
+
+    async def terminate(self) -> None:
+        """插件卸载或重载时取消尚未完成的后台交付。"""
+        await self.jobs.cancel_all()
+        logger.info("[ComfyUI] 插件已卸载")
 
     @filter.command_group("comfy")
     def comfy(self):

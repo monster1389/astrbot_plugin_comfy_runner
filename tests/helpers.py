@@ -6,6 +6,7 @@ from pathlib import Path
 
 import aiohttp
 import pytest
+from astrbot.api.message_components import Plain
 from astrbot.api.star import StarTools
 from astrbot.core.config.astrbot_config import AstrBotConfig
 from astrbot_plugin_comfy_runner.main import ComfyUIPlugin
@@ -129,6 +130,57 @@ def collect(gen) -> list:
         全部产出。
     """
     return asyncio.run(_collect(gen))
+
+
+def run_tool(plugin, name: str, event, **arguments):
+    """按 AstrBot 的调用方式执行一次工具，并等后台交付结束。
+
+    Args:
+        plugin: 已装配的插件。
+        name: 工具名。
+        event: 消息事件替身。
+        **arguments: 工具参数。
+
+    Returns:
+        工具返回给模型的文本。
+    """
+
+    async def scenario() -> str:
+        summary = await tool_of(plugin, name).handler(event, **arguments)
+        await asyncio.gather(*plugin.jobs.tasks)
+        return summary
+
+    return asyncio.run(scenario())
+
+
+def tool_of(plugin, name: str):
+    """取出插件注册的一个工具。
+
+    Args:
+        plugin: 已装配的插件。
+        name: 工具名。
+
+    Returns:
+        对应的 Function Tool。
+    """
+    return next(item for item in plugin.function_tools if item.name == name)
+
+
+def sent_texts(event: FakeEvent) -> list[str]:
+    """取出会话收到的全部文本片段。
+
+    Args:
+        event: 消息事件替身。
+
+    Returns:
+        按发送顺序排列的文本。
+    """
+    return [
+        component.text
+        for _, components in event.sent
+        for component in components
+        if isinstance(component, Plain)
+    ]
 
 
 async def _collect(gen) -> list:

@@ -1,4 +1,4 @@
-"""契约校验、工具注册与检查命令的用户可见行为。"""
+"""契约校验与工作流工具注册的用户可见行为。"""
 
 import asyncio
 import json
@@ -75,32 +75,34 @@ def admin_overrides() -> dict:
     return {"admin_ids": ["9"], "whitelist_group_ids": ["2"]}
 
 
-def test_valid_contract_registers_tool(tmp_path, monkeypatch):
-    """合法契约注册出名称、描述与参数 Schema 正确的独立工具。"""
+def test_enabled_contract_registers_three_fixed_tools(tmp_path, monkeypatch):
+    """启用契约时只注册清单、查看、执行三个固定工具。"""
     write_contract(tmp_path)
 
     plugin, _ = make_plugin(tmp_path, monkeypatch, control=admin_overrides())
     tools = register(plugin)
 
-    assert [tool.name for tool in tools] == ["comfy_moss_t2i"]
-    assert tools[0].description == "使用 MOSS 工作流根据提示词生成图片"
-    assert tools[0].parameters == {
-        "type": "object",
-        "properties": {
-            "prompt": {
-                "type": "string",
-                "description": "描述期望画面的完整提示词",
-                "minLength": 1,
-            },
-            "seed": {
-                "type": "integer",
-                "description": "随机种子",
-                "minimum": 0,
-            },
-        },
-        "required": ["prompt"],
-        "additionalProperties": False,
-    }
+    assert [tool.name for tool in tools] == [
+        "comfy_list",
+        "comfy_inspect",
+        "comfy_execute",
+    ]
+
+
+def test_tool_schemas_do_not_depend_on_contract(tmp_path, monkeypatch):
+    """契约里的参数不再进入工具参数 Schema。"""
+    write_contract(tmp_path)
+
+    plugin, _ = make_plugin(tmp_path, monkeypatch, control=admin_overrides())
+    tools = {tool.name: tool for tool in register(plugin)}
+
+    assert tools["comfy_list"].parameters["properties"] == {}
+    assert tools["comfy_inspect"].parameters["required"] == ["workflow"]
+    assert tools["comfy_execute"].parameters["required"] == ["workflow"]
+    assert tools["comfy_execute"].parameters["properties"]["arguments"]["type"] == (
+        "object"
+    )
+    assert "prompt" not in json.dumps(tools["comfy_execute"].parameters)
 
 
 def test_no_contract_loads_without_tools(tmp_path, monkeypatch):
@@ -164,19 +166,6 @@ def test_duplicate_tool_names_prevent_load(tmp_path, monkeypatch):
         make_plugin(tmp_path, monkeypatch, control=admin_overrides())
 
     assert "重复" in str(error.value)
-
-
-def test_disabled_contract_is_not_registered(tmp_path, monkeypatch):
-    """禁用契约不注册，其余契约照常注册。"""
-    disabled = json.loads(json.dumps(CONTRACT))
-    disabled.update(enabled=False, name="comfy_disabled")
-    write_contract(tmp_path, stem="disabled", contract=disabled)
-    write_contract(tmp_path)
-
-    plugin, _ = make_plugin(tmp_path, monkeypatch, control=admin_overrides())
-    tools = register(plugin)
-
-    assert [tool.name for tool in tools] == ["comfy_moss_t2i"]
 
 
 def test_disabled_contract_with_broken_mapping_still_loads(tmp_path, monkeypatch):

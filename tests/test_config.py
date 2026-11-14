@@ -46,4 +46,4 @@ def test_legacy_config_sections_do_not_block_load(tmp_path, monkeypatch):
 
     plugin, _ = make_plugin(tmp_path, monkeypatch, control={"admin_ids": ["9"]})
 
-    assert plugin.cmd_ctx.tool_names == ()
+    assert plugin.cmd_ctx.workflow_names == ()

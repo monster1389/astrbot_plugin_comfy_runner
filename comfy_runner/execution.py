@@ -1,4 +1,4 @@
-"""工作流工具的一次执行：副本、参数覆盖、提交、等待与产物解析。"""
+"""工作流的一次执行：映射校验、提交、等待与产物解析。"""
 
 from __future__ import annotations
 
@@ -105,23 +105,23 @@ class WorkflowExecutor:
         """
         self.client = client
 
-    async def execute(
+    async def submit(
         self,
         contract: ToolContract,
         arguments: dict[str, Any],
-    ) -> ExecutionResult:
-        """执行一次工作流并取回声明的正式产物。
+    ) -> str:
+        """校验映射并提交一次执行。
 
         Args:
             contract: 工具契约。
             arguments: 本次调用显式提供的参数。
 
         Returns:
-            任务 ID 与全部正式产物。
+            ComfyUI 分配的任务 ID。
 
         Raises:
             ContractError: 工作流文件里契约声明的映射已不成立。
-            ComfyError: 提交、执行、解析或下载失败。
+            ComfyError: 提交失败或提交结果未知。
         """
         graph = read_workflow(contract.workflow_path)
         problems = input_target_errors(contract, graph, contract.path.name)
@@ -132,6 +132,26 @@ class WorkflowExecutor:
         logger.info(f"[ComfyUI] 提交工作流 {contract.name}")
 
         prompt_id = await self.client.submit(graph)
+        logger.info(f"[ComfyUI] 已接受 {contract.name} | prompt_id: {prompt_id}")
+        return prompt_id
+
+    async def collect(
+        self,
+        contract: ToolContract,
+        prompt_id: str,
+    ) -> ExecutionResult:
+        """等待同一个任务完成并下载声明的正式产物。
+
+        Args:
+            contract: 工具契约。
+            prompt_id: 已经提交的任务 ID。
+
+        Returns:
+            任务 ID 与全部正式产物。
+
+        Raises:
+            ComfyError: 执行失败、状态未知或产物下载失败。
+        """
         entry = await self.client.wait(prompt_id)
 
         artifacts: list[Artifact] = []

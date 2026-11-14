@@ -1,16 +1,14 @@
-"""契约扫描、启动校验与工作流工具集合。"""
+"""契约扫描、启动校验与已启用的契约集合。"""
 
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Any
 
 from .contract import (
     CONTRACT_SUFFIX,
     ContractError,
     ToolContract,
-    build_parameter_schema,
     load_contract,
     load_contract_schema,
     validate_contract,
@@ -34,14 +32,6 @@ class ContractReport:
     def enabled(self) -> bool:
         """契约可用且声明为启用时为 True。"""
         return self.contract is not None and self.contract.enabled
-
-
-@dataclass(frozen=True, slots=True)
-class WorkflowTool:
-    """一个待注册的工作流工具。"""
-
-    contract: ToolContract
-    parameters: dict[str, Any]
 
 
 def discover_contracts(workflow_dir: Path) -> list[Path]:
@@ -86,15 +76,15 @@ def inspect_contracts(workflow_dir: Path, plugin_dir: Path) -> list[ContractRepo
     return _with_name_errors(reports)
 
 
-def build_tools(workflow_dir: Path, plugin_dir: Path) -> list[WorkflowTool]:
-    """构建待注册的工作流工具集合。
+def load_enabled_contracts(workflow_dir: Path, plugin_dir: Path) -> list[ToolContract]:
+    """构建已启用且全部合法的契约集合。
 
     Args:
         workflow_dir: 工作流目录。
         plugin_dir: 插件根目录。
 
     Returns:
-        按工具名排序的待注册工具；没有启用契约时为空列表。
+        按工具名排序的启用契约；没有启用契约时为空列表。
 
     Raises:
         ContractError: 任一文件不符合格式，或任一启用契约语义不成立。
@@ -109,16 +99,13 @@ def build_tools(workflow_dir: Path, plugin_dir: Path) -> list[WorkflowTool]:
         detail = "\n".join(error for report in blocking for error in report.errors)
         raise ContractError(f"工具契约不合法:\n{detail}")
 
-    tools = [
-        WorkflowTool(
-            contract=report.contract,
-            parameters=build_parameter_schema(report.contract),
-        )
+    contracts = [
+        report.contract
         for report in reports
         if report.enabled and report.contract is not None
     ]
-    tools.sort(key=lambda tool: tool.contract.name)
-    return tools
+    contracts.sort(key=lambda contract: contract.name)
+    return contracts
 
 
 def _with_name_errors(reports: list[ContractReport]) -> list[ContractReport]:

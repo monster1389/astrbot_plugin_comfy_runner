@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Any
 
 from astrbot.api.event import AstrMessageEvent
-from astrbot.api.message_components import Image
+from astrbot.api.message_components import Image, Plain
 
 
 def image_components(path: Path) -> list[Any]:
@@ -29,3 +29,13 @@ async def send_chain(event: AstrMessageEvent, components: list[Any]) -> None:
         components: 消息组件。
     """
     await event.send(event.chain_result(components))
+
+
+async def send_text(event: AstrMessageEvent, text: str) -> None:
+    """主动发送一段文本。
+
+    Args:
+        event: 消息事件。
+        text: 要发送的文本。
+    """
+    await send_chain(event, [Plain(text=text)])

@@ -33,7 +33,7 @@ class CommandContext:
     access: AccessController
     client: ComfyClient
     plugin_dir: Path
-    tool_names: tuple[str, ...]
+    workflow_names: tuple[str, ...]
 
 
 def command_arguments(event: AstrMessageEvent, depth: int = 2) -> str:
@@ -69,7 +69,7 @@ async def help_command(
     tips = [
         "ComfyUI 工作流工具",
         "",
-        "直接对话说出需求即可，模型会调用已启用的工作流工具。",
+        "直接对话说出需求即可，模型会自己发现并调用可用的工作流。",
         "",
         "【指令】",
         "  /comfy help    显示此帮助",
@@ -89,7 +89,7 @@ async def help_command(
         )
 
     tips.append("")
-    tips.append(f"已启用工具：{', '.join(ctx.tool_names) or '无'}")
+    tips.append(f"已启用工作流：{', '.join(ctx.workflow_names) or '无'}")
     tips.append(f"当前位置：{'群聊 ' + gid if gid else '私聊'}")
     tips.append(f"违禁级别：{policy}")
     tips.append(f"冷却时间：{ctx.cfg.control.cooldown_seconds} 秒")

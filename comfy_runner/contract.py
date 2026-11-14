@@ -267,6 +267,26 @@ def build_parameter_schema(contract: ToolContract) -> dict[str, Any]:
     }
 
 
+def contract_view(contract: ToolContract) -> dict[str, Any]:
+    """生成给模型看的契约视图。
+
+    Args:
+        contract: 工具契约。
+
+    Returns:
+        只含名称、说明、参数 Schema 与产物类型的字典。
+    """
+    return {
+        "name": contract.name,
+        "description": contract.description,
+        "parameters": build_parameter_schema(contract),
+        "outputs": {
+            name: {"type": contract.outputs[name].type}
+            for name in sorted(contract.outputs)
+        },
+    }
+
+
 def validate_arguments(contract: ToolContract, arguments: dict[str, Any]) -> None:
     """按生成的参数 Schema 校验一次调用的实参。
 

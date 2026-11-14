@@ -116,14 +116,14 @@ def test_list_command_requires_admin(tmp_path, monkeypatch):
     assert "权限不足" in results[0][1]
 
 
-def test_help_command_lists_enabled_tools(tmp_path, monkeypatch):
-    """/comfy help 显示已启用的工作流工具。"""
+def test_help_command_lists_enabled_workflows(tmp_path, monkeypatch):
+    """/comfy help 显示已启用的工作流。"""
     write_workflow_dir(tmp_path)
     plugin, _ = make_plugin(tmp_path, monkeypatch, control=admin_overrides())
 
     results = collect(plugin.cmd_comfy_help(FakeEvent("/comfy help", sender="9")))
 
-    assert "已启用工具：comfy_moss_t2i" in results[0][1]
+    assert "已启用工作流：comfy_moss_t2i" in results[0][1]
     assert "/comfy check" in results[0][1]
 
 

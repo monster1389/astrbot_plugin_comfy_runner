@@ -1,20 +1,17 @@
-"""工作流工具执行：参数覆盖、错误分类与并发上限。"""
+"""工作流执行：提交、后台交付、参数覆盖与错误告知。"""
 
 import asyncio
 import json
 from pathlib import Path
 
-import pytest
-from astrbot_plugin_comfy_runner.comfy_runner.comfy import (
-    DownloadError,
-    ExecutionFailed,
-    ExecutionTimeout,
-    OutputError,
-    SubmitError,
+from helpers import (
+    FakeComfyServer,
+    FakeEvent,
+    make_plugin,
+    run_tool,
+    sent_texts,
+    tool_of,
 )
-from astrbot_plugin_comfy_runner.comfy_runner.contract import ContractError
-from astrbot_plugin_comfy_runner.comfy_runner.tools import WorkflowRejected
-from helpers import FakeComfyServer, FakeEvent, make_plugin
 
 WORKFLOW = {
     "1": {"class_type": "CLIPTextEncode", "inputs": {"text": "原始提示词"}},
@@ -58,7 +55,7 @@ SUCCESS = {
 }
 
 
-def setup(tmp_path: Path, monkeypatch, execution: dict | None = None):
+def setup(tmp_path: Path, monkeypatch, execution: dict | None = None, control=None):
     """写一对契约与工作流、装配插件并接管 HTTP。"""
     workflow_dir = tmp_path / "plugin_data" / "workflow"
     workflow_dir.mkdir(parents=True, exist_ok=True)
@@ -71,26 +68,72 @@ def setup(tmp_path: Path, monkeypatch, execution: dict | None = None):
         tmp_path,
         monkeypatch,
         execution=execution or {},
-        control={"admin_ids": ["9"], "whitelist_group_ids": ["2"]},
+        control=control
+        or {"admin_ids": ["9"], "whitelist_group_ids": ["2"], "cooldown_seconds": 0},
     )
     server = FakeComfyServer().install(monkeypatch)
     server.history_reply = SUCCESS
     return plugin, server
 
 
-def run(plugin, **arguments):
-    """按 AstrBot 的调用方式执行一次工具。"""
-    handler = plugin.function_tools[0].handler
-    return asyncio.run(handler(FakeEvent(), **arguments))
+def execute(plugin, event=None, params=None) -> str:
+    """对测试工作流执行一次，并等后台交付结束。"""
+    return run_tool(
+        plugin,
+        "comfy_execute",
+        event or FakeEvent(),
+        workflow=CONTRACT["name"],
+        arguments=params,
+    )
+
+
+def test_execute_returns_before_artifacts_are_sent(tmp_path, monkeypatch):
+    """工具先返回提交结果，产物在之后的后台交付里发出。"""
+    plugin, _ = setup(tmp_path, monkeypatch)
+    event = FakeEvent(sender="9", group="2")
+
+    async def scenario():
+        tool = tool_of(plugin, "comfy_execute")
+        summary = await tool.handler(
+            event,
+            workflow=CONTRACT["name"],
+            arguments={"prompt": "一只猫"},
+        )
+        sent_before = len(event.sent)
+        await asyncio.gather(*plugin.jobs.tasks)
+        return summary, sent_before
+
+    summary, sent_before = asyncio.run(scenario())
+
+    assert sent_before == 0
+    assert summary == (
+        "已提交工作流 comfy_test_t2i，正在后台生成，完成后会自动发送到当前会话"
+    )
+    assert len(event.sent) == 1
+    kind, components = event.sent[0]
+    assert kind == "chain"
+    assert [type(item).__name__ for item in components] == ["Image"]
+    assert len(list((tmp_path / "plugin_data" / "output").glob("*.png"))) == 1
+
+
+def test_summary_hides_internal_location(tmp_path, monkeypatch):
+    """给模型的结果不含节点、路径或 ComfyUI 地址。"""
+    plugin, _ = setup(tmp_path, monkeypatch)
+
+    summary = execute(plugin, FakeEvent(sender="9", group="2"), {"prompt": "一只猫"})
+
+    assert "http" not in summary
+    assert str(tmp_path) not in summary
+    assert "1.text" not in summary
 
 
 def test_omitted_parameter_restores_workflow_value(tmp_path, monkeypatch):
     """连续调用后省略参数会回到原始工作流的值。"""
     plugin, server = setup(tmp_path, monkeypatch)
 
-    run(plugin, prompt="第一次", seed=5)
-    run(plugin, prompt="第二次", seed=9)
-    run(plugin, prompt="第三次")
+    execute(plugin, params={"prompt": "第一次", "seed": 5})
+    execute(plugin, params={"prompt": "第二次", "seed": 9})
+    execute(plugin, params={"prompt": "第三次"})
 
     assert [graph["2"]["inputs"]["seed"] for graph in server.submissions] == [5, 9, 7]
     assert [graph["1"]["inputs"]["text"] for graph in server.submissions] == [
@@ -106,7 +149,7 @@ def test_unmapped_seed_and_workflow_file_untouched(tmp_path, monkeypatch):
     path = tmp_path / "plugin_data" / "workflow" / "wf.json"
     before = path.read_bytes()
 
-    run(plugin, prompt="一次", seed=5)
+    execute(plugin, params={"prompt": "一次", "seed": 5})
 
     assert path.read_bytes() == before
     assert server.submissions[0]["2"]["inputs"]["noise_seed"] == 11
@@ -114,37 +157,82 @@ def test_unmapped_seed_and_workflow_file_untouched(tmp_path, monkeypatch):
 
 
 def test_missing_required_parameter_blocks_submission(tmp_path, monkeypatch):
-    """缺少必填参数时不提交工作流。"""
+    """缺少必填参数时把原因返回给模型，不提交工作流。"""
     plugin, server = setup(tmp_path, monkeypatch)
 
-    with pytest.raises(ContractError, match="缺少必填参数: prompt"):
-        run(plugin)
+    summary = execute(plugin)
 
+    assert summary == "❌ 缺少必填参数: prompt"
     assert server.submissions == []
 
 
 def test_unknown_parameter_blocks_submission(tmp_path, monkeypatch):
-    """出现未声明参数时不提交工作流。"""
+    """出现未声明参数时把原因返回给模型，不提交工作流。"""
     plugin, server = setup(tmp_path, monkeypatch)
 
-    with pytest.raises(ContractError, match="出现未声明参数: style"):
-        run(plugin, prompt="一次", style="二次元")
+    summary = execute(plugin, params={"prompt": "一次", "style": "二次元"})
 
+    assert summary == "❌ 出现未声明参数: style"
     assert server.submissions == []
 
 
-def test_success_returns_summary_and_downloads_artifact(tmp_path, monkeypatch):
-    """执行成功返回产物数量并下载声明的正式产物。"""
+def test_non_object_arguments_are_rejected(tmp_path, monkeypatch):
+    """参数不是对象时给出明确错误。"""
     plugin, server = setup(tmp_path, monkeypatch)
 
-    summary = run(plugin, prompt="一次")
+    summary = execute(plugin, params="一次")
 
-    assert summary == "已生成 1 个产物并发送到当前会话"
-    assert len(server.downloads) == 1
+    assert "参数 arguments 必须是对象" in summary
+    assert server.submissions == []
+
+
+def test_unknown_workflow_is_reported(tmp_path, monkeypatch):
+    """未知工作流不提交并提示可用名称。"""
+    plugin, server = setup(tmp_path, monkeypatch)
+
+    summary = run_tool(
+        plugin,
+        "comfy_execute",
+        FakeEvent(sender="9", group="2"),
+        workflow="comfy_nope",
+        arguments={"prompt": "一次"},
+    )
+
+    assert "未知的工作流: comfy_nope" in summary
+    assert "comfy_test_t2i" in summary
+    assert server.submissions == []
+
+
+def test_unlisted_group_cannot_execute(tmp_path, monkeypatch):
+    """白名单外的群不提交工作流。"""
+    plugin, server = setup(tmp_path, monkeypatch)
+
+    summary = execute(plugin, FakeEvent(sender="5", group="8"), {"prompt": "一只猫"})
+
+    assert "不在白名单中" in summary
+    assert server.submissions == []
+
+
+def test_sensitive_prompt_is_rejected(tmp_path, monkeypatch):
+    """参数命中敏感词时不提交工作流。"""
+    plugin, server = setup(
+        tmp_path,
+        monkeypatch,
+        control={
+            "admin_ids": ["9"],
+            "whitelist_group_ids": ["2"],
+            "default_group_policy": "full",
+        },
+    )
+
+    summary = execute(plugin, FakeEvent(sender="5", group="2"), {"prompt": "blood"})
+
+    assert "检测到敏感词" in summary
+    assert server.submissions == []
 
 
 def test_submit_error_is_reported(tmp_path, monkeypatch):
-    """HTTP 200 但含提交错误时按提交失败处理。"""
+    """HTTP 200 但含提交错误时把原因返回给模型。"""
     plugin, server = setup(tmp_path, monkeypatch)
     server.prompt_response = (
         200,
@@ -154,9 +242,11 @@ def test_submit_error_is_reported(tmp_path, monkeypatch):
         },
     )
 
-    with pytest.raises(SubmitError, match="prompt_no_outputs"):
-        run(plugin, prompt="一次")
+    summary = execute(plugin, params={"prompt": "一次"})
 
+    assert summary.startswith("❌")
+    assert "提交失败" in summary
+    assert "prompt_no_outputs" in summary
     assert server.history_queries == []
 
 
@@ -172,8 +262,9 @@ def test_node_errors_are_reported(tmp_path, monkeypatch):
         },
     )
 
-    with pytest.raises(SubmitError, match="节点 1: bad_linked_input 输入是连线"):
-        run(plugin, prompt="一次")
+    summary = execute(plugin, params={"prompt": "一次"})
+
+    assert "节点 1: bad_linked_input 输入是连线" in summary
 
 
 def test_non_200_submit_is_reported(tmp_path, monkeypatch):
@@ -181,12 +272,13 @@ def test_non_200_submit_is_reported(tmp_path, monkeypatch):
     plugin, server = setup(tmp_path, monkeypatch)
     server.prompt_response = (500, "boom")
 
-    with pytest.raises(SubmitError, match="HTTP 500"):
-        run(plugin, prompt="一次")
+    summary = execute(plugin, params={"prompt": "一次"})
+
+    assert "提交失败: HTTP 500" in summary
 
 
-def test_execution_failure_is_reported(tmp_path, monkeypatch):
-    """执行状态为 error 时报告节点与原因。"""
+def test_execution_failure_notifies_session(tmp_path, monkeypatch):
+    """执行失败时由后台向会话发送原因。"""
     plugin, server = setup(tmp_path, monkeypatch)
     server.history_reply = {
         "p1": {
@@ -203,13 +295,17 @@ def test_execution_failure_is_reported(tmp_path, monkeypatch):
             "outputs": {},
         }
     }
+    event = FakeEvent(sender="9", group="2")
 
-    with pytest.raises(ExecutionFailed, match="2 显存不足"):
-        run(plugin, prompt="一次")
+    execute(plugin, event, {"prompt": "一次"})
+
+    assert sent_texts(event) == [
+        "❌ 工作流 comfy_test_t2i 执行失败：执行失败: 2 显存不足"
+    ]
 
 
-def test_missing_declared_output_is_reported(tmp_path, monkeypatch):
-    """执行完成但没有声明的产物时按结果不完整处理。"""
+def test_missing_declared_output_notifies_session(tmp_path, monkeypatch):
+    """执行完成但声明的产物缺失时告知会话。"""
     plugin, server = setup(tmp_path, monkeypatch)
     server.history_reply = {
         "p1": {
@@ -217,50 +313,59 @@ def test_missing_declared_output_is_reported(tmp_path, monkeypatch):
             "outputs": {"9": {"images": []}},
         }
     }
+    event = FakeEvent(sender="9", group="2")
 
-    with pytest.raises(OutputError, match="产物 image 的输出节点 3 没有结果"):
-        run(plugin, prompt="一次")
+    execute(plugin, event, {"prompt": "一次"})
+
+    assert sent_texts(event) == [
+        "❌ 工作流 comfy_test_t2i 执行失败：产物 image 的输出节点 3 没有结果"
+    ]
 
 
-def test_download_failure_is_reported(tmp_path, monkeypatch):
-    """产物下载失败单独报告。"""
+def test_download_failure_notifies_session(tmp_path, monkeypatch):
+    """产物下载失败时告知会话。"""
     plugin, server = setup(tmp_path, monkeypatch)
     server.view_response = (404, "")
+    event = FakeEvent(sender="9", group="2")
 
-    with pytest.raises(DownloadError, match="HTTP 404"):
-        run(plugin, prompt="一次")
+    execute(plugin, event, {"prompt": "一次"})
+
+    texts = sent_texts(event)
+    assert len(texts) == 1
+    assert "下载 a.png 失败: HTTP 404" in texts[0]
 
 
-def test_timeout_does_not_resubmit(tmp_path, monkeypatch):
-    """超时结束本次调用，且不重新提交工作流。"""
+def test_timeout_notifies_unknown_state_without_resubmitting(tmp_path, monkeypatch):
+    """超时按执行状态未知告知会话，且不重新提交。"""
     plugin, server = setup(
         tmp_path,
         monkeypatch,
         execution={"timeout_seconds": 1, "poll_interval_seconds": 0.1},
     )
     server.history_reply = {}
+    event = FakeEvent(sender="9", group="2")
 
-    with pytest.raises(ExecutionTimeout):
-        run(plugin, prompt="一次")
+    execute(plugin, event, {"prompt": "一次"})
 
+    assert sent_texts(event) == ["⚠️ 工作流 comfy_test_t2i 等待超时，执行状态未知"]
     assert len(server.submissions) == 1
 
 
-def test_concurrency_limit_rejects_without_queueing(tmp_path, monkeypatch):
-    """并发已满时直接拒绝，不提交也不排队。"""
+def test_concurrency_limit_rejects_without_submitting(tmp_path, monkeypatch):
+    """并发已满时把拒绝原因返回给模型，不提交也不排队。"""
     plugin, server = setup(tmp_path, monkeypatch, execution={"max_concurrency": 1})
     assert plugin.gate.try_acquire()
 
-    with pytest.raises(WorkflowRejected, match="并发已满（上限 1）"):
-        run(plugin, prompt="一次")
+    summary = execute(plugin, params={"prompt": "一次"})
 
     plugin.gate.release()
+    assert summary == "⚠️ 并发已满（上限 1），请稍后重试"
     assert server.submissions == []
     assert plugin.gate.active == 0
 
 
 def test_slot_is_released_after_timeout(tmp_path, monkeypatch):
-    """超时后归还并发名额，下一次调用可以正常进入。"""
+    """后台超时后归还并发名额，下一次调用可以正常进入。"""
     plugin, server = setup(
         tmp_path,
         monkeypatch,
@@ -272,10 +377,10 @@ def test_slot_is_released_after_timeout(tmp_path, monkeypatch):
     )
     server.history_reply = {}
 
-    with pytest.raises(ExecutionTimeout):
-        run(plugin, prompt="一次")
+    execute(plugin, params={"prompt": "一次"})
 
     assert plugin.gate.active == 0
 
     server.history_reply = SUCCESS
-    assert run(plugin, prompt="二次") == "已生成 1 个产物并发送到当前会话"
+    assert execute(plugin, params={"prompt": "二次"}).startswith("已提交")
+    assert plugin.gate.active == 0

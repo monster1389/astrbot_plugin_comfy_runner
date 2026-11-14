@@ -16,7 +16,7 @@
         "default": 2
       },
       "timeout_seconds": {
-        "description": "单次执行同步等待的总时长上限（秒）",
+        "description": "单次执行在后台等待结果的总时长上限（秒）",
         "type": "int",
         "default": 300
       },
