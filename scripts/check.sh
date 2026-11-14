@@ -12,7 +12,10 @@ if [ "$(docker inspect -f '{{.State.Running}}' astrbot 2>/dev/null)" != "true" ]
 fi
 
 tracked() {
-  git -C "$root" ls-files --cached --others --exclude-standard -- "$@"
+  local path
+  while IFS= read -r path; do
+    [ -e "$root/$path" ] && printf '%s\n' "$path"
+  done < <(git -C "$root" ls-files --cached --others --exclude-standard -- "$@")
 }
 
 mapfile -t py_files < <(tracked '*.py')
