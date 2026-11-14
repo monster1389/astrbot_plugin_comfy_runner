@@ -8,7 +8,7 @@ import json
 import re
 import traceback
 from collections.abc import AsyncIterator
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -19,7 +19,13 @@ from astrbot.api.provider import LLMResponse, ProviderRequest
 from astrbot.core.message.message_event_result import MessageChain
 
 from .access import AccessController, group_id, is_group_message, self_id
+from .comfy import ComfyError
 from .config import POLICIES, Config
+from .contract import (
+    ContractError,
+    read_workflow,
+    remote_target_errors,
+)
 from .delivery import (
     chain_result,
     forward_components,
@@ -42,6 +48,7 @@ from .prompt import (
     sanitize_context_content,
     strip_control_tags,
 )
+from .registry import ContractReport, inspect_contracts
 from .workflow import format_strength, is_aux_file, normalize_lora_key
 
 FORCE_DRAW_CONTEXT_LIMIT = 12
@@ -67,6 +74,98 @@ class CommandContext:
     drawer: Drawer
     selection: WorkflowSelection
     context: Any
+    plugin_dir: Path
+
+
+async def check_contracts(
+    ctx: CommandContext,
+    event: AstrMessageEvent,
+) -> AsyncIterator[MessageEventResult]:
+    """检查全部工具契约（含禁用契约）并报告定位。"""
+    user_id = str(event.get_sender_id())
+    if user_id not in ctx.access.admin_ids:
+        yield event.plain_result("🚫 权限不足，仅管理员可检查工具契约")
+        return
+
+    args = event.message_str.split()
+    remote = any(arg.lower() == "remote" for arg in args[1:])
+    reports = inspect_contracts(ctx.cfg.workflow_dir, ctx.plugin_dir)
+    if remote:
+        reports = await _apply_remote_check(ctx, reports)
+
+    enabled = sum(1 for report in reports if report.enabled)
+    lines = [
+        "工具契约检查",
+        f"目录: {ctx.cfg.workflow_dir}",
+        f"共 {len(reports)} 个契约文件，启用 {enabled} 个",
+    ]
+    if remote:
+        lines.append("已附带 ComfyUI 节点定义核对")
+    lines.append("")
+
+    if not reports:
+        lines.append("目录中没有契约文件")
+        yield event.plain_result("\n".join(lines))
+        return
+
+    for report in reports:
+        lines.append(_report_header(report))
+        lines.extend(f"  {error}" for error in report.errors)
+
+    yield event.plain_result("\n".join(lines))
+
+
+def _report_header(report: ContractReport) -> str:
+    contract = report.contract
+    if contract is None:
+        return f"❌ {report.path.name} 无法读取"
+    state = "启用" if contract.enabled else "禁用"
+    mark = "✅" if report.ok else "❌"
+    workflow = contract.workflow_path.name
+    return f"{mark} {report.path.name} -> {contract.name} [{state}] 工作流 {workflow}"
+
+
+async def _apply_remote_check(
+    ctx: CommandContext,
+    reports: list[ContractReport],
+) -> list[ContractReport]:
+    """用 ComfyUI 节点定义核对参数映射的目标字段。"""
+    graphs: dict[Path, dict[str, Any]] = {}
+    class_types: set[str] = set()
+    for report in reports:
+        contract = report.contract
+        if contract is None:
+            continue
+        try:
+            graphs[report.path] = read_workflow(contract.workflow_path)
+        except ContractError:
+            continue
+        graph = graphs[report.path]
+        for parameter in contract.inputs.values():
+            node = graph.get(parameter.node)
+            if isinstance(node, dict) and node.get("class_type"):
+                class_types.add(str(node["class_type"]))
+
+    node_defs: dict[str, dict[str, Any]] = {}
+    for class_type in sorted(class_types):
+        try:
+            node_defs[class_type] = await ctx.api.client.object_info(class_type)
+        except ComfyError as exc:
+            node_defs[class_type] = {}
+            logger.warning(f"[ComfyUI] 读取节点定义失败 {class_type}: {exc}")
+
+    checked: list[ContractReport] = []
+    for report in reports:
+        contract = report.contract
+        graph = graphs.get(report.path)
+        if contract is None or graph is None:
+            checked.append(report)
+            continue
+        errors = remote_target_errors(contract, graph, node_defs)
+        checked.append(
+            replace(report, errors=report.errors + tuple(errors)) if errors else report
+        )
+    return checked
 
 
 async def help_command(
@@ -91,7 +190,7 @@ async def help_command(
         "【基础指令】",
         "  /画图 <提示词>     生成图片（转发模式）",
         "  /画图no <提示词>   生成图片（直发模式）",
-        "  /comfy帮助         显示此帮助",
+        "  /comfy help        显示此帮助",
         "",
         "【LLM 模式】",
         "  直接对话：'帮我画一个可爱的猫娘'",
@@ -102,12 +201,12 @@ async def help_command(
         tips.extend(
             [
                 "【管理员指令】 ",
-                "  /comfy_ls              列出所有工作流",
-                "  /comfy_use <序号>      切换工作流",
-                "  /comfy_save            导入新工作流",
-                "  /comfy_add             步数覆盖（按节点ID）",
-                "  /comfy_lock on|off     切换全局锁定",
-                "  /违禁级别              设置群敏感度",
+                "  /comfy ls          查看工作流",
+                "  /comfy check       检查工具契约",
+                "  /comfy save        导入工作流或契约",
+                "  /comfy lock on|off 切换全局锁定",
+                "  /comfy policy      设置群违禁级别",
+                "  /comfy_use <序号>  切换工作流接口",
                 "",
             ]
         )
@@ -157,7 +256,7 @@ async def set_policy(
             f"  lite - 轻度过滤\n"
             f"  full - 完全过滤\n"
             f"\n"
-            f"用法：/违禁级别 <级别>"
+            f"用法：/comfy policy <级别>"
         )
         return
 
@@ -197,7 +296,7 @@ async def toggle_lockdown(
             f"当前: {'开启' if ctx.access.lockdown else '关闭'}\n"
             f"命令开关: "
             f"{'开启' if ctx.cfg.control.lockdown_command_enabled else '关闭'}\n"
-            "用法: /comfy_lock on|off|status"
+            "用法: /comfy lock on|off|status"
         )
         return
 
@@ -213,7 +312,7 @@ async def toggle_lockdown(
         yield event.plain_result("已关闭全局锁定：恢复正常访问控制")
         return
 
-    yield event.plain_result("❌ 参数无效，用法：/comfy_lock on|off|status")
+    yield event.plain_result("❌ 参数无效，用法：/comfy lock on|off|status")
 
 
 async def list_workflows(
@@ -296,9 +395,7 @@ async def use_workflow(
         return
     if len(args) < 2:
         yield event.plain_result(
-            "❌ 参数不足\n"
-            "用法：/comfy_use <序号>\n"
-            "示例：/comfy_use 1"
+            "❌ 参数不足\n用法：/comfy_use <序号>\n示例：/comfy_use 1"
         )
         return
 
@@ -594,8 +691,7 @@ async def current_workflow(
                 "- 正面节点: 未登记",
                 "- 负面节点: 未登记",
                 "- 输出节点: 未登记",
-                "- 绑定: 未登记，请在 WebUI 的 "
-                "workflow_settings.bindings 中补上",
+                "- 绑定: 未登记，请在 WebUI 的 workflow_settings.bindings 中补上",
             ]
         )
     yield event.plain_result("\n".join(lines))

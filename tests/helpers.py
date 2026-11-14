@@ -16,12 +16,17 @@ class FakeContext:
     """只实现插件初始化用到的上下文接口。"""
 
     def __init__(self) -> None:
-        """记录被激活的 LLM 工具名。"""
+        """记录被添加与激活的 LLM 工具。"""
         self.activated_tool: str | None = None
+        self.llm_tools: list = []
 
     def activate_llm_tool(self, name: str) -> None:
         """记录激活的工具。"""
         self.activated_tool = name
+
+    def add_llm_tools(self, *tools) -> None:
+        """记录注册的工具。"""
+        self.llm_tools.extend(tools)
 
 
 class FakeResult:
@@ -101,9 +106,7 @@ class FakeEvent:
 
 def make_astrbot_config(tmp_path: Path) -> AstrBotConfig:
     """用插件 schema 构建 AstrBot 配置对象。"""
-    schema = json.loads(
-        (PLUGIN_ROOT / "_conf_schema.json").read_text(encoding="utf-8")
-    )
+    schema = json.loads((PLUGIN_ROOT / "_conf_schema.json").read_text(encoding="utf-8"))
     return AstrBotConfig(config_path=str(tmp_path / "config.json"), schema=schema)
 
 

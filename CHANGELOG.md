@@ -2,6 +2,12 @@
 
 ## 未发布
 
+- 命令收敛为 `comfy` 命令组：`/comfy help`、`/comfy ls`、`/comfy check`、`/comfy save`、`/comfy lock`、`/comfy policy`（别名 `banlevel`）；不再提供 `/comfy帮助`、`/违禁级别`、`/comfy_lock`、`/comfy_ls`、`/comfy_save`
+- 新增工具契约：`workflow/` 目录下 `name.json` 与 `name.tool.json` 配对，启用的契约在插件加载或重载时注册为独立 LLM 工具，参数由契约声明
+- 新增 `/comfy check [remote]`：检查全部契约（含禁用），带 `remote` 时额外用 ComfyUI `/object_info` 核对目标字段
+- 启用契约不合法时插件拒绝加载；`enabled: false` 的契约不注册，其映射错误不影响加载
+- 工作流列表不再列出 `.tool.json`、`.steps.json`、`.lora.json` 等附属文件
+
 - WebUI 配置的工作流下拉恢复：插件加载/重载时列出数据目录里的工作流，`/comfy_save` 导入后立即出现
 - `/comfy_use` 的选择写入数据目录 `state.json`，重启后保持；WebUI 修改配置后以 WebUI 为准
 - 工作流未配置或文件缺失时，`/画图` 给出明确错误并提示 `/comfy_ls`

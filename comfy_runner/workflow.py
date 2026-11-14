@@ -12,6 +12,7 @@ from typing import Any
 from astrbot.api import logger
 
 from .config import NodeBinding
+from .contract import CONTRACT_SUFFIX
 
 LORA_MANIFEST_SUFFIX = ".lora.json"
 STEPS_OVERRIDE_SUFFIX = ".steps.json"
@@ -36,10 +37,10 @@ def is_aux_file(filename: str) -> bool:
         filename: 文件名。
 
     Returns:
-        步数覆盖或 LoRA 清单文件返回 True。
+        契约、步数覆盖或 LoRA 清单文件返回 True。
     """
-    return filename.endswith(STEPS_OVERRIDE_SUFFIX) or filename.endswith(
-        LORA_MANIFEST_SUFFIX
+    return filename.endswith(
+        (CONTRACT_SUFFIX, STEPS_OVERRIDE_SUFFIX, LORA_MANIFEST_SUFFIX)
     )
 
 

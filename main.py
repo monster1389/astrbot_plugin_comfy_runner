@@ -17,6 +17,8 @@ from .comfy_runner.commands import CommandContext
 from .comfy_runner.config import Config
 from .comfy_runner.draw import Drawer
 from .comfy_runner.plugin_state import WorkflowSelection, prepare_data_dir
+from .comfy_runner.registry import build_tools
+from .comfy_runner.tools import build_function_tools
 
 PLUGIN_DIR = Path(os.path.dirname(os.path.abspath(__file__)))
 
@@ -25,11 +27,14 @@ class ComfyUIPlugin(Star):
     """外部 ComfyUI 的 AstrBot 适配器。"""
 
     def __init__(self, context: Context, config: dict[str, Any]) -> None:
-        """装配配置、访问控制、出图器与命令上下文。
+        """装配配置、访问控制、工作流工具与命令上下文。
 
         Args:
             context: AstrBot 插件上下文。
             config: 合并了 schema 默认值的配置字典。
+
+        Raises:
+            ContractError: 任一启用契约不合法，或任一契约文件无法解析。
         """
         super().__init__(context)
         self.data_dir = StarTools.get_data_dir("astrbot_plugin_comfy_runner")
@@ -40,7 +45,9 @@ class ComfyUIPlugin(Star):
         self.selection = WorkflowSelection(config, self.data_dir, self.cfg)
         self.cfg = self.selection.config
         control = self.cfg.control
-        llm = self.cfg.llm
+
+        self.workflow_tools = build_tools(self.cfg.workflow_dir, PLUGIN_DIR)
+        self.function_tools = build_function_tools(self.workflow_tools, __name__)
 
         self.access = AccessController(
             control,
@@ -57,6 +64,7 @@ class ComfyUIPlugin(Star):
             self.drawer,
             self.selection,
             self.context,
+            PLUGIN_DIR,
         )
 
         word_count = sum(len(words) for words in self.access.lexicon.values())
@@ -65,60 +73,64 @@ class ComfyUIPlugin(Star):
             f"[ComfyUI] 超级管理员: {len(control.admin_ids)} 个 | "
             f"白名单群: {len(control.whitelist_group_ids)} 个"
         )
-        logger.info(f"[ComfyUI] 多图模式: {'开启' if llm.multi_image_mode else '关闭'}")
-        if llm.discard_prompt_from_history:
-            logger.info("[ComfyUI] 绘图提示词历史丢弃: 开启")
-        if llm.force_draw_when_no_prompt:
-            logger.info("[ComfyUI] 强制画图: 开启")
-        if llm.target_image_count > 1:
-            logger.info(f"[ComfyUI] 目标出图数量: {llm.target_image_count}")
+        tool_names = ", ".join(tool.name for tool in self.function_tools) or "无"
+        logger.info(f"[ComfyUI] 启用的工作流工具: {tool_names}")
         if self.access.lockdown:
             logger.warning("[ComfyUI] 绘图功能全局锁定已启用，仅超级管理员可用")
-        logger.info(
-            f"[ComfyUI] 锁定命令开关: "
-            f"{'开启' if control.lockdown_command_enabled else '关闭'}"
-        )
         logger.info("[ComfyUI] ComfyUI API 初始化成功")
 
     async def initialize(self) -> None:
-        """插件加载完成后激活 LLM 工具。"""
+        """插件加载完成后注册工作流工具并激活旧工具。"""
+        if self.function_tools:
+            self.context.add_llm_tools(*self.function_tools)
+            logger.info(f"[ComfyUI] 已注册 {len(self.function_tools)} 个工作流工具")
         self.context.activate_llm_tool("comfyui_txt2img")
-        logger.info("[ComfyUI] 插件初始化完成，LLM 工具已激活")
+        logger.info("[ComfyUI] 插件初始化完成")
 
-    @filter.command("comfy帮助")
-    async def cmd_comfyui_help(self, event: AstrMessageEvent):
+    @filter.command_group("comfy")
+    def comfy(self):
+        """ComfyUI 工作流工具命令组。"""
+
+    @comfy.command("help")
+    async def cmd_comfy_help(self, event: AstrMessageEvent):
         """显示帮助。"""
         async for result in commands.help_command(self.cmd_ctx, event):
             yield result
 
-    @filter.command("违禁级别", aliases={"banlevel", "敏感级别"})
+    @comfy.command("policy", alias={"banlevel"})
     async def cmd_set_policy(self, event: AstrMessageEvent):
         """查看或设置本群违禁级别。"""
         async for result in commands.set_policy(self.cmd_ctx, event):
             yield result
 
-    @filter.command("comfy_lock", aliases=["全局锁定", "锁图", "绘图锁定"])
+    @comfy.command("lock")
     async def cmd_comfy_lock(self, event: AstrMessageEvent):
         """切换全局锁定。"""
         async for result in commands.toggle_lockdown(self.cmd_ctx, event):
             yield result
 
-    @filter.command("comfy_ls")
+    @comfy.command("ls")
     async def cmd_comfy_list(self, event: AstrMessageEvent):
         """列出可用工作流。"""
         async for result in commands.list_workflows(self.cmd_ctx, event):
+            yield result
+
+    @comfy.command("check")
+    async def cmd_comfy_check(self, event: AstrMessageEvent):
+        """检查工具契约。"""
+        async for result in commands.check_contracts(self.cmd_ctx, event):
+            yield result
+
+    @comfy.command("save")
+    async def cmd_comfy_save(self, event: AstrMessageEvent):
+        """保存或导入工作流。"""
+        async for result in commands.save_workflow(self.cmd_ctx, event):
             yield result
 
     @filter.command("comfy_use")
     async def cmd_comfy_use(self, event: AstrMessageEvent):
         """切换当前工作流。"""
         async for result in commands.use_workflow(self.cmd_ctx, event):
-            yield result
-
-    @filter.command("comfy_save")
-    async def cmd_comfy_save(self, event: AstrMessageEvent):
-        """保存或导入工作流。"""
-        async for result in commands.save_workflow(self.cmd_ctx, event):
             yield result
 
     @filter.command("comfy_add")

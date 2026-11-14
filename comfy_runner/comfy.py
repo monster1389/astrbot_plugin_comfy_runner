@@ -6,6 +6,7 @@ import asyncio
 import random
 import re
 from typing import Any
+from urllib.parse import quote
 
 import aiohttp
 
@@ -57,6 +58,33 @@ class ComfyClient:
         self.base_url = normalize_address(address)
         self.poll_interval = poll_interval
         self.poll_attempts = poll_attempts
+
+    async def object_info(self, class_type: str) -> dict[str, Any]:
+        """读取一个节点类型的定义。
+
+        Args:
+            class_type: 节点类型名。
+
+        Returns:
+            该节点类型的定义对象。
+
+        Raises:
+            ComfyError: 请求失败或返回结构不符。
+        """
+        url = f"{self.base_url}/object_info/{quote(class_type)}"
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(url) as resp:
+                    if resp.status != 200:
+                        raise ComfyError(f"读取节点定义失败: {resp.status}")
+                    data = await resp.json()
+        except aiohttp.ClientError as exc:
+            raise ComfyError(f"读取节点定义失败: {exc}") from exc
+
+        definition = data.get(class_type)
+        if not isinstance(definition, dict):
+            raise ComfyError(f"ComfyUI 未返回节点类型 {class_type} 的定义")
+        return definition
 
     async def generate(self, graph: dict[str, Any], output_node_id: str) -> bytes:
         """提交工作流并等待出图。
