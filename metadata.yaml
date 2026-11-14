@@ -1,9 +1,9 @@
 name: astrbot_plugin_comfy_runner
-version: v0.1.0
-desc: AstrBot 的高级 ComfyUI 连接插件，支持多工作流热切换、LLM 智能绘图、自定义系统提示词及敏感词过滤。
-help: 安装后需在配置中填写 ComfyUI 地址。在聊天中发送 /comfy帮助 查看详细指令。
+version: v0.2.0
+desc: 把 ComfyUI 工作流封装成 AstrBot 可调用的独立工具，参数与产物由工具契约声明。
+help: 在插件数据目录的 workflow/ 下放置 name.json 与 name.tool.json，重载插件后生效。发送 /comfy help 查看指令。
 author: monster1389
 repo: https://github.com/monster1389/astrbot_plugin_comfy_runner
 tags:
-  - 画图
   - comfyui
+  - 工作流

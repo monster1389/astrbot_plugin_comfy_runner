@@ -83,19 +83,6 @@ def group_id(event: AstrMessageEvent) -> str | None:
     return str(value) if value else None
 
 
-def self_id(event: AstrMessageEvent) -> str | None:
-    """取机器人自身账号。
-
-    Args:
-        event: 消息事件。
-
-    Returns:
-        自身账号，取不到时为 None。
-    """
-    value = event.get_self_id()
-    return str(value) if value else None
-
-
 def _is_ascii_term(term: str) -> bool:
     return all(ord(char) < 128 for char in term)
 

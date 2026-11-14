@@ -1,4 +1,4 @@
-"""AstrBot 插件入口：注册命令与工作流工具，装配依赖。"""
+"""AstrBot 插件入口：注册工作流工具与管理命令，装配依赖。"""
 
 from __future__ import annotations
 
@@ -6,18 +6,17 @@ import os
 from pathlib import Path
 from typing import Any
 
-from astrbot.api import llm_tool, logger
-from astrbot.api.event import AstrMessageEvent, MessageEventResult, filter
+from astrbot.api import logger
+from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.star import Context, Star, StarTools
 
 from .comfy_runner import commands
 from .comfy_runner.access import AccessController, load_lexicon
-from .comfy_runner.api import ComfyUI
+from .comfy_runner.comfy import ComfyClient
 from .comfy_runner.commands import CommandContext
 from .comfy_runner.config import Config
-from .comfy_runner.draw import Drawer
 from .comfy_runner.execution import ConcurrencyGate, WorkflowExecutor
-from .comfy_runner.plugin_state import WorkflowSelection, prepare_data_dir
+from .comfy_runner.paths import prepare_data_dir
 from .comfy_runner.registry import build_tools
 from .comfy_runner.tools import WorkflowToolAdapter, build_function_tools
 
@@ -35,28 +34,30 @@ class ComfyUIPlugin(Star):
             config: 合并了 schema 默认值的配置字典。
 
         Raises:
+            ConfigError: 配置项缺失、类型不符或取值非法。
             ContractError: 任一启用契约不合法，或任一契约文件无法解析。
         """
         super().__init__(context)
-        self.data_dir = StarTools.get_data_dir("astrbot_plugin_comfy_runner")
-        logger.info(f"[ComfyUI] 数据目录: {self.data_dir}")
-        prepare_data_dir(self.data_dir, PLUGIN_DIR)
+        data_dir = StarTools.get_data_dir("astrbot_plugin_comfy_runner")
+        logger.info(f"[ComfyUI] 数据目录: {data_dir}")
+        prepare_data_dir(data_dir, PLUGIN_DIR)
 
-        self.cfg = Config.from_mapping(config, data_dir=self.data_dir)
-        self.selection = WorkflowSelection(config, self.data_dir, self.cfg)
-        self.cfg = self.selection.config
-        control = self.cfg.control
+        self.cfg = Config.from_mapping(config, data_dir=data_dir)
+        execution = self.cfg.execution
 
         self.access = AccessController(
-            control,
+            self.cfg.control,
             load_lexicon(self.cfg.sensitive_words_path),
         )
-        self.api = ComfyUI(self.cfg)
-        self.executor = WorkflowExecutor(self.api.client)
-        self.gate = ConcurrencyGate(self.cfg.execution.max_concurrency)
+        self.client = ComfyClient(
+            self.cfg.server_address,
+            timeout=execution.timeout_seconds,
+            poll_interval=execution.poll_interval_seconds,
+        )
+        self.gate = ConcurrencyGate(execution.max_concurrency)
         self.adapter = WorkflowToolAdapter(
             self.access,
-            self.executor,
+            WorkflowExecutor(self.client),
             self.gate,
             self.cfg.output_dir,
         )
@@ -66,36 +67,30 @@ class ComfyUIPlugin(Star):
             __name__,
             self.adapter,
         )
-
-        self.selection.sync_options(self.api.workflow.list_files())
-        self.selection.log_status(self.api.workflow)
-        self.drawer = Drawer(self.api, self.access, self.cfg.output_dir)
         self.cmd_ctx = CommandContext(
             self.cfg,
             self.access,
-            self.api,
-            self.drawer,
-            self.selection,
-            self.context,
+            self.client,
             PLUGIN_DIR,
+            tuple(tool.name for tool in self.function_tools),
         )
 
         word_count = sum(len(words) for words in self.access.lexicon.values())
-        logger.info(f"[ComfyUI] 敏感词库已加载: {word_count} 个词条")
         logger.info(
-            f"[ComfyUI] 超级管理员: {len(control.admin_ids)} 个 | "
-            f"白名单群: {len(control.whitelist_group_ids)} 个"
+            f"[ComfyUI] 敏感词库: {word_count} 个词条 | "
+            f"管理员: {len(self.access.admin_ids)} 个 | "
+            f"白名单群: {len(self.access.whitelist_group_ids)} 个"
         )
-        tool_names = ", ".join(tool.name for tool in self.function_tools) or "无"
+        tool_names = ", ".join(self.cmd_ctx.tool_names) or "无"
         logger.info(f"[ComfyUI] 启用的工作流工具: {tool_names}")
         logger.info(
             f"[ComfyUI] 执行上限: 并发 {self.gate.limit} | "
-            f"超时 {self.cfg.execution.timeout_seconds} 秒 | "
-            f"轮询 {self.cfg.execution.poll_interval_seconds} 秒"
+            f"超时 {execution.timeout_seconds} 秒 | "
+            f"轮询 {execution.poll_interval_seconds} 秒"
         )
         if self.access.lockdown:
-            logger.warning("[ComfyUI] 工作流工具全局锁定已启用，仅超级管理员可用")
-        logger.info("[ComfyUI] ComfyUI API 初始化成功")
+            logger.warning("[ComfyUI] 工作流工具全局锁定已启用，仅管理员可用")
+        logger.info("[ComfyUI] 插件装配完成")
 
     async def initialize(self) -> None:
         """插件加载完成后注册工作流工具。"""
@@ -140,51 +135,6 @@ class ComfyUIPlugin(Star):
 
     @comfy.command("save")
     async def cmd_comfy_save(self, event: AstrMessageEvent):
-        """保存或导入工作流。"""
+        """导入工作流或契约。"""
         async for result in commands.save_workflow(self.cmd_ctx, event):
-            yield result
-
-    @filter.command("重绘", aliases=["重抽", "reroll"])
-    async def cmd_reroll(self, event: AstrMessageEvent):
-        """按给定提示词重绘一张图。"""
-        async for result in commands.paint(
-            self.cmd_ctx,
-            event,
-            direct_send=True,
-            strip_at=True,
-            usage=(
-                "用法: /重绘 <提示词>\n"
-                "示例: /重绘 1girl, silver hair, cinematic lighting"
-            ),
-        ):
-            yield result
-
-    @filter.command("画图", aliases=["绘画"])
-    async def cmd_paint(self, event: AstrMessageEvent):
-        """生成一张图并以合并转发发出。"""
-        async for result in commands.paint(self.cmd_ctx, event, direct_send=False):
-            yield result
-
-    @filter.command("画图no")
-    async def cmd_paint_no(self, event: AstrMessageEvent):
-        """生成一张图并直接发出。"""
-        async for result in commands.paint(self.cmd_ctx, event, direct_send=True):
-            yield result
-
-    @llm_tool(name="comfyui_txt2img")
-    async def comfyui_txt2img(
-        self,
-        event: AstrMessageEvent,
-        prompt: str = None,
-        text: str = None,
-        direct_send: bool = False,
-    ) -> MessageEventResult:
-        """ComfyUI 文生图工具。"""
-        async for result in commands.draw_tool(
-            self.cmd_ctx,
-            event,
-            prompt,
-            text,
-            direct_send,
-        ):
             yield result

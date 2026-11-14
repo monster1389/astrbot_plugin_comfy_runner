@@ -17,13 +17,8 @@ class FakeContext:
     """只实现插件初始化用到的上下文接口。"""
 
     def __init__(self) -> None:
-        """记录被添加与激活的 LLM 工具。"""
-        self.activated_tool: str | None = None
+        """记录被添加的 LLM 工具。"""
         self.llm_tools: list = []
-
-    def activate_llm_tool(self, name: str) -> None:
-        """记录激活的工具。"""
-        self.activated_tool = name
 
     def add_llm_tools(self, *tools) -> None:
         """记录注册的工具。"""
@@ -59,9 +54,6 @@ class FakeEvent:
         self._sender = sender
         self._group = group
         self._result = FakeResult()
-        self._comfy_segments = None
-        self._comfy_extracted_prompt = None
-        self._comfy_extracted_loras = []
         self.unified_msg_origin = "origin"
 
     def plain_result(self, text: str):
@@ -84,10 +76,6 @@ class FakeEvent:
         """返回群号。"""
         return self._group
 
-    def get_self_id(self) -> str:
-        """返回机器人自身账号。"""
-        return "999"
-
     def set_extra(self, key: str, value) -> None:
         """写入附加数据。"""
         self.extra[key] = value
@@ -99,10 +87,6 @@ class FakeEvent:
     def get_result(self) -> FakeResult:
         """返回当前结果对象。"""
         return self._result
-
-    def set_result(self, result: FakeResult) -> None:
-        """替换当前结果对象。"""
-        self._result = result
 
 
 def make_astrbot_config(tmp_path: Path) -> AstrBotConfig:
