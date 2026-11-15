@@ -2,8 +2,7 @@
 
 from __future__ import annotations
 
-import os
-from pathlib import Path
+from dataclasses import replace
 from typing import Any
 
 from astrbot.api import logger
@@ -17,11 +16,16 @@ from .comfy_runner.comfy import ComfyClient
 from .comfy_runner.commands import CommandContext
 from .comfy_runner.config import Config
 from .comfy_runner.execution import ConcurrencyGate, WorkflowExecutor
-from .comfy_runner.paths import prepare_data_dir
+from .comfy_runner.paths import PLUGIN_DIR, prepare_data_dir
 from .comfy_runner.registry import load_enabled_contracts
-from .comfy_runner.tools import WorkflowToolAdapter, build_function_tools
-
-PLUGIN_DIR = Path(os.path.dirname(os.path.abspath(__file__)))
+from .comfy_runner.tools import (
+    EXECUTE_NAME,
+    INSPECT_NAME,
+    LIST_NAME,
+    WorkflowToolAdapter,
+    build_function_tools,
+)
+from .comfy_runner.web import WebController
 
 
 class ComfyUIPlugin(Star):
@@ -74,6 +78,9 @@ class ComfyUIPlugin(Star):
             PLUGIN_DIR,
             tuple(contract.name for contract in self.contracts),
         )
+        self.web = WebController(self)
+        if hasattr(self.context, "register_web_api"):
+            self.web.register(self.context)
 
         word_count = sum(len(words) for words in self.access.lexicon.values())
         logger.info(
@@ -98,6 +105,41 @@ class ComfyUIPlugin(Star):
             self.context.add_llm_tools(*self.function_tools)
             logger.info(f"[ComfyUI] 已注册 {len(self.function_tools)} 个工作流工具")
         logger.info("[ComfyUI] 插件初始化完成")
+
+    def reload_contracts(self) -> tuple[str, ...]:
+        """重新读取并校验全部工具契约，在内存中刷新运行状态。
+
+        Returns:
+            当前启用的工具名。
+
+        Raises:
+            ContractError: 任一契约文件不可读、不符合 Schema 或启用契约语义不成立。
+        """
+        contracts = load_enabled_contracts(self.cfg.workflow_dir, PLUGIN_DIR)
+        self.contracts = contracts
+        self.adapter.catalog.clear()
+        self.adapter.catalog.update({contract.name: contract for contract in contracts})
+        names = tuple(contract.name for contract in contracts)
+        self.cmd_ctx = replace(self.cmd_ctx, workflow_names=names)
+        self._sync_tool_registration(bool(contracts))
+        logger.info(f"[ComfyUI] 工具契约已刷新，当前启用: {', '.join(names) or '无'}")
+        return names
+
+    def _sync_tool_registration(self, has_workflows: bool) -> None:
+        """在启用契约数量跨过零边界时同步注册或移除工作流工具。"""
+        if has_workflows and not self.function_tools:
+            self.function_tools = build_function_tools(self.adapter, __name__)
+            self.context.add_llm_tools(*self.function_tools)
+            logger.info(f"[ComfyUI] 已注册 {len(self.function_tools)} 个工作流工具")
+            return
+        if has_workflows or not self.function_tools:
+            return
+        if hasattr(self.context, "get_llm_tool_manager"):
+            manager = self.context.get_llm_tool_manager()
+            for name in (LIST_NAME, INSPECT_NAME, EXECUTE_NAME):
+                manager.remove_func(name)
+        self.function_tools = []
+        logger.info("[ComfyUI] 已移除工作流工具")
 
     async def terminate(self) -> None:
         """插件卸载或重载时取消尚未完成的后台交付。"""
@@ -136,4 +178,14 @@ class ComfyUIPlugin(Star):
     async def cmd_comfy_check(self, event: AstrMessageEvent):
         """检查工具契约。"""
         async for result in commands.check_contracts(self.cmd_ctx, event):
+            yield result
+
+    @comfy.command("reload")
+    async def cmd_comfy_reload(self, event: AstrMessageEvent):
+        """重新加载工具契约。"""
+        async for result in commands.reload_contracts_command(
+            self.cmd_ctx,
+            self.reload_contracts,
+            event,
+        ):
             yield result

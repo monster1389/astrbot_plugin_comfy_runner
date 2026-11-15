@@ -1,9 +1,10 @@
 """管理命令的用户可见行为。"""
 
+import asyncio
 import json
 from pathlib import Path
 
-from helpers import FakeComfyServer, FakeEvent, collect, make_plugin
+from helpers import FakeComfyServer, FakeEvent, collect, make_plugin, run_tool
 
 WORKFLOW = {
     "1": {"class_type": "CLIPTextEncode", "inputs": {"text": ""}},
@@ -87,6 +88,7 @@ def test_help_command_lists_enabled_workflows(tmp_path, monkeypatch):
 
     assert "已启用工作流：comfy_moss_t2i" in results[0][1]
     assert "/comfy check" in results[0][1]
+    assert "/comfy reload" in results[0][1]
     assert "/comfy save" not in results[0][1]
 
 
@@ -158,3 +160,78 @@ def test_check_command_remote_uses_node_definitions(tmp_path, monkeypatch):
     assert "参数 prompt 的字段 1.text 不在节点类型 CLIPTextEncode 的输入中" in (
         results[0][1]
     )
+
+
+def write_workflow_only(tmp_path: Path) -> Path:
+    """只写一份工作流，返回工作流目录。"""
+    workflow_dir = tmp_path / "plugin_data" / "workflow"
+    workflow_dir.mkdir(parents=True)
+    (workflow_dir / "moss.json").write_text(json.dumps(WORKFLOW), encoding="utf-8")
+    return workflow_dir
+
+
+def test_reload_command_requires_admin(tmp_path, monkeypatch):
+    """/comfy reload 仅管理员可用。"""
+    write_workflow_dir(tmp_path)
+    plugin, _ = make_plugin(tmp_path, monkeypatch, control=admin_overrides())
+
+    results = collect(plugin.cmd_comfy_reload(FakeEvent("/comfy reload", sender="5")))
+
+    assert "权限不足" in results[0][1]
+
+
+def test_reload_command_registers_new_contract(tmp_path, monkeypatch):
+    """新增契约后 /comfy reload 让工具与命令上下文立即生效。"""
+    workflow_dir = write_workflow_only(tmp_path)
+    plugin, _ = make_plugin(tmp_path, monkeypatch, control=admin_overrides())
+    assert plugin.function_tools == []
+
+    (workflow_dir / "moss.tool.json").write_text(
+        json.dumps(CONTRACT),
+        encoding="utf-8",
+    )
+    results = collect(plugin.cmd_comfy_reload(FakeEvent("/comfy reload", sender="9")))
+
+    assert "已重新加载工具契约，当前启用：comfy_moss_t2i" in results[0][1]
+    assert [tool.name for tool in plugin.context.llm_tools] == [
+        "comfy_list",
+        "comfy_inspect",
+        "comfy_execute",
+    ]
+    listed = run_tool(plugin, "comfy_list", FakeEvent("/comfy list", sender="9"))
+    assert "comfy_moss_t2i" in listed
+    help_text = collect(plugin.cmd_comfy_help(FakeEvent("/comfy help", sender="9")))
+    assert "已启用工作流：comfy_moss_t2i" in help_text[0][1]
+
+
+def test_reload_command_removes_tools_when_contracts_disappear(tmp_path, monkeypatch):
+    """删掉全部契约后 /comfy reload 移除三个工作流工具。"""
+    workflow_dir = write_workflow_dir(tmp_path)
+    plugin, _ = make_plugin(tmp_path, monkeypatch, control=admin_overrides())
+    asyncio.run(plugin.initialize())
+    assert len(plugin.context.llm_tools) == 3
+
+    (workflow_dir / "moss.tool.json").unlink()
+    results = collect(plugin.cmd_comfy_reload(FakeEvent("/comfy reload", sender="9")))
+
+    assert "当前启用：无" in results[0][1]
+    assert plugin.function_tools == []
+    assert plugin.context.llm_tools == []
+
+
+def test_reload_command_keeps_state_when_contract_broken(tmp_path, monkeypatch):
+    """契约损坏时 /comfy reload 报错且保留原运行状态。"""
+    workflow_dir = write_workflow_dir(tmp_path)
+    plugin, _ = make_plugin(tmp_path, monkeypatch, control=admin_overrides())
+    (workflow_dir / "moss.tool.json").write_text("{", encoding="utf-8")
+
+    results = collect(plugin.cmd_comfy_reload(FakeEvent("/comfy reload", sender="9")))
+
+    assert "重新加载失败，保持原运行状态" in results[0][1]
+    listed = run_tool(plugin, "comfy_list", FakeEvent("/comfy list", sender="9"))
+    assert "comfy_moss_t2i" in listed
+    assert [tool.name for tool in plugin.function_tools] == [
+        "comfy_list",
+        "comfy_inspect",
+        "comfy_execute",
+    ]

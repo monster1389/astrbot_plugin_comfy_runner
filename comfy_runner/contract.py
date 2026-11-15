@@ -146,6 +146,30 @@ def load_contract(path: Path, schema: dict[str, Any]) -> ToolContract:
         raise ContractError(f"{label}: 不是合法 JSON: {exc}") from exc
     if not isinstance(data, dict):
         raise ContractError(f"{label}: 顶层必须是对象")
+    return parse_contract_data(path, data, schema)
+
+
+def parse_contract_data(
+    path: Path,
+    data: Any,
+    schema: dict[str, Any],
+) -> ToolContract:
+    """对内存里的契约数据做单文件 Schema 校验并构造契约对象。
+
+    Args:
+        path: 契约文件路径，决定错误前缀与配对工作流。
+        data: 已解析的契约数据。
+        schema: 契约 Schema。
+
+    Returns:
+        契约对象。
+
+    Raises:
+        ContractError: 顶层不是对象或不符合 Schema。
+    """
+    label = path.name
+    if not isinstance(data, dict):
+        raise ContractError(f"{label}: 顶层必须是对象")
 
     errors = sorted(
         Draft202012Validator(schema).iter_errors(data),
@@ -159,6 +183,42 @@ def load_contract(path: Path, schema: dict[str, Any]) -> ToolContract:
         raise ContractError(detail)
 
     return _build_contract(path, data)
+
+
+def validate_workflow_data(data: Any, label: str) -> dict[str, Any]:
+    """校验一份工作流图的顶层与节点结构。
+
+    Args:
+        data: 已解析的工作流数据。
+        label: 出现在错误里的文件名。
+
+    Returns:
+        同一份工作流数据。
+
+    Raises:
+        ContractError: 顶层不是对象、是画布格式、为空或节点结构不符。
+    """
+    if not isinstance(data, dict):
+        raise ContractError(f"{label}: 工作流顶层必须是 JSON 对象")
+    if "nodes" in data and isinstance(data.get("nodes"), list):
+        raise ContractError(
+            f"{label}: 检测到 ComfyUI 画布格式，"
+            "请在 ComfyUI 中使用 Save (API Format) 导出"
+        )
+    if not data:
+        raise ContractError(f"{label}: 工作流不能为空")
+    for node_id, node in data.items():
+        if (
+            not isinstance(node, dict)
+            or not isinstance(node.get("class_type"), str)
+            or not node["class_type"].strip()
+            or not isinstance(node.get("inputs"), dict)
+        ):
+            raise ContractError(
+                f"{label}: 节点 {node_id} 缺少 class_type 或 inputs，"
+                "请在 ComfyUI 中使用 Save (API Format) 导出"
+            )
+    return data
 
 
 def read_workflow(path: Path) -> dict[str, Any]:
@@ -204,7 +264,26 @@ def validate_contract(contract: ToolContract) -> list[str]:
     except ContractError as exc:
         return errors + [f"{label}: {exc}"]
 
-    errors.extend(input_target_errors(contract, graph, label))
+    errors.extend(graph_target_errors(contract, graph, label))
+    return errors
+
+
+def graph_target_errors(
+    contract: ToolContract,
+    graph: dict[str, Any],
+    label: str,
+) -> list[str]:
+    """检查契约映射在给定工作流图上是否成立，不读工作流文件。
+
+    Args:
+        contract: 工具契约。
+        graph: 工作流图。
+        label: 出现在错误里的文件名。
+
+    Returns:
+        面向管理员的问题描述；为空表示映射成立。
+    """
+    errors = input_target_errors(contract, graph, label)
     errors.extend(_output_target_errors(contract, graph, label))
     errors.extend(_optional_value_errors(contract, graph, label))
     return errors
@@ -368,7 +447,7 @@ def parameter_defaults(
                 f"{label}: 参数 {name} 的目标字段 {parameter.target} 不存在"
             )
         value = inputs[parameter.field]
-        if _is_link(value):
+        if is_link_value(value):
             continue
         defaults[name] = value
     return defaults
@@ -536,7 +615,7 @@ def input_target_errors(
         if parameter.field not in inputs:
             errors.append(f"{label}: 参数 {name} 的目标字段 {parameter.target} 不存在")
             continue
-        if _is_link(inputs[parameter.field]) and parameter.required:
+        if is_link_value(inputs[parameter.field]) and parameter.required:
             errors.append(
                 f"{label}: 参数 {name} 是必填参数，但目标字段 {parameter.target} "
                 "是连线，省略时没有原值可用"
@@ -574,7 +653,7 @@ def _optional_value_errors(
         if parameter.field not in inputs:
             continue
         value = inputs[parameter.field]
-        if _is_link(value):
+        if is_link_value(value):
             continue
         validator = Draft202012Validator(_parameter_schema(parameter))
         for error in validator.iter_errors(value):
@@ -659,7 +738,15 @@ def _scalar_marker(spec: Any) -> str | None:
     return head if isinstance(head, str) and head in DECLARED_MARKERS else None
 
 
-def _is_link(value: Any) -> bool:
+def is_link_value(value: Any) -> bool:
+    """判断一个节点输入值是不是指向其他节点输出的连线。
+
+    Args:
+        value: 工作流节点里的输入值。
+
+    Returns:
+        形如 ``[节点 ID, 输出序号]`` 时返回 True。
+    """
     return (
         isinstance(value, list)
         and len(value) == 2

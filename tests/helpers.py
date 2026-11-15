@@ -4,6 +4,7 @@ import asyncio
 import json
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 
 import aiohttp
 import pytest
@@ -20,12 +21,50 @@ class FakeContext:
     """只实现插件初始化用到的上下文接口。"""
 
     def __init__(self) -> None:
-        """记录被添加的 LLM 工具。"""
+        """记录被添加的 LLM 工具与注册的 Web API。"""
         self.llm_tools: list = []
+        self.web_apis: dict[tuple[str, str], Any] = {}
 
     def add_llm_tools(self, *tools) -> None:
         """记录注册的工具。"""
         self.llm_tools.extend(tools)
+
+    def register_web_api(
+        self,
+        route: str,
+        view_handler: Any,
+        methods: list[str],
+        desc: str,
+    ) -> None:
+        """按路由与方法记录注册的 Web API。"""
+        for method in methods:
+            self.web_apis[(route, method)] = view_handler
+
+    def get_llm_tool_manager(self) -> "FakeToolManager":
+        """返回按名称移除工具的替身。"""
+        return FakeToolManager(self)
+
+
+class FakeToolManager:
+    """只实现按名称移除工具的 LLM 工具管理器替身。"""
+
+    def __init__(self, context: FakeContext) -> None:
+        """记录要操作的工具列表。
+
+        Args:
+            context: 持有工具列表的上下文替身。
+        """
+        self.context = context
+
+    def remove_func(self, name: str) -> None:
+        """移除同名工具。
+
+        Args:
+            name: 工具名。
+        """
+        self.context.llm_tools = [
+            tool for tool in self.context.llm_tools if tool.name != name
+        ]
 
 
 class FakeResult:

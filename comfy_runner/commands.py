@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
@@ -80,6 +80,7 @@ async def help_command(
                 "【管理员指令】",
                 "  /comfy ls            工作流与契约状态",
                 "  /comfy check [remote] 检查工具契约",
+                "  /comfy reload        重新加载工具契约",
                 "  /comfy lock on|off   切换全局锁定",
                 "  /comfy policy        设置群违禁级别",
             ]
@@ -320,6 +321,34 @@ def _hidden_line(report: ContractReport) -> str:
         return ""
     names = sorted(name for name, item in contract.inputs.items() if not item.visible)
     return f"  隐藏参数: {', '.join(names)}" if names else ""
+
+
+async def reload_contracts_command(
+    ctx: CommandContext,
+    reload_fn: Callable[[], tuple[str, ...]],
+    event: AstrMessageEvent,
+) -> AsyncIterator[MessageEventResult]:
+    """重新读取并校验全部工具契约，在内存中刷新运行状态。
+
+    Args:
+        ctx: 命令上下文。
+        reload_fn: 执行热刷新的回调，返回当前启用的工具名。
+        event: 消息事件。
+    """
+    user_id = str(event.get_sender_id())
+    if user_id not in ctx.access.admin_ids:
+        yield event.plain_result("🚫 权限不足，仅管理员可重新加载工具契约")
+        return
+
+    try:
+        names = reload_fn()
+    except ContractError as exc:
+        yield event.plain_result(f"❌ 重新加载失败，保持原运行状态:\n{exc}")
+        return
+
+    yield event.plain_result(
+        f"✅ 已重新加载工具契约，当前启用：{', '.join(names) or '无'}"
+    )
 
 
 async def _apply_remote_check(

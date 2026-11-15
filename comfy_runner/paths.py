@@ -9,6 +9,7 @@ from astrbot.api import logger
 
 from .contract import CONTRACT_SUFFIX
 
+PLUGIN_DIR = Path(__file__).resolve().parents[1]
 LEGACY_SUFFIXES = (".steps.json", ".lora.json")
 
 
