@@ -1,0 +1,14 @@
+{
+  "views": {
+    "workflows": {
+      "title": "Workflows and Mappings",
+      "description": "Manage ComfyUI workflows and tool contracts"
+    }
+  },
+  "pages": {
+    "workflows": {
+      "title": "Workflows and Mappings",
+      "description": "Manage ComfyUI workflows and tool contracts"
+    }
+  }
+}

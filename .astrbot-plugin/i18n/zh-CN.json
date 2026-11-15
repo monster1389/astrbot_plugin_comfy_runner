@@ -1,0 +1,14 @@
+{
+  "views": {
+    "workflows": {
+      "title": "工作流与映射规则",
+      "description": "管理 ComfyUI 工作流与工具契约"
+    }
+  },
+  "pages": {
+    "workflows": {
+      "title": "工作流与映射规则",
+      "description": "管理 ComfyUI 工作流与工具契约"
+    }
+  }
+}

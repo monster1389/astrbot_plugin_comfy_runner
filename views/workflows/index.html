@@ -1,0 +1,59 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="color-scheme" content="light dark" />
+    <title>工作流与映射规则</title>
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <header class="topbar">
+      <div class="topbar-about">
+        <div class="topbar-title">
+          <h1>工作流与映射规则</h1>
+          <p class="topbar-path">工作流目录：<code id="workflow-dir">读取中</code></p>
+        </div>
+        <div class="topbar-tools">
+          <span class="topbar-label">已启用工具</span>
+          <div id="active-tools" class="chip-row"></div>
+        </div>
+      </div>
+      <div class="topbar-actions">
+        <input id="upload-input" type="file" accept=".json" hidden />
+        <button id="btn-upload" type="button" class="btn btn-primary">
+          上传工作流 .json
+        </button>
+        <button id="btn-check-local" type="button" class="btn">
+          全部本地检查
+        </button>
+        <button id="btn-check-remote" type="button" class="btn">
+          全部远端检查
+        </button>
+      </div>
+    </header>
+
+    <div id="global-banner" class="banner" hidden></div>
+
+    <main class="layout">
+      <aside class="sidebar">
+        <input
+          id="search-input"
+          class="search-input"
+          type="search"
+          placeholder="搜索工作流"
+          autocomplete="off"
+        />
+        <div id="workflow-list" class="workflow-list"></div>
+      </aside>
+
+      <section id="workspace" class="workspace">
+        <div class="empty-state">
+          <p>请从左侧选择一个工作流，或上传新的 ComfyUI API 格式工作流文件</p>
+        </div>
+      </section>
+    </main>
+
+    <script type="module" src="./app.js"></script>
+  </body>
+</html>
