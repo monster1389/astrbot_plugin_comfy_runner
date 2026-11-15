@@ -80,12 +80,20 @@
             "string",
             "integer",
             "number",
-            "boolean"
+            "boolean",
+            "image",
+            "video",
+            "audio",
+            "file"
           ]
         },
         "description": {
           "type": "string",
           "minLength": 1
+        },
+        "visible": {
+          "type": "boolean",
+          "default": true
         },
         "required": {
           "type": "boolean",
@@ -195,6 +203,32 @@
             "properties": {
               "type": {
                 "const": "boolean"
+              }
+            },
+            "required": [
+              "type"
+            ]
+          },
+          "then": {
+            "properties": {
+              "enum": false,
+              "minLength": false,
+              "maxLength": false,
+              "minimum": false,
+              "maximum": false
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "type": {
+                "enum": [
+                  "image",
+                  "video",
+                  "audio",
+                  "file"
+                ]
               }
             },
             "required": [

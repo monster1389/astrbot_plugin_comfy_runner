@@ -18,9 +18,20 @@ JSON_TYPES = {
     "integer": "integer",
     "number": "number",
     "boolean": "boolean",
+    "image": "string",
+    "video": "string",
+    "audio": "string",
+    "file": "string",
 }
 TEXT_OUTPUT_TYPE = "text"
 FILE_OUTPUT_TYPES = frozenset({"image", "video", "audio", "file"})
+REFERENCE_HINT = (
+    "取值可以是 attachment 或 attachment:N"
+    "（该类型第 N 个附件，本条消息的排在引用消息前面），"
+    "也可以是本地绝对路径、file:// URI 或 http(s) 链接"
+)
+NUMERIC_MARKERS = frozenset({"INT", "FLOAT", "BOOLEAN"})
+DECLARED_MARKERS = NUMERIC_MARKERS | {"STRING", "COMBO"}
 
 
 class ContractError(ValueError):
@@ -29,12 +40,13 @@ class ContractError(ValueError):
 
 @dataclass(frozen=True, slots=True)
 class ParameterMapping:
-    """一个公开参数到工作流节点输入字段的映射。"""
+    """一个参数（可见或隐藏）到工作流节点输入字段的映射。"""
 
     name: str
     type: str
     description: str
     required: bool
+    visible: bool
     node: str
     field: str
     enum: tuple[Any, ...] = ()
@@ -47,6 +59,11 @@ class ParameterMapping:
     def target(self) -> str:
         """参数映射目标的显示写法。"""
         return f"{self.node}.{self.field}"
+
+    @property
+    def is_reference(self) -> bool:
+        """是否是需要上传附件的文件类参数。"""
+        return self.type in FILE_OUTPUT_TYPES
 
 
 @dataclass(frozen=True, slots=True)
@@ -180,6 +197,7 @@ def validate_contract(contract: ToolContract) -> list[str]:
     """
     label = contract.path.name
     errors = _limit_errors(contract, label)
+    errors.extend(_visibility_errors(contract, label))
 
     try:
         graph = read_workflow(contract.workflow_path)
@@ -226,6 +244,13 @@ def remote_target_errors(
                 f"{label}: 参数 {parameter.name} 的字段 {parameter.target} "
                 f"不在节点类型 {class_type} 的输入中"
             )
+            continue
+        marker = _scalar_marker(_field_spec(definition, parameter.field))
+        if parameter.is_reference and marker in NUMERIC_MARKERS:
+            errors.append(
+                f"{label}: 参数 {parameter.name} 是文件类参数，"
+                f"但目标字段 {parameter.target} 的值类型是 {marker}"
+            )
 
     for output in contract.outputs.values():
         class_type, definition, problem = _remote_definition(
@@ -252,16 +277,19 @@ def build_parameter_schema(
 
     Args:
         contract: 工具契约。
-        defaults: 可选参数名到工作流原值的映射；只对这里的参数写 ``default``。
+        defaults: 参数名到工作流原值的映射；只对这里的参数写 ``default``。
 
     Returns:
-        根对象为 ``type: object`` 且带 ``additionalProperties: false`` 的 Schema。
+        根对象为 ``type: object`` 且带 ``additionalProperties: false`` 的 Schema；
+        只含模型可见的参数。
     """
     shown = defaults or {}
     properties: dict[str, Any] = {}
     required: list[str] = []
     for name in sorted(contract.inputs):
         parameter = contract.inputs[name]
+        if not parameter.visible:
+            continue
         schema = _parameter_schema(parameter)
         if name in shown:
             schema["default"] = shown[name]
@@ -308,23 +336,26 @@ def parameter_defaults(
     contract: ToolContract,
     graph: dict[str, Any],
 ) -> dict[str, Any]:
-    """取出可选参数在工作流里的原值。
+    """取出可省略参数在工作流里的原值。
+
+    必填参数不会被省略，文件类参数的原理值是 ComfyUI input 目录里的文件名，
+    两者都不展示；目标是连线的字段没有值可展示。
 
     Args:
         contract: 工具契约。
         graph: 配对的工作流图。
 
     Returns:
-        可选参数名到工作流原值的映射；必填参数不在其中。
+        可省略且能展示原值的参数名到工作流原值的映射。
 
     Raises:
-        ContractError: 可选参数的目标节点或字段在本次读取的工作流里不存在。
+        ContractError: 参数的目标节点或字段在本次读取的工作流里不存在。
     """
     label = contract.path.name
     defaults: dict[str, Any] = {}
     for name in sorted(contract.inputs):
         parameter = contract.inputs[name]
-        if parameter.required:
+        if parameter.required or not parameter.visible or parameter.is_reference:
             continue
         node = graph.get(parameter.node)
         if not isinstance(node, dict) or not isinstance(node.get("inputs"), dict):
@@ -338,9 +369,7 @@ def parameter_defaults(
             )
         value = inputs[parameter.field]
         if _is_link(value):
-            raise ContractError(
-                f"{label}: 参数 {name} 的目标字段 {parameter.target} 是连线，不能映射"
-            )
+            continue
         defaults[name] = value
     return defaults
 
@@ -356,7 +385,9 @@ def validate_arguments(contract: ToolContract, arguments: dict[str, Any]) -> Non
         ContractError: 缺少必填参数、出现未声明参数或取值不合法。
     """
     validator = Draft202012Validator(build_parameter_schema(contract))
-    problems = [_argument_error(error) for error in validator.iter_errors(arguments)]
+    problems = [
+        _argument_error(error, contract) for error in validator.iter_errors(arguments)
+    ]
     if problems:
         raise ContractError("\n".join(problems))
 
@@ -368,6 +399,7 @@ def _build_contract(path: Path, data: dict[str, Any]) -> ToolContract:
             type=spec["type"],
             description=spec["description"],
             required=bool(spec.get("required", False)),
+            visible=bool(spec.get("visible", True)),
             node=str(spec["target"]["node"]),
             field=str(spec["target"]["field"]),
             enum=tuple(spec.get("enum", ())),
@@ -405,10 +437,14 @@ def _schema_error_location(error: ValidationError) -> str:
     return location[2:] if location.startswith("$.") else location
 
 
-def _argument_error(error: ValidationError) -> str:
+def _argument_error(error: ValidationError, contract: ToolContract) -> str:
     if error.validator == "required":
         missing = [name for name in error.validator_value if name not in error.instance]
-        return f"缺少必填参数: {', '.join(missing)}"
+        detail = f"缺少必填参数: {', '.join(missing)}"
+        hints = [name for name in missing if contract.inputs[name].is_reference]
+        if hints:
+            detail = f"{detail}（{', '.join(hints)} 的 {REFERENCE_HINT}）"
+        return detail
     if error.validator == "additionalProperties":
         allowed = set(error.schema.get("properties", {}))
         extra = [name for name in error.instance if name not in allowed]
@@ -468,6 +504,9 @@ def input_target_errors(
 ) -> list[str]:
     """检查参数映射在当前工作流里是否成立。
 
+    目标字段可以是连线：提供值就替成常量，省略就保持连线；但必填参数不能
+    落在连线上，因为没有原值可回退。
+
     Args:
         contract: 工具契约。
         graph: 工作流图。
@@ -497,9 +536,10 @@ def input_target_errors(
         if parameter.field not in inputs:
             errors.append(f"{label}: 参数 {name} 的目标字段 {parameter.target} 不存在")
             continue
-        if _is_link(inputs[parameter.field]):
+        if _is_link(inputs[parameter.field]) and parameter.required:
             errors.append(
-                f"{label}: 参数 {name} 的目标字段 {parameter.target} 是连线，不能映射"
+                f"{label}: 参数 {name} 是必填参数，但目标字段 {parameter.target} "
+                "是连线，省略时没有原值可用"
             )
     return errors
 
@@ -544,10 +584,24 @@ def _optional_value_errors(
     return errors
 
 
+def _visibility_errors(contract: ToolContract, label: str) -> list[str]:
+    errors: list[str] = []
+    for name in sorted(contract.inputs):
+        parameter = contract.inputs[name]
+        if not parameter.visible and parameter.required:
+            errors.append(
+                f"{label}: 参数 {name} 对模型不可见，不能声明为必填"
+            )
+    return errors
+
+
 def _parameter_schema(parameter: ParameterMapping) -> dict[str, Any]:
+    description = parameter.description
+    if parameter.is_reference:
+        description = f"{description}。{REFERENCE_HINT}"
     schema: dict[str, Any] = {
         "type": JSON_TYPES[parameter.type],
-        "description": parameter.description,
+        "description": description,
     }
     if parameter.enum:
         schema["enum"] = list(parameter.enum)
@@ -588,6 +642,21 @@ def _declared_fields(definition: dict[str, Any]) -> set[str]:
         if isinstance(fields, dict):
             declared.update(str(name) for name in fields)
     return declared
+
+
+def _field_spec(definition: dict[str, Any], field: str) -> Any:
+    for section in ("required", "optional"):
+        fields = definition.get("input", {}).get(section, {})
+        if isinstance(fields, dict) and field in fields:
+            return fields[field]
+    return None
+
+
+def _scalar_marker(spec: Any) -> str | None:
+    if not isinstance(spec, list) or not spec:
+        return None
+    head = spec[0]
+    return head if isinstance(head, str) and head in DECLARED_MARKERS else None
 
 
 def _is_link(value: Any) -> bool:

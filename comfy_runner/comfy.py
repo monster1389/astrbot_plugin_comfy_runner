@@ -45,6 +45,10 @@ class DownloadError(ComfyError):
     """下载正式产物失败。"""
 
 
+class UploadError(ComfyError):
+    """上传附件失败。"""
+
+
 @dataclass(frozen=True, slots=True)
 class ArtifactRef:
     """一个待下载的产物位置。"""
@@ -308,6 +312,56 @@ class ComfyClient:
                     return await resp.read()
         except (aiohttp.ClientError, TimeoutError) as exc:
             raise DownloadError(f"下载 {ref.filename} 失败: {exc}") from exc
+
+    async def upload(self, filename: str, content: bytes) -> str:
+        """把一份文件传到 ComfyUI 的 input 目录。
+
+        Args:
+            filename: 上传后的文件名。
+            content: 文件内容。
+
+        Returns:
+            ComfyUI 侧的文件引用，可直接写进读取文件的节点字段。
+
+        Raises:
+            UploadError: 请求失败或返回结构与预期不符。
+        """
+        form = aiohttp.FormData()
+        form.add_field(
+            "image",
+            content,
+            filename=filename,
+            content_type="application/octet-stream",
+        )
+        form.add_field("overwrite", "true")
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    f"{self.base_url}/upload/image",
+                    data=form,
+                    timeout=self._request_timeout(),
+                ) as resp:
+                    status = resp.status
+                    body = await resp.text()
+        except (aiohttp.ClientError, TimeoutError) as exc:
+            raise UploadError(f"上传 {filename} 失败: {exc}") from exc
+
+        if status != 200:
+            raise UploadError(f"上传 {filename} 失败: HTTP {status}")
+        try:
+            data = json.loads(body)
+        except json.JSONDecodeError as exc:
+            raise UploadError(f"上传 {filename} 返回不是 JSON: {exc}") from exc
+        if not isinstance(data, dict):
+            raise UploadError(f"上传 {filename} 返回不是对象")
+
+        name = data.get("name")
+        subfolder = data.get("subfolder")
+        if not isinstance(name, str) or not name:
+            raise UploadError(f"上传 {filename} 未返回文件名")
+        if not isinstance(subfolder, str):
+            raise UploadError(f"上传 {filename} 返回的 subfolder 不是字符串")
+        return f"{subfolder}/{name}" if subfolder else name
 
     def _request_timeout(self) -> aiohttp.ClientTimeout:
         return aiohttp.ClientTimeout(total=self.timeout)

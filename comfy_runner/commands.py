@@ -292,6 +292,9 @@ async def check_contracts(
     for report in reports:
         lines.append(_report_header(report))
         lines.extend(f"  {error}" for error in report.errors)
+        hidden = _hidden_line(report)
+        if hidden:
+            lines.append(hidden)
 
     yield event.plain_result("\n".join(lines))
 
@@ -302,10 +305,21 @@ def _report_header(report: ContractReport) -> str:
         return f"❌ {report.path.name} 无法读取"
     state = "启用" if contract.enabled else "禁用"
     mark = "✅" if report.ok else "❌"
+    total = len(contract.inputs)
+    visible = sum(1 for item in contract.inputs.values() if item.visible)
     return (
         f"{mark} {report.path.name} -> {contract.name} [{state}] "
-        f"工作流 {contract.workflow_path.name}"
+        f"工作流 {contract.workflow_path.name} | "
+        f"参数 {total}（对外 {visible}，隐藏 {total - visible}）"
     )
+
+
+def _hidden_line(report: ContractReport) -> str:
+    contract = report.contract
+    if contract is None:
+        return ""
+    names = sorted(name for name, item in contract.inputs.items() if not item.visible)
+    return f"  隐藏参数: {', '.join(names)}" if names else ""
 
 
 async def _apply_remote_check(

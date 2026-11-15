@@ -1,0 +1,45 @@
+{
+  "version": 1,
+  "name": "comfy_flux2_i2i",
+  "description": "使用 Flux2 Klein 工作流按参考图重绘或改图",
+  "enabled": true,
+  "inputs": {
+    "prompt": {
+      "type": "string",
+      "description": "描述期望画面的完整提示词",
+      "required": true,
+      "minLength": 1,
+      "target": {
+        "node": "214:6",
+        "field": "text"
+      }
+    },
+    "reference_image": {
+      "type": "image",
+      "description": "参考图：按它重绘或改图",
+      "required": true,
+      "target": {
+        "node": "219",
+        "field": "image"
+      }
+    },
+    "seed": {
+      "type": "integer",
+      "description": "随机种子；不提供时使用工作流原值",
+      "minimum": 0,
+      "target": {
+        "node": "218",
+        "field": "seed"
+      }
+    }
+  },
+  "outputs": {
+    "image": {
+      "type": "image",
+      "target": {
+        "node": "203",
+        "field": "images"
+      }
+    }
+  }
+}

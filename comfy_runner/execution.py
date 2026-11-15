@@ -23,6 +23,7 @@ from .contract import (
     input_target_errors,
     read_workflow,
 )
+from .media import Attachments, resolve_reference
 
 
 @dataclass(frozen=True, slots=True)
@@ -128,26 +129,47 @@ class WorkflowExecutor:
         self,
         contract: ToolContract,
         arguments: dict[str, Any],
+        attachments: Attachments,
     ) -> str:
-        """校验映射并提交一次执行。
+        """校验映射、上传附件并提交一次执行。
 
         Args:
             contract: 工具契约。
             arguments: 本次调用显式提供的参数。
+            attachments: 本次消息里的附件，供文件类参数引用。
 
         Returns:
             ComfyUI 分配的任务 ID。
 
         Raises:
             ContractError: 工作流文件里契约声明的映射已不成立。
-            ComfyError: 提交失败或提交结果未知。
+            MediaError: 文件类参数的引用无法解析。
+            ComfyError: 附件上传失败、提交失败或提交结果未知。
         """
         graph = read_workflow(contract.workflow_path)
         problems = input_target_errors(contract, graph, contract.path.name)
         if problems:
             raise ContractError("\n".join(problems))
 
-        apply_arguments(contract, graph, arguments)
+        values = dict(arguments)
+        for name, parameter in contract.inputs.items():
+            if not parameter.is_reference or name not in arguments:
+                continue
+            payload = await resolve_reference(
+                arguments[name],
+                parameter.type,
+                attachments,
+            )
+            values[name] = await self.client.upload(
+                payload.filename,
+                payload.content,
+            )
+            logger.info(
+                f"[ComfyUI] 已上传附件 {payload.filename} "
+                f"到参数 {name} ({parameter.type})"
+            )
+
+        apply_arguments(contract, graph, values)
         logger.info(f"[ComfyUI] 提交工作流 {contract.name}")
 
         prompt_id = await self.client.submit(graph)

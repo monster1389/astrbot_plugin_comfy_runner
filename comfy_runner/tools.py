@@ -31,6 +31,7 @@ from .execution import (
     TextArtifact,
     WorkflowExecutor,
 )
+from .media import Attachments, MediaError
 
 ToolHandler = Callable[..., Awaitable[str]]
 
@@ -38,13 +39,14 @@ LIST_NAME = "comfy_list"
 INSPECT_NAME = "comfy_inspect"
 EXECUTE_NAME = "comfy_execute"
 
-LIST_DESCRIPTION = "列出当前可用的 ComfyUI 工作流及其用途"
-INSPECT_DESCRIPTION = (
-    "查看一个 ComfyUI 工作流的公开参数与产物说明；已掌握参数时可以直接调用 "
-    "comfy_execute"
+LIST_DESCRIPTION = (
+    "列出可用的 ComfyUI 工作流。用户要生成图片、改图或生成视频，或提到 ComfyUI 时，"
+    "先调用本工具。不要用 shell、python、curl 直接请求 ComfyUI 的 HTTP 接口。"
 )
+INSPECT_DESCRIPTION = "查看一个 ComfyUI 工作流的参数名、类型、约束与产物类型"
 EXECUTE_DESCRIPTION = (
-    "提交一次 ComfyUI 工作流执行；提交成功后立即返回，产物完成后自动发送到当前会话"
+    "提交一次 ComfyUI 工作流执行，是调用 ComfyUI 的唯一入口；提交成功后立即返回，"
+    "产物完成后自动发送到当前会话"
 )
 
 WORKFLOW_PROPERTY = {
@@ -199,7 +201,11 @@ class WorkflowToolAdapter:
             if not passed:
                 logger.info(f"[ComfyUI] 用户 {event.get_sender_id()} 冷却中")
                 raise WorkflowRejected(f"⚠️ 冷却中，请在 {remain} 秒后重试")
-            prompt_id = await self.executor.submit(contract, values)
+            prompt_id = await self.executor.submit(
+                contract,
+                values,
+                Attachments.from_event(event),
+            )
         except BaseException:
             self.gate.release()
             raise
@@ -417,6 +423,9 @@ def _guard(name: str, handler: ToolHandler) -> ToolHandler:
         except WorkflowRejected as exc:
             logger.info(f"[ComfyUI] {name} 拒绝本次调用: {exc}")
             return str(exc)
+        except MediaError as exc:
+            logger.warning(f"[ComfyUI] {name} 附件引用无法解析: {exc}")
+            return f"⚠️ {exc}"
         except (ContractError, ComfyError) as exc:
             logger.warning(f"[ComfyUI] {name} 失败: {exc}")
             return f"❌ {exc}"

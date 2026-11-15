@@ -3,6 +3,7 @@
 import asyncio
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 import aiohttp
 import pytest
@@ -12,6 +13,7 @@ from astrbot.core.config.astrbot_config import AstrBotConfig
 from astrbot_plugin_comfy_runner.main import ComfyUIPlugin
 
 PLUGIN_ROOT = Path(__file__).resolve().parents[1]
+EXTERNAL_URL_PREFIX = "http://example.com/"
 
 
 class FakeContext:
@@ -41,21 +43,33 @@ class FakeResult:
 class FakeEvent:
     """只实现命令与钩子用到的那部分事件接口。"""
 
-    def __init__(self, text: str = "", sender: str = "9", group: str = "2") -> None:
-        """设置消息文本、发送者与群号。
+    def __init__(
+        self,
+        text: str = "",
+        sender: str = "9",
+        group: str = "2",
+        components: list | None = None,
+    ) -> None:
+        """设置消息文本、发送者、群号与消息链。
 
         Args:
             text: 消息原文。
             sender: 发送者 ID。
             group: 群号，空串表示私聊。
+            components: 消息链组件。
         """
         self.message_str = text
         self.extra: dict = {}
         self.sent: list = []
+        self.message_obj = SimpleNamespace(message=list(components or []))
         self._sender = sender
         self._group = group
         self._result = FakeResult()
         self.unified_msg_origin = "origin"
+
+    def get_messages(self) -> list:
+        """返回消息链。"""
+        return self.message_obj.message
 
     def plain_result(self, text: str):
         """构造纯文本结果的替身。"""
@@ -235,20 +249,26 @@ class FakeComfyServer:
         self.view_response = (200, b"png-bytes")
         self.object_info: dict[str, dict] = {}
         self.object_info_status = 200
+        self.uploads: list[tuple[str, bytes]] = []
+        self.upload_response: tuple[int, object] | None = None
+        self.external_response = (200, b"external-bytes")
 
     def install(self, monkeypatch: pytest.MonkeyPatch) -> "FakeComfyServer":
         """把 aiohttp 会话替换成这个假服务。"""
         server = self
 
         class FakeSession:
+            def __init__(self, *args, **kwargs):
+                pass
+
             async def __aenter__(self):
                 return self
 
             async def __aexit__(self, *exc_info):
                 return False
 
-            def post(self, url, json=None, timeout=None):
-                return server._post(str(url), json or {})
+            def post(self, url, json=None, data=None, timeout=None):
+                return server._post(str(url), json or {}, data)
 
             def get(self, url, timeout=None):
                 return server._get(str(url))
@@ -256,10 +276,16 @@ class FakeComfyServer:
         monkeypatch.setattr(aiohttp, "ClientSession", FakeSession)
         return self
 
-    def _post(self, url: str, payload: dict) -> FakeResponse:
+    def _post(self, url: str, payload: dict, data=None) -> FakeResponse:
         if url.endswith("/prompt"):
             self.submissions.append(payload["prompt"])
             return _response(*self.prompt_response)
+        if url.endswith("/upload/image"):
+            filename = _form_filename(data)
+            self.uploads.append((filename, _form_content(data)))
+            if self.upload_response is not None:
+                return _response(*self.upload_response)
+            return _response(200, {"name": filename, "subfolder": "", "type": "input"})
         raise AssertionError(f"未预期的 POST: {url}")
 
     def _get(self, url: str) -> FakeResponse:
@@ -274,6 +300,8 @@ class FakeComfyServer:
             return _response(*self.view_response)
         if "/object_info/" in url:
             return _response(self.object_info_status, self.object_info)
+        if url.startswith(EXTERNAL_URL_PREFIX):
+            return _response(*self.external_response)
         raise AssertionError(f"未预期的 GET: {url}")
 
 
@@ -283,3 +311,34 @@ def _response(status: int, body: object) -> FakeResponse:
     if isinstance(body, str):
         return FakeResponse(status, body.encode("utf-8"))
     return FakeResponse(status, json.dumps(body).encode("utf-8"))
+
+
+def _form_fields(form) -> list[tuple[dict, bytes]]:
+    """取出 multipart 表单里的（头信息, 内容），不依赖 aiohttp 版本。"""
+    fields = getattr(form, "_fields", None)
+    if not isinstance(fields, list):
+        raise AssertionError(f"无法识别表单结构: {type(form)}")
+    parsed = []
+    for entry in fields:
+        if not isinstance(entry, tuple) or len(entry) != 3:
+            raise AssertionError(f"无法识别表单字段: {entry!r}")
+        headers, _content_type, payload = entry
+        parsed.append((dict(headers), payload))
+    return parsed
+
+
+def _form_filename(form) -> str:
+    """取出 multipart 表单里的文件名。"""
+    for headers, _ in _form_fields(form):
+        filename = headers.get("filename")
+        if filename:
+            return filename
+    raise AssertionError("上传请求里没有文件名")
+
+
+def _form_content(form) -> bytes:
+    """取出 multipart 表单里的文件内容。"""
+    for _headers, payload in _form_fields(form):
+        if isinstance(payload, bytes | bytearray | memoryview):
+            return bytes(payload)
+    raise AssertionError("上传请求里没有内容")

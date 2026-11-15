@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 from astrbot_plugin_comfy_runner.comfy_runner.contract import ContractError
-from helpers import FakeComfyServer, FakeEvent, collect, make_plugin
+from helpers import FakeComfyServer, FakeEvent, collect, make_plugin, run_tool
 
 WORKFLOW = {
     "1": {"class_type": "CLIPTextEncode", "inputs": {"text": ""}},
@@ -128,10 +128,11 @@ def test_no_contract_loads_without_tools(tmp_path, monkeypatch):
                 style={
                     "type": "string",
                     "description": "风格",
+                    "required": True,
                     "target": {"node": "3", "field": "positive"},
                 }
             ),
-            id="linked-target",
+            id="required-on-link",
         ),
         pytest.param(
             lambda c: c["outputs"]["image"].update(type="mesh"),
@@ -170,6 +171,107 @@ def test_optional_parameter_value_violating_contract_prevents_load(
         make_plugin(tmp_path, monkeypatch, control=admin_overrides())
 
     assert "参数 seed 的工作流原值不满足契约" in str(error.value)
+
+
+def test_optional_parameter_on_link_keeps_the_link(tmp_path, monkeypatch):
+    """可选参数可以映射到连线：省略时连线保持原样，执行照常。"""
+    contract = json.loads(json.dumps(CONTRACT))
+    contract["inputs"]["style"] = {
+        "type": "string",
+        "description": "风格后缀",
+        "target": {"node": "3", "field": "positive"},
+    }
+    write_contract(tmp_path, contract=contract)
+    plugin, _ = make_plugin(tmp_path, monkeypatch, control=admin_overrides())
+    server = FakeComfyServer().install(monkeypatch)
+    server.history_reply = {
+        "p1": {
+            "status": {"status_str": "success", "completed": True},
+            "outputs": {
+                "4": {
+                    "images": [
+                        {"filename": "a.png", "subfolder": "", "type": "output"}
+                    ]
+                }
+            },
+        }
+    }
+
+    summary = run_tool(
+        plugin,
+        "comfy_execute",
+        FakeEvent(sender="9", group="2"),
+        workflow="comfy_moss_t2i",
+        arguments={"prompt": "一只猫"},
+    )
+
+    assert summary.startswith("已提交")
+    assert server.submissions[0]["3"]["inputs"]["positive"] == ["1", 0]
+
+
+def test_required_parameter_on_link_prevents_load(tmp_path, monkeypatch):
+    """必填参数落在连线上时插件拒绝加载：没有原值可回退。"""
+    contract = json.loads(json.dumps(CONTRACT))
+    contract["inputs"]["style"] = {
+        "type": "string",
+        "description": "风格后缀",
+        "required": True,
+        "target": {"node": "3", "field": "positive"},
+    }
+    write_contract(tmp_path, contract=contract)
+
+    with pytest.raises(ContractError) as error:
+        make_plugin(tmp_path, monkeypatch, control=admin_overrides())
+
+    assert "是必填参数，但目标字段 3.positive 是连线" in str(error.value)
+
+
+def test_hidden_parameter_is_not_exposed_to_the_model(tmp_path, monkeypatch):
+    """visible: false 的参数不出现在查看结果里，也传不进来。"""
+    contract = json.loads(json.dumps(CONTRACT))
+    contract["inputs"]["seed"]["visible"] = False
+    write_contract(tmp_path, contract=contract)
+    plugin, _ = make_plugin(tmp_path, monkeypatch, control=admin_overrides())
+    event = FakeEvent(sender="9", group="2")
+
+    view = json.loads(
+        run_tool(plugin, "comfy_inspect", event, workflow="comfy_moss_t2i")
+    )
+    rejected = run_tool(
+        plugin,
+        "comfy_execute",
+        event,
+        workflow="comfy_moss_t2i",
+        arguments={"prompt": "一只猫", "seed": 7},
+    )
+
+    assert "seed" not in view["parameters"]["properties"]
+    assert "出现未声明参数: seed" in rejected
+
+
+def test_hidden_parameter_cannot_be_required(tmp_path, monkeypatch):
+    """模型看不见的参数不能声明为必填。"""
+    contract = json.loads(json.dumps(CONTRACT))
+    contract["inputs"]["seed"].update(visible=False, required=True)
+    write_contract(tmp_path, contract=contract)
+
+    with pytest.raises(ContractError) as error:
+        make_plugin(tmp_path, monkeypatch, control=admin_overrides())
+
+    assert "对模型不可见，不能声明为必填" in str(error.value)
+
+
+def test_check_command_reports_parameter_visibility(tmp_path, monkeypatch):
+    """检查命令报出对外与隐藏的参数数量，并点名隐藏参数。"""
+    contract = json.loads(json.dumps(CONTRACT))
+    contract["inputs"]["seed"]["visible"] = False
+    write_contract(tmp_path, contract=contract)
+    plugin, _ = make_plugin(tmp_path, monkeypatch, control=admin_overrides())
+
+    results = collect(plugin.cmd_comfy_check(FakeEvent("/comfy check", sender="9")))
+
+    assert "参数 2（对外 1，隐藏 1）" in results[0][1]
+    assert "隐藏参数: seed" in results[0][1]
 
 
 def test_duplicate_tool_names_prevent_load(tmp_path, monkeypatch):
@@ -283,6 +385,59 @@ def test_check_command_remote_rejects_non_output_node(tmp_path, monkeypatch):
     )
 
     assert "产物 image 的节点类型 SaveImage 不是输出节点" in results[0][1]
+
+
+def test_check_command_remote_rejects_reference_on_scalar_field(tmp_path, monkeypatch):
+    """文件类参数映射到数值字段时远端核对直接报错。"""
+    contract = json.loads(json.dumps(CONTRACT))
+    contract["inputs"]["image"] = {
+        "type": "image",
+        "description": "参考图",
+        "required": True,
+        "target": {"node": "3", "field": "seed"},
+    }
+    write_contract(tmp_path, contract=contract)
+    plugin, _ = make_plugin(tmp_path, monkeypatch, control=admin_overrides())
+    server = FakeComfyServer().install(monkeypatch)
+    server.object_info = {
+        "CLIPTextEncode": {"input": {"required": {"text": ["STRING", {}]}}},
+        "KSampler": {"input": {"required": {"seed": ["INT", {}]}}},
+        "SaveImage": {"output_node": True},
+    }
+
+    results = collect(
+        plugin.cmd_comfy_check(FakeEvent("/comfy check remote", sender="9"))
+    )
+
+    assert "参数 image 是文件类参数，但目标字段 3.seed 的值类型是 INT" in results[0][1]
+
+
+def test_check_command_remote_accepts_reference_on_file_field(tmp_path, monkeypatch):
+    """文件类参数映射到文件选择字段时通过。"""
+    workflow = json.loads(json.dumps(WORKFLOW))
+    workflow["5"] = {"class_type": "LoadImage", "inputs": {"image": "a.png"}}
+    contract = json.loads(json.dumps(CONTRACT))
+    contract["inputs"]["image"] = {
+        "type": "image",
+        "description": "参考图",
+        "required": True,
+        "target": {"node": "5", "field": "image"},
+    }
+    write_contract(tmp_path, contract=contract, workflow=workflow)
+    plugin, _ = make_plugin(tmp_path, monkeypatch, control=admin_overrides())
+    server = FakeComfyServer().install(monkeypatch)
+    server.object_info = {
+        "CLIPTextEncode": {"input": {"required": {"text": ["STRING", {}]}}},
+        "KSampler": {"input": {"required": {"seed": ["INT", {}]}}},
+        "SaveImage": {"output_node": True},
+        "LoadImage": {"input": {"required": {"image": ["a.png", "b.png"]}}},
+    }
+
+    results = collect(
+        plugin.cmd_comfy_check(FakeEvent("/comfy check remote", sender="9"))
+    )
+
+    assert "文件类参数" not in results[0][1]
 
 
 def test_check_command_remote_reports_unreachable_object_info(tmp_path, monkeypatch):
