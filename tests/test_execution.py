@@ -75,7 +75,7 @@ def setup(
         monkeypatch,
         execution=execution or {},
         control=control
-        or {"admin_ids": ["9"], "whitelist_group_ids": ["2"], "cooldown_seconds": 0},
+        or {"admin_ids": ["9"], "whitelist_ids": ["2"], "cooldown_seconds": 0},
     )
     server = FakeComfyServer().install(monkeypatch)
     server.history_reply = SUCCESS
@@ -235,7 +235,7 @@ def test_sensitive_prompt_is_rejected(tmp_path, monkeypatch):
         monkeypatch,
         control={
             "admin_ids": ["9"],
-            "whitelist_group_ids": ["2"],
+            "whitelist_ids": ["2"],
             "default_group_policy": "full",
         },
     )

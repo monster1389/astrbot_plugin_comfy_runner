@@ -86,7 +86,7 @@ class ComfyUIPlugin(Star):
         logger.info(
             f"[ComfyUI] 敏感词库: {word_count} 个词条 | "
             f"管理员: {len(self.access.admin_ids)} 个 | "
-            f"白名单群: {len(self.access.whitelist_group_ids)} 个"
+            f"白名单: {len(self.access.whitelist_ids)} 条"
         )
         workflow_names = ", ".join(self.cmd_ctx.workflow_names) or "无"
         logger.info(f"[ComfyUI] 启用的工作流: {workflow_names}")

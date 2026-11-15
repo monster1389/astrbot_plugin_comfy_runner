@@ -37,12 +37,12 @@
         "default": 35
       },
       "admin_ids": {
-        "description": "管理员 QQ 号（列表）",
+        "description": "管理员 ID（列表，支持 平台:ID 或纯 ID）",
         "type": "list",
         "default": []
       },
-      "whitelist_group_ids": {
-        "description": "允许使用的群（白名单）",
+      "whitelist_ids": {
+        "description": "白名单（群与私聊共用，支持 [平台:]group|user:ID 或 [平台:]ID）",
         "type": "list",
         "default": []
       },
@@ -71,7 +71,7 @@
         "type": "object",
         "items": {
           "whitelist": {
-            "description": "管理员无视群聊白名单",
+            "description": "管理员无视白名单限制",
             "type": "bool",
             "default": true
           },

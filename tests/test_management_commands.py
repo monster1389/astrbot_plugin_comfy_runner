@@ -32,7 +32,7 @@ CONTRACT = {
 
 def admin_overrides() -> dict:
     """管理员在群 2 的访问配置。"""
-    return {"admin_ids": ["9"], "whitelist_group_ids": ["2"]}
+    return {"admin_ids": ["9"], "whitelist_ids": ["2"]}
 
 
 def write_workflow_dir(tmp_path: Path) -> Path:
@@ -235,3 +235,116 @@ def test_reload_command_keeps_state_when_contract_broken(tmp_path, monkeypatch):
         "comfy_inspect",
         "comfy_execute",
     ]
+
+
+def test_private_chat_requires_whitelist_and_respects_scope(tmp_path, monkeypatch):
+    """私聊默认受白名单控制，group:ID 不放行同名私聊用户。"""
+    write_workflow_dir(tmp_path)
+    plugin, _ = make_plugin(
+        tmp_path,
+        monkeypatch,
+        control={
+            "admin_ids": ["9"],
+            "whitelist_ids": ["group:100", "telegram:user:200"],
+        },
+    )
+
+    denied = collect(
+        plugin.cmd_comfy_help(
+            FakeEvent("/comfy help", sender="100", group="", platform="aiocqhttp")
+        )
+    )
+    assert "不在白名单中" in denied[0][1]
+    assert "aiocqhttp:100" in denied[0][1]
+
+    allowed = collect(
+        plugin.cmd_comfy_help(
+            FakeEvent("/comfy help", sender="200", group="", platform="telegram")
+        )
+    )
+    assert "当前位置：私聊 telegram:200" in allowed[0][1]
+
+
+def test_platform_scoped_admin_and_cooldown_isolation(tmp_path, monkeypatch):
+    """管理员与冷却均按平台隔离，跨平台同数字 ID 互不影响。"""
+    write_workflow_dir(tmp_path)
+    plugin, _ = make_plugin(
+        tmp_path,
+        monkeypatch,
+        control={
+            "admin_ids": ["telegram:9"],
+            "whitelist_ids": ["2"],
+            "cooldown_seconds": 60,
+        },
+    )
+
+    qq_denied = collect(
+        plugin.cmd_comfy_lock(
+            FakeEvent("/comfy lock on", sender="9", group="2", platform="aiocqhttp")
+        )
+    )
+    assert "权限不足" in qq_denied[0][1]
+
+    tg_ok = collect(
+        plugin.cmd_comfy_lock(
+            FakeEvent("/comfy lock on", sender="9", group="2", platform="telegram")
+        )
+    )
+    assert "已开启全局锁定" in tg_ok[0][1]
+
+    ok_tg, _ = plugin.access.check_cooldown(
+        FakeEvent(sender="10", group="2", platform="telegram")
+    )
+    ok_qq, _ = plugin.access.check_cooldown(
+        FakeEvent(sender="10", group="2", platform="aiocqhttp")
+    )
+    again_tg, _ = plugin.access.check_cooldown(
+        FakeEvent(sender="10", group="2", platform="telegram")
+    )
+    assert ok_tg is True
+    assert ok_qq is True
+    assert again_tg is False
+
+
+def test_telegram_topic_whitelist_and_policy_fallback(tmp_path, monkeypatch):
+    """Telegram 话题群继承整群白名单，/comfy policy 仅作用于当前话题。"""
+    write_workflow_dir(tmp_path)
+    plugin, _ = make_plugin(
+        tmp_path,
+        monkeypatch,
+        control={
+            "admin_ids": ["telegram:9"],
+            "whitelist_ids": ["telegram:group:-1001"],
+            "default_group_policy": "lite",
+        },
+    )
+
+    help_res = collect(
+        plugin.cmd_comfy_help(
+            FakeEvent("/comfy help", sender="7", group="-1001#42", platform="telegram")
+        )
+    )
+    assert "当前位置：群聊 telegram:-1001#42" in help_res[0][1]
+
+    collect(
+        plugin.cmd_set_policy(
+            FakeEvent(
+                "/comfy policy full",
+                sender="9",
+                group="-1001#42",
+                platform="telegram",
+            )
+        )
+    )
+    assert (
+        plugin.access.policy_for(
+            FakeEvent(sender="7", group="-1001#42", platform="telegram")
+        )
+        == "full"
+    )
+    assert (
+        plugin.access.policy_for(
+            FakeEvent(sender="7", group="-1001#99", platform="telegram")
+        )
+        == "lite"
+    )

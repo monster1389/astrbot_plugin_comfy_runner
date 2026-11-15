@@ -61,7 +61,7 @@ def setup(tmp_path: Path, monkeypatch, control: dict | None = None):
         tmp_path,
         monkeypatch,
         control=control
-        or {"admin_ids": ["9"], "whitelist_group_ids": ["2"], "cooldown_seconds": 0},
+        or {"admin_ids": ["9"], "whitelist_ids": ["2"], "cooldown_seconds": 0},
     )
     server = FakeComfyServer().install(monkeypatch)
     server.history_reply = HISTORY
@@ -131,7 +131,7 @@ def test_inspect_shows_optional_default_from_workflow(tmp_path, monkeypatch):
     plugin, _ = make_plugin(
         tmp_path,
         monkeypatch,
-        control={"admin_ids": ["9"], "whitelist_group_ids": ["2"]},
+        control={"admin_ids": ["9"], "whitelist_ids": ["2"]},
     )
     event = FakeEvent(sender="9", group="2")
 
@@ -168,7 +168,7 @@ def test_inspect_reads_default_from_current_workflow(tmp_path, monkeypatch):
     plugin, _ = make_plugin(
         tmp_path,
         monkeypatch,
-        control={"admin_ids": ["9"], "whitelist_group_ids": ["2"]},
+        control={"admin_ids": ["9"], "whitelist_ids": ["2"]},
     )
     event = FakeEvent(sender="9", group="2")
 
@@ -241,7 +241,7 @@ def test_lockdown_rejects_discovery_for_non_admin(tmp_path, monkeypatch):
         monkeypatch,
         control={
             "admin_ids": ["9"],
-            "whitelist_group_ids": ["2"],
+            "whitelist_ids": ["2"],
             "lockdown": True,
         },
     )

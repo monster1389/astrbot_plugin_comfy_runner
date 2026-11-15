@@ -2,6 +2,17 @@
 
 ## 未发布
 
+### 跨平台与访问控制
+
+- `control.whitelist_group_ids` 替换为 `control.whitelist_ids`，同时管控群聊与私聊白名单；
+  条目支持 `[平台:]group|user:ID` 精确写法与 `[平台:]ID` 简写，空列表不再放行普通私聊
+- `control.admin_ids` 与内部冷却、群违禁级别均支持按 `平台名:ID`（如 `telegram:123`、
+  `aiocqhttp:123`）隔离，同时向后兼容纯 `ID` 管理员配置
+- Telegram 话题群（`<chat_id>#<thread_id>`）匹配白名单与群违禁级别时优先命中精确话题，
+  未命中时回退匹配整群 `<chat_id>`；`/comfy help` 与拒绝提示展示带平台前缀的 ID
+- 解析 `image` / `video` / `audio` 附件引用时，支持把扩展名匹配的 `File` 组件
+  （例如 Telegram 以文件发送的未压缩原图）纳入候选
+
 ### 定位
 
 从固定文生图插件改为 ComfyUI 工作流工具适配器：参数与产物由工具契约声明，

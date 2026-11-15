@@ -48,7 +48,7 @@ CONTRACT = {
 
 def admin_overrides() -> dict:
     """管理员在群 2 的访问配置。"""
-    return {"admin_ids": ["9"], "whitelist_group_ids": ["2"]}
+    return {"admin_ids": ["9"], "whitelist_ids": ["2"]}
 
 
 def workflow_dir_of(tmp_path: Path) -> Path:

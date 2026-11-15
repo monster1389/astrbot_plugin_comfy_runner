@@ -27,6 +27,38 @@ KIND_COMPONENTS = {
     "audio": Record,
     "file": File,
 }
+FILE_KIND_EXTENSIONS = {
+    "image": frozenset(
+        {".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp", ".tif", ".tiff"}
+    ),
+    "video": frozenset({".mp4", ".mov", ".avi", ".mkv", ".webm", ".m4v"}),
+    "audio": frozenset(
+        {".mp3", ".wav", ".ogg", ".opus", ".flac", ".m4a", ".aac", ".amr"}
+    ),
+}
+
+
+def _file_extension(component: File) -> str:
+    for candidate in (
+        getattr(component, "name", ""),
+        getattr(component, "url", ""),
+        getattr(component, "file_", ""),
+    ):
+        if not candidate:
+            continue
+        suffix = Path(urlparse(str(candidate)).path).suffix.lower()
+        if suffix:
+            return suffix
+    return ""
+
+
+def _matches_kind(component: Any, kind: str, component_type: type[Any]) -> bool:
+    if isinstance(component, component_type):
+        return True
+    if not isinstance(component, File):
+        return False
+    extensions = FILE_KIND_EXTENSIONS.get(kind)
+    return bool(extensions and _file_extension(component) in extensions)
 ATTACHMENT_PREFIX = "attachment"
 DOWNLOAD_TIMEOUT_SECONDS = 60.0
 
@@ -74,7 +106,7 @@ class Attachments:
                 kind: tuple(
                     component
                     for component in ordered
-                    if isinstance(component, component_type)
+                    if _matches_kind(component, kind, component_type)
                 )
                 for kind, component_type in KIND_COMPONENTS.items()
             }
@@ -183,11 +215,16 @@ def _require_suffix(suffix: str, value: str) -> str:
 
 async def _component_path(component: Any) -> str:
     try:
-        if isinstance(component, File):
-            return await component.get_file()
-        return await component.convert_to_file_path()
+        path = (
+            await component.get_file()
+            if isinstance(component, File)
+            else await component.convert_to_file_path()
+        )
     except (OSError, aiohttp.ClientError) as exc:
         raise MediaError(f"读取消息附件失败: {exc}") from exc
+    if not path:
+        raise MediaError("读取消息附件失败: 未获取到有效文件路径")
+    return path
 
 
 async def _read_bytes(path: Path, value: str) -> bytes:

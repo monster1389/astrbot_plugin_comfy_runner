@@ -88,7 +88,7 @@ class ControlSettings:
 
     cooldown_seconds: int
     admin_ids: frozenset[str]
-    whitelist_group_ids: frozenset[str]
+    whitelist_ids: frozenset[str]
     default_group_policy: str
     default_private_policy: str
     lockdown: bool
@@ -165,7 +165,7 @@ class Config:
             control=ControlSettings(
                 cooldown_seconds=_integer(control, "cooldown_seconds"),
                 admin_ids=_id_set(control, "admin_ids"),
-                whitelist_group_ids=_id_set(control, "whitelist_group_ids"),
+                whitelist_ids=_id_set(control, "whitelist_ids"),
                 default_group_policy=_policy(control, "default_group_policy"),
                 default_private_policy=_policy(control, "default_private_policy"),
                 lockdown=_boolean(control, "lockdown"),

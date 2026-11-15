@@ -10,7 +10,7 @@ from typing import Any
 from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent, MessageEventResult
 
-from .access import AccessController, group_id, is_group_message
+from .access import AccessController, group_id, is_group_message, scoped_id
 from .comfy import ComfyClient, ComfyError
 from .config import POLICIES, Config
 from .contract import (
@@ -62,7 +62,7 @@ async def help_command(
     gid = group_id(event)
     policy = ctx.access.policy_for(event)
     user_id = str(event.get_sender_id())
-    is_admin = user_id in ctx.access.admin_ids
+    is_admin = ctx.access.is_admin(event)
 
     tips = [
         "ComfyUI 工作流工具",
@@ -88,7 +88,12 @@ async def help_command(
 
     tips.append("")
     tips.append(f"已启用工作流：{', '.join(ctx.workflow_names) or '无'}")
-    tips.append(f"当前位置：{'群聊 ' + gid if gid else '私聊'}")
+    location = (
+        f"群聊 {scoped_id(event, gid)}"
+        if gid
+        else f"私聊 {scoped_id(event, user_id)}"
+    )
+    tips.append(f"当前位置：{location}")
     tips.append(f"违禁级别：{policy}")
     tips.append(f"冷却时间：{ctx.cfg.control.cooldown_seconds} 秒")
     tips.append(f"并发上限：{ctx.cfg.execution.max_concurrency}")
@@ -114,8 +119,7 @@ async def set_policy(
         yield event.plain_result("⚠️ 该指令仅支持在群聊中使用")
         return
 
-    user_id = str(event.get_sender_id())
-    if user_id not in ctx.access.admin_ids:
+    if not ctx.access.is_admin(event):
         yield event.plain_result("🚫 权限不足，仅管理员可修改违禁级别")
         return
 
@@ -141,8 +145,10 @@ async def set_policy(
         yield event.plain_result("❌ 无效级别，可选：none / lite / full")
         return
 
-    ctx.access.set_policy(gid, level)
-    logger.info(f"[ComfyUI] 群 {gid} 违禁级别已设为 {level}（操作者：{user_id}）")
+    policy_key = scoped_id(event, gid)
+    actor = scoped_id(event, str(event.get_sender_id()))
+    ctx.access.set_policy(policy_key, level)
+    logger.info(f"[ComfyUI] 群 {policy_key} 违禁级别已设为 {level}（操作者：{actor}）")
     yield event.plain_result(f"✅ 已将本群违禁级别设置为：{level}")
 
 
@@ -151,8 +157,7 @@ async def toggle_lockdown(
     event: AstrMessageEvent,
 ) -> AsyncIterator[MessageEventResult]:
     """管理员动态切换全局锁定状态。"""
-    user_id = str(event.get_sender_id())
-    if user_id not in ctx.access.admin_ids:
+    if not ctx.access.is_admin(event):
         yield event.plain_result("🚫 权限不足，仅管理员可切换全局锁定")
         return
 
@@ -177,15 +182,16 @@ async def toggle_lockdown(
         )
         return
 
+    actor = scoped_id(event, str(event.get_sender_id()))
     if action in ("on", "true", "1", "enable", "start", "开启"):
         ctx.access.lockdown = True
-        logger.warning(f"[ComfyUI] 管理员 {user_id} 通过命令开启全局锁定")
+        logger.warning(f"[ComfyUI] 管理员 {actor} 通过命令开启全局锁定")
         yield event.plain_result("✅ 已开启全局锁定：当前仅管理员可调用工作流工具")
         return
 
     if action in ("off", "false", "0", "disable", "stop", "关闭"):
         ctx.access.lockdown = False
-        logger.info(f"[ComfyUI] 管理员 {user_id} 通过命令关闭全局锁定")
+        logger.info(f"[ComfyUI] 管理员 {actor} 通过命令关闭全局锁定")
         yield event.plain_result("✅ 已关闭全局锁定：恢复正常的访问控制")
         return
 
@@ -197,8 +203,7 @@ async def list_workflows(
     event: AstrMessageEvent,
 ) -> AsyncIterator[MessageEventResult]:
     """列出工作流与契约的配对、启用与校验状态。"""
-    user_id = str(event.get_sender_id())
-    if user_id not in ctx.access.admin_ids:
+    if not ctx.access.is_admin(event):
         yield event.plain_result("🚫 权限不足，仅管理员可查看工作流列表")
         return
 
@@ -265,8 +270,7 @@ async def check_contracts(
     event: AstrMessageEvent,
 ) -> AsyncIterator[MessageEventResult]:
     """检查全部工具契约（含禁用契约）并报告定位。"""
-    user_id = str(event.get_sender_id())
-    if user_id not in ctx.access.admin_ids:
+    if not ctx.access.is_admin(event):
         yield event.plain_result("🚫 权限不足，仅管理员可检查工具契约")
         return
 
@@ -335,8 +339,7 @@ async def reload_contracts_command(
         reload_fn: 执行热刷新的回调，返回当前启用的工具名。
         event: 消息事件。
     """
-    user_id = str(event.get_sender_id())
-    if user_id not in ctx.access.admin_ids:
+    if not ctx.access.is_admin(event):
         yield event.plain_result("🚫 权限不足，仅管理员可重新加载工具契约")
         return
 

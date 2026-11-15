@@ -58,6 +58,34 @@ def load_lexicon(path: Path) -> dict[str, list[str]]:
     return data
 
 
+def platform_name(event: AstrMessageEvent) -> str:
+    """取事件所属平台类型名。
+
+    Args:
+        event: 消息事件。
+
+    Returns:
+        平台类型名，取不到时为空串。
+    """
+    getter = getattr(event, "get_platform_name", None)
+    value = getter() if callable(getter) else ""
+    return str(value).strip() if value else ""
+
+
+def scoped_id(event: AstrMessageEvent, raw_id: str) -> str:
+    """为 ID 加上当前平台前缀。
+
+    Args:
+        event: 消息事件。
+        raw_id: 平台内的原始用户或群 ID。
+
+    Returns:
+        形如 ``平台:ID`` 的标识，平台为空时返回原值。
+    """
+    plat = platform_name(event)
+    return f"{plat}:{raw_id}" if plat else raw_id
+
+
 def is_group_message(event: AstrMessageEvent) -> bool:
     """判断事件是否来自群聊。
 
@@ -83,6 +111,27 @@ def group_id(event: AstrMessageEvent) -> str | None:
     return str(value) if value else None
 
 
+def _group_candidates(gid: str) -> tuple[str, ...]:
+    if "#" in gid:
+        return (gid, gid.split("#", 1)[0])
+    return (gid,)
+
+
+def _matches_whitelist(
+    whitelist: frozenset[str],
+    plat: str,
+    scope: str,
+    candidates: tuple[str, ...],
+) -> bool:
+    for candidate in candidates:
+        keys = [candidate, f"{scope}:{candidate}"]
+        if plat:
+            keys.extend((f"{plat}:{candidate}", f"{plat}:{scope}:{candidate}"))
+        if any(key in whitelist for key in keys):
+            return True
+    return False
+
+
 def _is_ascii_term(term: str) -> bool:
     return all(ord(char) < 128 for char in term)
 
@@ -103,15 +152,53 @@ class AccessController:
         """
         self.settings = settings
         self.admin_ids = settings.admin_ids
-        self.whitelist_group_ids = settings.whitelist_group_ids
+        self.whitelist_ids = settings.whitelist_ids
         self.lockdown = settings.lockdown
         self.group_policies: dict[str, str] = {}
         self.cooldowns: dict[str, float] = {}
         self.lexicon = lexicon
         self.patterns = self._build_patterns()
 
+    def is_admin(self, event: AstrMessageEvent) -> bool:
+        """判断事件发送者是否为管理员。
+
+        Args:
+            event: 消息事件。
+
+        Returns:
+            命中 ``admin_ids``（精确 ``平台:ID`` 或纯 ``ID``）时为 True。
+        """
+        user_id = str(event.get_sender_id())
+        plat = platform_name(event)
+        if plat and f"{plat}:{user_id}" in self.admin_ids:
+            return True
+        return user_id in self.admin_ids
+
+    def is_whitelisted(self, event: AstrMessageEvent) -> bool:
+        """判断当前会话（群或私聊用户）是否在白名单内。
+
+        Args:
+            event: 消息事件。
+
+        Returns:
+            命中白名单时为 True。
+        """
+        plat = platform_name(event)
+        if is_group_message(event):
+            gid = group_id(event)
+            if not gid:
+                return False
+            return _matches_whitelist(
+                self.whitelist_ids,
+                plat,
+                "group",
+                _group_candidates(gid),
+            )
+        user_id = str(event.get_sender_id())
+        return _matches_whitelist(self.whitelist_ids, plat, "user", (user_id,))
+
     def check_access(self, event: AstrMessageEvent) -> tuple[bool, str]:
-        """检查全局锁定与群白名单。
+        """检查全局锁定与白名单。
 
         Args:
             event: 消息事件。
@@ -119,20 +206,21 @@ class AccessController:
         Returns:
             是否放行，以及拒绝原因。
         """
-        user_id = str(event.get_sender_id())
-        is_admin = user_id in self.admin_ids
+        is_admin = self.is_admin(event)
 
         if self.lockdown and not is_admin:
             return False, "🚫 工作流工具已全局锁定，仅管理员可用"
 
+        bypass = is_admin and self.settings.admin_bypass.whitelist
         if is_group_message(event):
             gid = group_id(event)
             if not gid:
                 return False, "⚠️ 无法获取群号"
-            if gid not in self.whitelist_group_ids and not (
-                is_admin and self.settings.admin_bypass.whitelist
-            ):
-                return False, f"🚫 本群({gid})不在白名单中"
+            if not self.is_whitelisted(event) and not bypass:
+                return False, f"🚫 本群({scoped_id(event, gid)})不在白名单中"
+        elif not self.is_whitelisted(event) and not bypass:
+            user_id = str(event.get_sender_id())
+            return False, f"🚫 当前用户({scoped_id(event, user_id)})不在白名单中"
 
         return True, ""
 
@@ -145,18 +233,18 @@ class AccessController:
         Returns:
             是否放行，以及剩余秒数。
         """
-        user_id = str(event.get_sender_id())
-        if user_id in self.admin_ids and self.settings.admin_bypass.cooldown:
+        if self.is_admin(event) and self.settings.admin_bypass.cooldown:
             return True, 0
 
+        key = scoped_id(event, str(event.get_sender_id()))
         now = time.time()
-        last_time = self.cooldowns.get(user_id, 0)
+        last_time = self.cooldowns.get(key, 0)
         elapsed = now - last_time
 
         if elapsed < self.settings.cooldown_seconds:
             return False, int(self.settings.cooldown_seconds - elapsed)
 
-        self.cooldowns[user_id] = now
+        self.cooldowns[key] = now
         return True, 0
 
     def check_sensitive(
@@ -173,12 +261,12 @@ class AccessController:
         Returns:
             是否放行，以及触发的词。
         """
-        user_id = str(event.get_sender_id())
         sensitive = self.find_sensitive_words(text, event)
         if not sensitive:
             return True, []
-        if user_id in self.admin_ids and self.settings.admin_bypass.sensitive_words:
-            logger.info(f"[ComfyUI] 管理员 {user_id} 使用敏感词 {sensitive}，已放行")
+        if self.is_admin(event) and self.settings.admin_bypass.sensitive_words:
+            actor = scoped_id(event, str(event.get_sender_id()))
+            logger.info(f"[ComfyUI] 管理员 {actor} 使用敏感词 {sensitive}，已放行")
             return True, []
         return False, sensitive
 
@@ -195,7 +283,11 @@ class AccessController:
             gid = group_id(event)
             if not gid:
                 return self.settings.default_group_policy
-            return self.group_policies.get(gid, self.settings.default_group_policy)
+            for candidate in _group_candidates(gid):
+                key = scoped_id(event, candidate)
+                if key in self.group_policies:
+                    return self.group_policies[key]
+            return self.settings.default_group_policy
         return self.settings.default_private_policy
 
     def set_policy(self, gid: str, level: str) -> None:

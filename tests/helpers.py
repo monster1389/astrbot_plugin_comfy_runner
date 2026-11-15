@@ -88,6 +88,7 @@ class FakeEvent:
         sender: str = "9",
         group: str = "2",
         components: list | None = None,
+        platform: str = "aiocqhttp",
     ) -> None:
         """设置消息文本、发送者、群号与消息链。
 
@@ -96,6 +97,7 @@ class FakeEvent:
             sender: 发送者 ID。
             group: 群号，空串表示私聊。
             components: 消息链组件。
+            platform: 平台类型名。
         """
         self.message_str = text
         self.extra: dict = {}
@@ -103,6 +105,7 @@ class FakeEvent:
         self.message_obj = SimpleNamespace(message=list(components or []))
         self._sender = sender
         self._group = group
+        self._platform = platform
         self._result = FakeResult()
         self.unified_msg_origin = "origin"
 
@@ -129,6 +132,10 @@ class FakeEvent:
     def get_group_id(self) -> str:
         """返回群号。"""
         return self._group
+
+    def get_platform_name(self) -> str:
+        """返回平台类型名。"""
+        return self._platform
 
     def set_extra(self, key: str, value) -> None:
         """写入附加数据。"""

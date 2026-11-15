@@ -62,7 +62,7 @@ def setup(tmp_path: Path, monkeypatch, contract: dict | None = None):
         monkeypatch,
         control={
             "admin_ids": ["9"],
-            "whitelist_group_ids": ["2"],
+            "whitelist_ids": ["2"],
             "cooldown_seconds": 0,
         },
     )
@@ -345,3 +345,21 @@ def _write_source(path: Path, content: bytes) -> None:
             handle.writeframes(b"\x00\x00" * 400)
         return
     path.write_bytes(content)
+
+
+def test_file_component_with_image_extension_resolves_as_image(tmp_path, monkeypatch):
+    """Telegram 以文件发送的未压缩图片也可作为 image 参数附件解析。"""
+    source = tmp_path / "uncompressed.png"
+    _write_source(source, b"raw-png-bytes")
+    plugin, server = setup(tmp_path, monkeypatch)
+    event = FakeEvent(
+        sender="9",
+        group="2",
+        platform="telegram",
+        components=[File(name="uncompressed.png", file=str(source))],
+    )
+
+    execute(plugin, event, {"prompt": "一次", "reference": "attachment"})
+
+    assert len(server.uploads) == 1
+    assert server.uploads[0][1] == b"raw-png-bytes"
