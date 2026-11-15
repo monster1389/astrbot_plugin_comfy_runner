@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import re
 from pathlib import Path
 
 from helpers import (
@@ -570,3 +571,52 @@ def test_slot_is_released_after_timeout(tmp_path, monkeypatch):
     server.history_reply = SUCCESS
     assert execute(plugin, params={"prompt": "二次"}).startswith("已提交")
     assert plugin.gate.active == 0
+
+
+def test_hidden_value_template_expands_date_on_submit(tmp_path, monkeypatch):
+    """隐藏参数里的日期模板在提交副本时展开，不改工作流文件且不暴露给模型。"""
+    contract = json.loads(json.dumps(CONTRACT))
+    contract["inputs"]["prefix"] = {
+        "type": "string",
+        "description": "保存路径前缀",
+        "visible": False,
+        "target": {"node": "3", "field": "filename_prefix"},
+        "value_template": "moss/%date:yyyy-MM-dd%/MOSS-%date:HHmmss%-%date%",
+    }
+    workflow = json.loads(json.dumps(WORKFLOW))
+    workflow["3"]["inputs"]["filename_prefix"] = "moss/2026-11-14/MOSS-102348"
+
+    workflow_dir = tmp_path / "plugin_data" / "workflow"
+    workflow_dir.mkdir(parents=True, exist_ok=True)
+    wf_path = workflow_dir / "wf.json"
+    wf_path.write_text(json.dumps(workflow), encoding="utf-8")
+    (workflow_dir / "wf.tool.json").write_text(
+        json.dumps(contract),
+        encoding="utf-8",
+    )
+    plugin, _ = make_plugin(
+        tmp_path,
+        monkeypatch,
+        control={"admin_ids": ["9"], "whitelist_ids": ["2"], "cooldown_seconds": 0},
+    )
+    server = FakeComfyServer().install(monkeypatch)
+    server.history_reply = SUCCESS
+
+    inspected = run_tool(
+        plugin,
+        "comfy_inspect",
+        FakeEvent("看下", sender="2"),
+        workflow="comfy_test_t2i",
+    )
+    assert "prefix" not in inspected
+
+    summary = execute(plugin, params={"prompt": "一只猫"})
+    assert summary.startswith("已提交")
+
+    submitted_prefix = server.submissions[0]["3"]["inputs"]["filename_prefix"]
+    assert re.fullmatch(
+        r"moss/\d{4}-\d{2}-\d{2}/MOSS-\d{6}-\d{4}-\d{2}-\d{2}",
+        submitted_prefix,
+    )
+    saved_wf = json.loads(wf_path.read_text(encoding="utf-8"))
+    assert saved_wf["3"]["inputs"]["filename_prefix"] == "moss/2026-11-14/MOSS-102348"

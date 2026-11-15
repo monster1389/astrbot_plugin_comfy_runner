@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -32,6 +34,8 @@ REFERENCE_HINT = (
 )
 NUMERIC_MARKERS = frozenset({"INT", "FLOAT", "BOOLEAN"})
 DECLARED_MARKERS = NUMERIC_MARKERS | {"STRING", "COMBO"}
+_DATE_PLACEHOLDER_RE = re.compile(r"%date(?::([^%]*))?%")
+_DATE_TOKEN_RE = re.compile(r"yyyy|yy|MM|M|dd|d|HH|H|hh|h|mm|m|ss|s")
 
 
 class ContractError(ValueError):
@@ -54,6 +58,7 @@ class ParameterMapping:
     max_length: int | None = None
     minimum: float | None = None
     maximum: float | None = None
+    value_template: str | None = None
 
     @property
     def target(self) -> str:
@@ -486,6 +491,7 @@ def _build_contract(path: Path, data: dict[str, Any]) -> ToolContract:
             max_length=spec.get("maxLength"),
             minimum=spec.get("minimum"),
             maximum=spec.get("maximum"),
+            value_template=spec.get("value_template"),
         )
         for name, spec in data["inputs"].items()
     }
@@ -663,6 +669,69 @@ def _optional_value_errors(
     return errors
 
 
+def value_template_error(template: str) -> str | None:
+    """校验隐藏参数的时间模板占位符语法。
+
+    Args:
+        template: 待校验的值模板。
+
+    Returns:
+        错误原因；合法时为 None。
+    """
+    for match in _DATE_PLACEHOLDER_RE.finditer(template):
+        fmt = match.group(1)
+        if fmt is None:
+            continue
+        if fmt == "":
+            return "存在空日期格式 %date:%"
+        if not _DATE_TOKEN_RE.search(fmt):
+            return f"日期格式 {fmt!r} 不包含有效日期标记"
+    return None
+
+
+def expand_value_template(template: str, now: datetime | None = None) -> str:
+    """展开值模板里的 ComfyUI 日期占位符。
+
+    Args:
+        template: 含 ``%date:...%`` 或 ``%date%`` 的值模板。
+        now: 基准本地时间；省略时取当前时间。
+
+    Returns:
+        展开后的字符串。
+
+    Raises:
+        ContractError: 模板里包含空的或无效的日期占位符。
+    """
+    problem = value_template_error(template)
+    if problem is not None:
+        raise ContractError(f"value_template 不合法: {problem}")
+    current = now or datetime.now()
+    hour_12 = current.hour % 12 or 12
+    tokens = {
+        "yyyy": f"{current:%Y}",
+        "yy": f"{current:%y}",
+        "MM": f"{current:%m}",
+        "M": str(current.month),
+        "dd": f"{current:%d}",
+        "d": str(current.day),
+        "HH": f"{current:%H}",
+        "H": str(current.hour),
+        "hh": f"{hour_12:02d}",
+        "h": str(hour_12),
+        "mm": f"{current:%M}",
+        "m": str(current.minute),
+        "ss": f"{current:%S}",
+        "s": str(current.second),
+    }
+    return _DATE_PLACEHOLDER_RE.sub(
+        lambda match: _DATE_TOKEN_RE.sub(
+            lambda item: tokens[item.group(0)],
+            "yyyy-MM-dd" if match.group(1) is None else match.group(1),
+        ),
+        template,
+    )
+
+
 def _visibility_errors(contract: ToolContract, label: str) -> list[str]:
     errors: list[str] = []
     for name in sorted(contract.inputs):
@@ -670,6 +739,23 @@ def _visibility_errors(contract: ToolContract, label: str) -> list[str]:
         if not parameter.visible and parameter.required:
             errors.append(
                 f"{label}: 参数 {name} 对模型不可见，不能声明为必填"
+            )
+        if parameter.value_template is None:
+            continue
+        if parameter.visible:
+            errors.append(
+                f"{label}: 参数 {name} 对模型可见，不能声明 value_template"
+            )
+            continue
+        if parameter.type != "string":
+            errors.append(
+                f"{label}: 参数 {name} 类型不是 string，不能声明 value_template"
+            )
+            continue
+        problem = value_template_error(parameter.value_template)
+        if problem is not None:
+            errors.append(
+                f"{label}: 参数 {name} 的 value_template 不合法: {problem}"
             )
     return errors
 

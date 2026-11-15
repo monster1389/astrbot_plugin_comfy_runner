@@ -532,13 +532,24 @@ function renderSelectRow(elementId, label, binding, options) {
  */
 function renderInputConstraints(row, id) {
   if (row.type === "string") {
+    const templateRow = row.visible
+      ? ""
+      : renderTextRow(
+          id("valueTemplate"),
+          "隐藏值模板（可选，支持 %date:yyyy-MM-dd%）",
+          'data-input-field="valueTemplate"',
+          row.valueTemplate,
+        );
     return [
+      templateRow,
       `<div class="grid-3">`,
       renderLimitField(id("minLength"), "最小长度", "minLength", row.minLength),
       renderLimitField(id("maxLength"), "最大长度", "maxLength", row.maxLength),
       renderEnumField(id("enumText"), row.enumText),
       `</div>`,
-    ].join("\n");
+    ]
+      .filter(Boolean)
+      .join("\n");
   }
   if (row.type === "integer" || row.type === "number") {
     return [

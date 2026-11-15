@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -20,6 +21,7 @@ from .contract import (
     ContractError,
     OutputMapping,
     ToolContract,
+    expand_value_template,
     input_target_errors,
     read_workflow,
 )
@@ -152,7 +154,11 @@ class WorkflowExecutor:
             raise ContractError("\n".join(problems))
 
         values = dict(arguments)
+        now = datetime.now()
         for name, parameter in contract.inputs.items():
+            if parameter.value_template is not None:
+                values[name] = expand_value_template(parameter.value_template, now)
+                continue
             if not parameter.is_reference or name not in arguments:
                 continue
             payload = await resolve_reference(

@@ -120,6 +120,10 @@
         },
         "maximum": {
           "type": "number"
+        },
+        "value_template": {
+          "type": "string",
+          "minLength": 1
         }
       },
       "allOf": [
@@ -171,7 +175,8 @@
               },
               "maximum": {
                 "type": "integer"
-              }
+              },
+              "value_template": false
             }
           }
         },
@@ -194,7 +199,8 @@
                 }
               },
               "minLength": false,
-              "maxLength": false
+              "maxLength": false,
+              "value_template": false
             }
           }
         },
@@ -215,7 +221,8 @@
               "minLength": false,
               "maxLength": false,
               "minimum": false,
-              "maximum": false
+              "maximum": false,
+              "value_template": false
             }
           }
         },
@@ -241,7 +248,8 @@
               "minLength": false,
               "maxLength": false,
               "minimum": false,
-              "maximum": false
+              "maximum": false,
+              "value_template": false
             }
           }
         }

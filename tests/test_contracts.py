@@ -453,3 +453,43 @@ def test_check_command_remote_reports_unreachable_object_info(tmp_path, monkeypa
 
     assert "无法核对: 读取节点定义失败: HTTP 503" in results[0][1]
     assert "不存在" not in results[0][1]
+
+
+def test_visible_input_with_value_template_fails_registration(tmp_path, monkeypatch):
+    """可见参数声明 value_template 时拒绝注册，不与原值语义混淆。"""
+    contract = json.loads(json.dumps(CONTRACT))
+    contract["inputs"]["prompt"]["value_template"] = "moss/%date:yyyy-MM-dd%"
+    write_contract(tmp_path, contract=contract)
+
+    with pytest.raises(ContractError, match="对模型可见，不能声明 value_template"):
+        make_plugin(tmp_path, monkeypatch, control=admin_overrides())
+
+
+def test_invalid_date_placeholder_in_value_template_fails(tmp_path, monkeypatch):
+    """空格式或无效日期占位符在契约检查时直接报错拒绝。"""
+    workflow = json.loads(json.dumps(WORKFLOW))
+    workflow["4"]["inputs"]["filename_prefix"] = "moss/static"
+    for bad in ("moss/%date:%", "moss/%date:xyz%"):
+        contract = json.loads(json.dumps(CONTRACT))
+        contract["inputs"]["prefix"] = {
+            "type": "string",
+            "description": "保存路径前缀",
+            "visible": False,
+            "target": {"node": "4", "field": "filename_prefix"},
+            "value_template": bad,
+        }
+        write_contract(tmp_path, contract=contract, workflow=workflow)
+
+        with pytest.raises(ContractError, match="value_template 不合法"):
+            make_plugin(tmp_path, monkeypatch, control=admin_overrides())
+
+
+def test_non_string_input_with_value_template_fails_schema(tmp_path, monkeypatch):
+    """非字符串参数声明 value_template 时在 Schema 校验阶段直接报错。"""
+    contract = json.loads(json.dumps(CONTRACT))
+    contract["inputs"]["seed"]["visible"] = False
+    contract["inputs"]["seed"]["value_template"] = "%date:yyyy%"
+    write_contract(tmp_path, contract=contract)
+
+    with pytest.raises(ContractError, match="False schema"):
+        make_plugin(tmp_path, monkeypatch, control=admin_overrides())

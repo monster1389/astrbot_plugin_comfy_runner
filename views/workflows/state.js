@@ -189,6 +189,7 @@ function inputRows(inputs) {
       maxLength: editableLimit(spec?.maxLength),
       minimum: editableLimit(spec?.minimum),
       maximum: editableLimit(spec?.maximum),
+      valueTemplate: spec?.value_template ?? "",
     };
   });
 }
@@ -243,6 +244,8 @@ function inputSpec(row) {
   if (TEXT_TYPES.has(type)) {
     assignLimit(spec, "minLength", row.minLength);
     assignLimit(spec, "maxLength", row.maxLength);
+    const valueTemplate = String(row.valueTemplate ?? "").trim();
+    if (!row.visible && valueTemplate) spec.value_template = valueTemplate;
   }
   if (NUMBER_TYPES.has(type)) {
     assignLimit(spec, "minimum", row.minimum);

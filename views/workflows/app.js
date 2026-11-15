@@ -415,6 +415,7 @@ function newInputRow() {
     maxLength: "",
     minimum: "",
     maximum: "",
+    valueTemplate: "",
   };
 }
 
@@ -492,6 +493,7 @@ function updateInputRow(index, field, target) {
   if (field === "visible" || field === "required") {
     row[field] = target.checked;
     if (field === "visible" && !target.checked) row.required = false;
+    if (field === "visible" && target.checked) row.valueTemplate = "";
   } else if (field === "node") {
     row.node = target.value;
     row.field = firstFieldName(target.value);
