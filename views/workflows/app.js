@@ -598,13 +598,13 @@ function handleActionClick(event) {
       runTask(fetchRemoteNodes);
       return;
     case "preview-local":
-      runTask(() => refreshPreview(false));
+      runTask(() => refreshPreview(false), { showErrors: true });
       return;
     case "preview-remote":
-      runTask(() => refreshPreview(true));
+      runTask(() => refreshPreview(true), { showErrors: true });
       return;
     case "refresh-inspect":
-      runTask(() => refreshPreview(false));
+      runTask(() => refreshPreview(false), { showErrors: true });
       return;
     case "save-contract":
       runTask(saveContract, { showErrors: true });

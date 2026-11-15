@@ -98,21 +98,46 @@ export function contractToDraft(rawContract, stem, nodes) {
  * @param {object} draft 表单草稿。
  * @returns {object} 符合契约 Schema 的对象。
  */
-export function draftToContract(draft) {
-  const inputs = {};
-  for (const row of draft.inputs ?? []) {
+/**
+ * 把草稿行数组收集成契约对象，遇到空名或重名直接报错。
+ *
+ * @param {Array<object>} rows 表单行数组。
+ * @param {string} kindLabel 展示用类别名，例如 `参数` 或 `产物`。
+ * @param {(row: object) => object} buildSpec 单行转换函数。
+ * @param {Array<string>} errors 收集到的错误列表。
+ * @returns {object} 键值映射对象。
+ */
+function collectNamedEntries(rows, kindLabel, buildSpec, errors) {
+  const entries = {};
+  for (const [index, row] of (rows ?? []).entries()) {
     const key = String(row.key ?? "").trim();
-    if (!key) continue;
-    inputs[key] = inputSpec(row);
+    if (!key) {
+      errors.push(`第 ${index + 1} 个${kindLabel}未填写名称`);
+      continue;
+    }
+    if (Object.hasOwn(entries, key)) {
+      errors.push(`${kindLabel}名「${key}」重复`);
+      continue;
+    }
+    entries[key] = buildSpec(row);
   }
-  const outputs = {};
-  for (const row of draft.outputs ?? []) {
-    const key = String(row.key ?? "").trim();
-    if (!key) continue;
-    outputs[key] = {
+  return entries;
+}
+
+export function draftToContract(draft) {
+  const errors = [];
+  const inputs = collectNamedEntries(draft.inputs, "参数", inputSpec, errors);
+  const outputs = collectNamedEntries(
+    draft.outputs,
+    "产物",
+    (row) => ({
       type: row.type ?? DEFAULT_OUTPUT_TYPE,
       target: targetOf(row),
-    };
+    }),
+    errors,
+  );
+  if (errors.length > 0) {
+    throw new Error(errors.join("\n"));
   }
   return {
     version: 1,
