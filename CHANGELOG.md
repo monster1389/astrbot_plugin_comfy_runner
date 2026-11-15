@@ -35,13 +35,21 @@
 ### 命令
 
 - 命令收敛为 `comfy` 命令组：`/comfy help`、`/comfy ls`、`/comfy check [remote]`、
-  `/comfy lock`、`/comfy policy`（别名 `banlevel`）
+  `/comfy reload`、`/comfy lock`、`/comfy policy`（别名 `banlevel`）
+- 新增 `/comfy reload`：重新读取并校验全部契约后在内存中刷新工具与命令上下文；
+  校验失败时保持原运行状态，不重载插件、不中断进行中的后台交付
 - 删除 `/comfy save`：不再从聊天消息里贴 JSON 导入工作流或契约，只由文件目录管理；
   带导入与管理能力的管理页面属于后续版本
 - 删除 `/画图`、`/画图no`、`/重绘`、`/当前工作流`、`/测试lora`、`/comfy帮助`、
   `/违禁级别`、`/comfy_lock`、`/comfy_ls`、`/comfy_save`、`/comfy_use`、`/comfy_add`
 - 新增 `/comfy check`：检查全部契约（含禁用）并定位到参数与节点字段；带 `remote`
   时额外用 ComfyUI `/object_info` 核对参数字段与输出节点，远端读不到时如实报告原因
+
+### 视图
+
+- 新增插件视图 Web API：列出工作流与契约状态、读取工作流的节点与字段、上传工作流、
+  保存与预览工具契约、删除契约或工作流
+- 上传、保存与删除先整体校验再热刷新；保存失败不写盘，热刷新被其他文件阻断时回滚本次写入
 
 ### 配置
 

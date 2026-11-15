@@ -1,7 +1,7 @@
 name: astrbot_plugin_comfy_runner
 version: v0.2.0
 desc: 把 ComfyUI 工作流公开为可发现、可查看、可执行的工作流工具，参数与产物由工具契约声明。
-help: 在插件数据目录的 workflow/ 下放置 name.json 与 name.tool.json，重载插件后生效。发送 /comfy help 查看指令。
+help: 在插件数据目录的 workflow/ 下放置 name.json 与 name.tool.json，在插件 WebUI 的「工作流与映射规则」视图里编辑并保存契约，或发送 /comfy reload 热刷新工具契约，无需重载插件。发送 /comfy help 查看指令。
 author: monster1389
 repo: https://github.com/monster1389/astrbot_plugin_comfy_runner
 tags:

@@ -1,5 +1,5 @@
 ---
-status: accepted
+status: superseded by ADR-0019
 ---
 
 # 重载插件时整体重建工具注册
