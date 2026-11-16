@@ -35,6 +35,10 @@ html_render_cache/
 *.gif
 *.jpg
 *.jpeg
+!docs/assets/*.png
+!docs/assets/*.jpg
+!docs/assets/*.jpeg
+!docs/assets/*.gif
 
 # 日志
 *.log
