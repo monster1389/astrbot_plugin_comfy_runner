@@ -27,7 +27,7 @@ CONTRACT = {
     "version": 1,
     "name": "comfy_test_t2i",
     "description": "测试用工作流",
-    "enabled": True,
+    "model_visible": True,
     "inputs": {
         "prompt": {
             "type": "string",

@@ -15,6 +15,8 @@ from helpers import make_plugin
         {"timeout_seconds": 0},
         {"poll_interval_seconds": 0},
         {"poll_interval_seconds": "1"},
+        {"interactive_timeout_seconds": 9},
+        {"interactive_timeout_seconds": "120"},
     ],
 )
 def test_invalid_execution_settings_prevent_load(tmp_path, monkeypatch, execution):

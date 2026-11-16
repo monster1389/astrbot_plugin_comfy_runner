@@ -31,7 +31,7 @@ CONTRACT = {
     "version": 1,
     "name": "comfy_moss_t2i",
     "description": "使用 MOSS 工作流根据提示词生成图片",
-    "enabled": True,
+    "model_visible": True,
     "inputs": {
         "prompt": {
             "type": "string",
@@ -165,7 +165,7 @@ def test_list_workflows_reports_contract_state(tmp_path, monkeypatch):
     assert item["contract_file"] == "moss.tool.json"
     assert item["has_workflow"] is True
     assert item["has_contract"] is True
-    assert item["enabled"] is True
+    assert item["model_visible"] is True
     assert item["tool_name"] == "comfy_moss_t2i"
     assert item["description"] == "使用 MOSS 工作流根据提示词生成图片"
     assert item["ok"] is True
@@ -437,18 +437,18 @@ def test_upload_workflow_refuses_to_break_enabled_contract(tmp_path, monkeypatch
     )
 
     assert status == 400
-    assert "新工作流会导致已启用契约失效" in body["message"]
+    assert "新工作流会导致已有契约失效" in body["message"]
     assert json.loads((workflow_dir / "moss.json").read_text(encoding="utf-8")) == (
         WORKFLOW
     )
 
 
-def test_upload_workflow_allows_shape_change_for_disabled_contract(
+def test_upload_workflow_refuses_to_break_command_only_contract(
     tmp_path,
     monkeypatch,
 ):
-    """契约停用后允许上传不再匹配它的工作流。"""
-    workflow_dir = write_pair(tmp_path, contract=dict(CONTRACT, enabled=False))
+    """仅命令可见的契约也受保护，新工作流会破坏其映射时拒绝覆盖。"""
+    workflow_dir = write_pair(tmp_path, contract=dict(CONTRACT, model_visible=False))
     plugin, _ = make_plugin(tmp_path, monkeypatch, control=admin_overrides())
     changed = {
         "1": {"class_type": "CLIPTextEncode", "inputs": {"other": ""}},
@@ -462,9 +462,10 @@ def test_upload_workflow_allows_shape_change_for_disabled_contract(
         files=[("file", "moss.json", json.dumps(changed).encode("utf-8"))],
     )
 
-    assert status == 200
+    assert status == 400
+    assert "新工作流会导致已有契约失效" in body["message"]
     assert json.loads((workflow_dir / "moss.json").read_text(encoding="utf-8")) == (
-        changed
+        WORKFLOW
     )
 
 
@@ -552,29 +553,52 @@ def test_save_contract_rejects_duplicate_enabled_name(tmp_path, monkeypatch):
     assert "重复" in body["message"]
 
 
-def test_save_contract_allows_disabled_draft_with_mapping_warnings(
+def test_save_command_only_contract_does_not_register_model_tools(
     tmp_path,
     monkeypatch,
 ):
-    """停用契约作为草稿保存，映射警告随响应返回。"""
+    """保存 model_visible=False 的合法契约后写盘，但不注册模型工具。"""
     workflow_dir = write_workflow_only(tmp_path)
     plugin, _ = make_plugin(tmp_path, monkeypatch, control=admin_overrides())
-    draft = json.loads(json.dumps(CONTRACT))
-    draft["enabled"] = False
-    draft["inputs"]["prompt"]["target"] = {"node": "99", "field": "text"}
+    cmd_only = json.loads(json.dumps(CONTRACT))
+    cmd_only["model_visible"] = False
 
     status, body = call_api(
         plugin,
         "POST",
         CONTRACT_ROUTE,
-        payload={"stem": "moss", "contract": draft},
+        payload={"stem": "moss", "contract": cmd_only},
     )
 
     assert status == 200
-    assert body["ok"] is False
-    assert "目标节点 99 不存在" in "\n".join(body["errors"])
+    assert body["ok"] is True
     assert body["active_tools"] == []
     assert (workflow_dir / "moss.tool.json").is_file()
+    assert plugin.context.llm_tools == []
+    assert plugin.cmd_ctx.workflow_names == ("comfy_moss_t2i",)
+
+
+def test_save_command_only_contract_rejects_mapping_error_without_writing(
+    tmp_path,
+    monkeypatch,
+):
+    """model_visible=False 的契约存在映射错误时同样拒绝保存。"""
+    workflow_dir = write_workflow_only(tmp_path)
+    plugin, _ = make_plugin(tmp_path, monkeypatch, control=admin_overrides())
+    broken = json.loads(json.dumps(CONTRACT))
+    broken["model_visible"] = False
+    broken["inputs"]["prompt"]["target"] = {"node": "99", "field": "text"}
+
+    status, body = call_api(
+        plugin,
+        "POST",
+        CONTRACT_ROUTE,
+        payload={"stem": "moss", "contract": broken},
+    )
+
+    assert status == 400
+    assert "目标节点 99 不存在" in body["message"]
+    assert not (workflow_dir / "moss.tool.json").exists()
 
 
 def test_save_contract_rolls_back_when_other_contract_breaks_reload(
@@ -701,27 +725,14 @@ def test_delete_contract_scope_reports_missing_contract(tmp_path, monkeypatch):
     assert status == 404
 
 
-def test_delete_all_refuses_enabled_contract(tmp_path, monkeypatch):
-    """启用中的契约不允许随工作流一起删除。"""
+def test_delete_all_removes_workflow_and_model_visible_contract(
+    tmp_path,
+    monkeypatch,
+):
+    """scope=all 可直接删除工作流与模型可见契约并移除工具。"""
     workflow_dir = write_pair(tmp_path)
     plugin, _ = make_plugin(tmp_path, monkeypatch, control=admin_overrides())
-
-    status, body = call_api(
-        plugin,
-        "POST",
-        DELETE_ROUTE,
-        payload={"stem": "moss", "scope": "all"},
-    )
-
-    assert status == 400
-    assert "仍处于启用状态" in body["message"]
-    assert (workflow_dir / "moss.json").exists()
-
-
-def test_delete_all_removes_workflow_and_disabled_contract(tmp_path, monkeypatch):
-    """契约停用后可以把工作流与契约一起删除。"""
-    workflow_dir = write_pair(tmp_path, contract=dict(CONTRACT, enabled=False))
-    plugin, _ = make_plugin(tmp_path, monkeypatch, control=admin_overrides())
+    asyncio.run(plugin.initialize())
 
     status, body = call_api(
         plugin,
@@ -735,6 +746,7 @@ def test_delete_all_removes_workflow_and_disabled_contract(tmp_path, monkeypatch
     assert body["active_tools"] == []
     assert not (workflow_dir / "moss.json").exists()
     assert not (workflow_dir / "moss.tool.json").exists()
+    assert plugin.context.llm_tools == []
 
 
 def test_delete_all_reports_missing_files(tmp_path, monkeypatch):
@@ -770,11 +782,11 @@ def test_delete_rejects_unknown_scope(tmp_path, monkeypatch):
 def test_list_workflows_includes_orphan_contract(tmp_path, monkeypatch):
     """找不到配对工作流的契约为单独条目并带错误。"""
     workflow_dir = write_workflow_only(tmp_path)
+    plugin, _ = make_plugin(tmp_path, monkeypatch, control=admin_overrides())
     (workflow_dir / "orphan.tool.json").write_text(
-        json.dumps(dict(CONTRACT, enabled=False)),
+        json.dumps(dict(CONTRACT, model_visible=False)),
         encoding="utf-8",
     )
-    plugin, _ = make_plugin(tmp_path, monkeypatch, control=admin_overrides())
 
     status, body = call_api(plugin, "GET", LIST_ROUTE)
 
@@ -854,8 +866,8 @@ def test_preview_contract_reports_duplicate_enabled_name(tmp_path, monkeypatch):
     assert "重复" in "\n".join(body["errors"])
 
 
-def test_delete_all_refuses_unreadable_contract(tmp_path, monkeypatch):
-    """契约无法读取时不允许随工作流一起删除。"""
+def test_delete_all_removes_unreadable_contract_and_workflow(tmp_path, monkeypatch):
+    """损坏契约也能通过 scope=all 连同工作流一起清理。"""
     workflow_dir = write_pair(tmp_path)
     plugin, _ = make_plugin(tmp_path, monkeypatch, control=admin_overrides())
     (workflow_dir / "moss.tool.json").write_text("{", encoding="utf-8")
@@ -867,9 +879,10 @@ def test_delete_all_refuses_unreadable_contract(tmp_path, monkeypatch):
         payload={"stem": "moss", "scope": "all"},
     )
 
-    assert status == 400
-    assert "仍处于启用状态" in body["message"]
-    assert (workflow_dir / "moss.json").exists()
+    assert status == 200
+    assert body["deleted"] == "all"
+    assert not (workflow_dir / "moss.json").exists()
+    assert not (workflow_dir / "moss.tool.json").exists()
 
 
 def test_workflow_detail_caches_remote_node_defs_until_refresh(tmp_path, monkeypatch):

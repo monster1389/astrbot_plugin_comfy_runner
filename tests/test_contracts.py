@@ -21,7 +21,7 @@ CONTRACT = {
     "version": 1,
     "name": "comfy_moss_t2i",
     "description": "使用 MOSS 工作流根据提示词生成图片",
-    "enabled": True,
+    "model_visible": True,
     "inputs": {
         "prompt": {
             "type": "string",
@@ -285,16 +285,27 @@ def test_duplicate_tool_names_prevent_load(tmp_path, monkeypatch):
     assert "重复" in str(error.value)
 
 
-def test_disabled_contract_with_broken_mapping_still_loads(tmp_path, monkeypatch):
-    """禁用契约的映射错误不阻止加载，留给检查命令报告。"""
-    disabled = json.loads(json.dumps(CONTRACT))
-    disabled.update(enabled=False, name="comfy_disabled")
-    disabled["inputs"]["prompt"]["target"].update(node="99")
-    write_contract(tmp_path, stem="disabled", contract=disabled)
+def test_command_only_contract_does_not_register_model_tools(tmp_path, monkeypatch):
+    """仅有 model_visible=False 的合法契约时不注册模型工具。"""
+    cmd_only = json.loads(json.dumps(CONTRACT))
+    cmd_only.update(model_visible=False, name="comfy_cmd_only")
+    write_contract(tmp_path, stem="cmd_only", contract=cmd_only)
 
     plugin, _ = make_plugin(tmp_path, monkeypatch, control=admin_overrides())
 
     assert register(plugin) == []
+    assert plugin.cmd_ctx.workflow_names == ("comfy_cmd_only",)
+
+
+def test_command_only_contract_with_broken_mapping_prevents_load(tmp_path, monkeypatch):
+    """model_visible=False 的契约映射错误同样阻止插件加载。"""
+    broken = json.loads(json.dumps(CONTRACT))
+    broken.update(model_visible=False, name="comfy_broken")
+    broken["inputs"]["prompt"]["target"].update(node="99")
+    write_contract(tmp_path, stem="broken", contract=broken)
+
+    with pytest.raises(ContractError, match="目标节点 99 不存在"):
+        make_plugin(tmp_path, monkeypatch, control=admin_overrides())
 
 
 def test_unparsable_contract_file_prevents_load(tmp_path, monkeypatch):
@@ -306,18 +317,18 @@ def test_unparsable_contract_file_prevents_load(tmp_path, monkeypatch):
         make_plugin(tmp_path, monkeypatch, control=admin_overrides())
 
 
-def test_check_command_reports_disabled_contract_errors(tmp_path, monkeypatch):
-    """检查命令覆盖禁用契约并给节点级定位。"""
-    disabled = json.loads(json.dumps(CONTRACT))
-    disabled.update(enabled=False, name="comfy_disabled")
-    disabled["inputs"]["prompt"]["target"].update(node="99")
-    write_contract(tmp_path, stem="disabled", contract=disabled)
+def test_check_command_reports_command_only_contract_errors(tmp_path, monkeypatch):
+    """检查命令覆盖仅命令契约并给节点级定位。"""
     write_contract(tmp_path)
-
     plugin, _ = make_plugin(tmp_path, monkeypatch, control=admin_overrides())
+    cmd_only = json.loads(json.dumps(CONTRACT))
+    cmd_only.update(model_visible=False, name="comfy_cmd_only")
+    cmd_only["inputs"]["prompt"]["target"].update(node="99")
+    write_contract(tmp_path, stem="cmd_only", contract=cmd_only)
+
     results = collect(plugin.cmd_comfy_check(FakeEvent("/comfy check", sender="9")))
 
-    assert "共 2 个契约文件，启用 1 个" in results[0][1]
+    assert "共 2 个契约文件，模型可见 1 个" in results[0][1]
     assert "moss.tool.json" in results[0][1]
     assert "参数 prompt 的目标节点 99 不存在" in results[0][1]
 
@@ -364,7 +375,7 @@ def test_check_command_remote_accepts_known_field(tmp_path, monkeypatch):
         plugin.cmd_comfy_check(FakeEvent("/comfy check remote", sender="9"))
     )
 
-    assert "moss.tool.json -> comfy_moss_t2i [启用]" in results[0][1]
+    assert "moss.tool.json -> comfy_moss_t2i [模型可见]" in results[0][1]
     assert "不在节点类型" not in results[0][1]
     assert "不是输出节点" not in results[0][1]
 

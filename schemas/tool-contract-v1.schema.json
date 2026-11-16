@@ -8,7 +8,7 @@
     "version",
     "name",
     "description",
-    "enabled",
+    "model_visible",
     "inputs",
     "outputs"
   ],
@@ -24,7 +24,7 @@
       "type": "string",
       "minLength": 1
     },
-    "enabled": {
+    "model_visible": {
       "type": "boolean"
     },
     "inputs": {

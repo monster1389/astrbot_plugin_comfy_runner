@@ -16,9 +16,11 @@ from .config import POLICIES, Config
 from .contract import (
     CONTRACT_SUFFIX,
     ContractError,
+    ToolContract,
     read_workflow,
     remote_target_errors,
 )
+from .interactive import InteractiveManager
 from .paths import is_aux_file
 from .registry import ContractReport, inspect_contracts
 
@@ -31,7 +33,13 @@ class CommandContext:
     access: AccessController
     client: ComfyClient
     plugin_dir: Path
-    workflow_names: tuple[str, ...]
+    contracts: tuple[ToolContract, ...]
+    interactive: InteractiveManager
+
+    @property
+    def workflow_names(self) -> tuple[str, ...]:
+        """全部可用工作流名。"""
+        return tuple(contract.name for contract in self.contracts)
 
 
 def command_arguments(event: AstrMessageEvent, depth: int = 2) -> str:
@@ -67,10 +75,14 @@ async def help_command(
     tips = [
         "ComfyUI 工作流工具",
         "",
-        "直接对话说出需求即可，模型会自己发现并调用可用的工作流。",
+        "直接对话说出需求即可，模型会自己发现并调用对模型可见的工作流；",
+        "也可使用 /comfy run 手动逐轮输入参数直接执行（不经过模型）。",
         "",
         "【指令】",
-        "  /comfy help    显示此帮助",
+        "  /comfy help         显示此帮助",
+        "  /comfy ls           查看可用工作流",
+        "  /comfy run [工作流] 手动触发工作流",
+        "  /comfy cancel       取消当前参数收集",
     ]
 
     if is_admin:
@@ -78,16 +90,15 @@ async def help_command(
             [
                 "",
                 "【管理员指令】",
-                "  /comfy ls            工作流与契约状态",
                 "  /comfy check [remote] 检查工具契约",
-                "  /comfy reload        重新加载工具契约",
-                "  /comfy lock on|off   切换全局锁定",
-                "  /comfy policy        设置群违禁级别",
+                "  /comfy reload         重新加载工具契约",
+                "  /comfy lock on|off    切换全局锁定",
+                "  /comfy policy         设置群违禁级别",
             ]
         )
 
     tips.append("")
-    tips.append(f"已启用工作流：{', '.join(ctx.workflow_names) or '无'}")
+    tips.append(f"可用工作流：{', '.join(ctx.workflow_names) or '无'}")
     location = (
         f"群聊 {scoped_id(event, gid)}"
         if gid
@@ -202,9 +213,14 @@ async def list_workflows(
     ctx: CommandContext,
     event: AstrMessageEvent,
 ) -> AsyncIterator[MessageEventResult]:
-    """列出工作流与契约的配对、启用与校验状态。"""
+    """列出可用工作流（普通用户看清单，管理员看文件与校验状态）。"""
+    allowed, reason = ctx.access.check_access(event)
+    if not allowed:
+        yield event.plain_result(reason)
+        return
+
     if not ctx.access.is_admin(event):
-        yield event.plain_result("🚫 权限不足，仅管理员可查看工作流列表")
+        yield event.plain_result(_user_workflow_list(ctx.contracts))
         return
 
     workflow_dir = ctx.cfg.workflow_dir
@@ -239,6 +255,43 @@ async def list_workflows(
     yield event.plain_result("\n".join(lines))
 
 
+async def run_workflow_command(
+    ctx: CommandContext,
+    event: AstrMessageEvent,
+) -> AsyncIterator[MessageEventResult]:
+    """手动触发工作流并在不经过模型的情况下逐轮收集参数。"""
+    query = command_arguments(event)
+    reply = await ctx.interactive.start_run(event, ctx.contracts, query)
+    yield event.plain_result(reply)
+
+
+async def cancel_workflow_command(
+    ctx: CommandContext,
+    event: AstrMessageEvent,
+) -> AsyncIterator[MessageEventResult]:
+    """不在向导中时告知用户没有可取消的会话。"""
+    allowed, reason = ctx.access.check_access(event)
+    if not allowed:
+        yield event.plain_result(reason)
+        return
+    yield event.plain_result("⚠️ 当前没有进行中的工作流向导")
+
+
+def _user_workflow_list(contracts: tuple[ToolContract, ...]) -> str:
+    if not contracts:
+        return "当前没有可用的工作流"
+    lines = ["可用工作流：", ""]
+    for contract in contracts:
+        scope = "模型可见" if contract.model_visible else "仅命令"
+        lines.append(f"- {contract.name} [{scope}]：{contract.description}")
+    lines.extend(["", "发送 /comfy run [工作流名] 可直接调用。"])
+    return "\n".join(lines)
+
+
+def _visibility_label(contract: ToolContract) -> str:
+    return "模型可见" if contract.model_visible else "仅命令"
+
+
 def _workflow_line(name: str, report: ContractReport | None) -> str:
     """渲染一行工作流与契约的配对状态。"""
     if report is None:
@@ -246,7 +299,7 @@ def _workflow_line(name: str, report: ContractReport | None) -> str:
     contract = report.contract
     if contract is None:
         return f"❌ {name} 契约 {report.path.name} 无法读取"
-    state = "启用" if contract.enabled else "禁用"
+    state = _visibility_label(contract)
     mark = "✅" if report.ok else "❌"
     problems = f"（{len(report.errors)} 个问题）" if report.errors else ""
     return f"{mark} {name} -> {contract.name} [{state}]{problems}"
@@ -258,7 +311,7 @@ def _orphan_line(report: ContractReport) -> str:
     if contract is None:
         return f"❌ {report.path.name} 无法读取，且没有同名工作流"
     workflow_name = contract.workflow_path.name
-    state = "启用" if contract.enabled else "禁用"
+    state = _visibility_label(contract)
     return (
         f"❌ {report.path.name} -> {contract.name} [{state}] "
         f"缺少工作流 {workflow_name}"
@@ -269,7 +322,7 @@ async def check_contracts(
     ctx: CommandContext,
     event: AstrMessageEvent,
 ) -> AsyncIterator[MessageEventResult]:
-    """检查全部工具契约（含禁用契约）并报告定位。"""
+    """检查全部工具契约并报告定位。"""
     if not ctx.access.is_admin(event):
         yield event.plain_result("🚫 权限不足，仅管理员可检查工具契约")
         return
@@ -279,11 +332,11 @@ async def check_contracts(
     if remote:
         reports = await _apply_remote_check(ctx, reports)
 
-    enabled = sum(1 for report in reports if report.enabled)
+    model_visible = sum(1 for report in reports if report.model_visible)
     lines = [
         "工具契约检查",
         f"目录: {ctx.cfg.workflow_dir}",
-        f"共 {len(reports)} 个契约文件，启用 {enabled} 个",
+        f"共 {len(reports)} 个契约文件，模型可见 {model_visible} 个",
     ]
     if remote:
         lines.append("已附带 ComfyUI 节点定义核对")
@@ -308,7 +361,7 @@ def _report_header(report: ContractReport) -> str:
     contract = report.contract
     if contract is None:
         return f"❌ {report.path.name} 无法读取"
-    state = "启用" if contract.enabled else "禁用"
+    state = _visibility_label(contract)
     mark = "✅" if report.ok else "❌"
     total = len(contract.inputs)
     visible = sum(1 for item in contract.inputs.values() if item.visible)
@@ -336,7 +389,7 @@ async def reload_contracts_command(
 
     Args:
         ctx: 命令上下文。
-        reload_fn: 执行热刷新的回调，返回当前启用的工具名。
+        reload_fn: 执行热刷新的回调，返回当前可用工作流名。
         event: 消息事件。
     """
     if not ctx.access.is_admin(event):
@@ -350,7 +403,7 @@ async def reload_contracts_command(
         return
 
     yield event.plain_result(
-        f"✅ 已重新加载工具契约，当前启用：{', '.join(names) or '无'}"
+        f"✅ 已重新加载工具契约，当前可用：{', '.join(names) or '无'}"
     )
 
 

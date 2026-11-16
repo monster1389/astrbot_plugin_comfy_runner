@@ -16,8 +16,9 @@ from .comfy_runner.comfy import ComfyClient
 from .comfy_runner.commands import CommandContext
 from .comfy_runner.config import Config
 from .comfy_runner.execution import ConcurrencyGate, WorkflowExecutor
+from .comfy_runner.interactive import InteractiveManager
 from .comfy_runner.paths import PLUGIN_DIR, prepare_data_dir
-from .comfy_runner.registry import load_enabled_contracts
+from .comfy_runner.registry import load_contracts
 from .comfy_runner.tools import (
     EXECUTE_NAME,
     INSPECT_NAME,
@@ -40,7 +41,7 @@ class ComfyUIPlugin(Star):
 
         Raises:
             ConfigError: 配置项缺失、类型不符或取值非法。
-            ContractError: 任一启用契约不合法，或任一契约文件无法解析。
+            ContractError: 任一契约文件不合法或无法解析。
         """
         super().__init__(context)
         data_dir = StarTools.get_data_dir("astrbot_plugin_comfy_runner")
@@ -61,14 +62,21 @@ class ComfyUIPlugin(Star):
         )
         self.gate = ConcurrencyGate(execution.max_concurrency)
         self.jobs = BackgroundJobs()
-        self.contracts = load_enabled_contracts(self.cfg.workflow_dir, PLUGIN_DIR)
+        self.contracts = load_contracts(self.cfg.workflow_dir, PLUGIN_DIR)
+        self.model_contracts = [
+            contract for contract in self.contracts if contract.model_visible
+        ]
         self.adapter = WorkflowToolAdapter(
             self.access,
             WorkflowExecutor(self.client),
             self.gate,
             self.jobs,
-            {contract.name: contract for contract in self.contracts},
+            {contract.name: contract for contract in self.model_contracts},
             self.cfg.output_dir,
+        )
+        self.interactive = InteractiveManager(
+            self.adapter,
+            execution.interactive_timeout_seconds,
         )
         self.function_tools = build_function_tools(self.adapter, __name__)
         self.cmd_ctx = CommandContext(
@@ -76,7 +84,8 @@ class ComfyUIPlugin(Star):
             self.access,
             self.client,
             PLUGIN_DIR,
-            tuple(contract.name for contract in self.contracts),
+            tuple(self.contracts),
+            self.interactive,
         )
         self.web = WebController(self)
         if hasattr(self.context, "register_web_api"):
@@ -89,7 +98,10 @@ class ComfyUIPlugin(Star):
             f"白名单: {len(self.access.whitelist_ids)} 条"
         )
         workflow_names = ", ".join(self.cmd_ctx.workflow_names) or "无"
-        logger.info(f"[ComfyUI] 启用的工作流: {workflow_names}")
+        model_names = ", ".join(c.name for c in self.model_contracts) or "无"
+        logger.info(
+            f"[ComfyUI] 可用工作流: {workflow_names} | 模型可见: {model_names}"
+        )
         logger.info(
             f"[ComfyUI] 执行上限: 并发 {self.gate.limit} | "
             f"超时 {execution.timeout_seconds} 秒 | "
@@ -110,23 +122,29 @@ class ComfyUIPlugin(Star):
         """重新读取并校验全部工具契约，在内存中刷新运行状态。
 
         Returns:
-            当前启用的工具名。
+            当前全部可用工作流名。
 
         Raises:
-            ContractError: 任一契约文件不可读、不符合 Schema 或启用契约语义不成立。
+            ContractError: 任一契约文件不可读、不符合 Schema 或语义不成立。
         """
-        contracts = load_enabled_contracts(self.cfg.workflow_dir, PLUGIN_DIR)
+        contracts = load_contracts(self.cfg.workflow_dir, PLUGIN_DIR)
+        model_contracts = [
+            contract for contract in contracts if contract.model_visible
+        ]
         self.contracts = contracts
+        self.model_contracts = model_contracts
         self.adapter.catalog.clear()
-        self.adapter.catalog.update({contract.name: contract for contract in contracts})
+        self.adapter.catalog.update(
+            {contract.name: contract for contract in model_contracts}
+        )
         names = tuple(contract.name for contract in contracts)
-        self.cmd_ctx = replace(self.cmd_ctx, workflow_names=names)
-        self._sync_tool_registration(bool(contracts))
-        logger.info(f"[ComfyUI] 工具契约已刷新，当前启用: {', '.join(names) or '无'}")
+        self.cmd_ctx = replace(self.cmd_ctx, contracts=tuple(contracts))
+        self._sync_tool_registration(bool(model_contracts))
+        logger.info(f"[ComfyUI] 工具契约已刷新，当前可用: {', '.join(names) or '无'}")
         return names
 
     def _sync_tool_registration(self, has_workflows: bool) -> None:
-        """在启用契约数量跨过零边界时同步注册或移除工作流工具。"""
+        """在模型可见契约数量跨过零边界时同步注册或移除工作流工具。"""
         if has_workflows and not self.function_tools:
             self.function_tools = build_function_tools(self.adapter, __name__)
             self.context.add_llm_tools(*self.function_tools)
@@ -142,7 +160,8 @@ class ComfyUIPlugin(Star):
         logger.info("[ComfyUI] 已移除工作流工具")
 
     async def terminate(self) -> None:
-        """插件卸载或重载时取消尚未完成的后台交付。"""
+        """插件卸载或重载时取消交互向导与尚未完成的后台交付。"""
+        await self.interactive.cancel_all()
         await self.jobs.cancel_all()
         logger.info("[ComfyUI] 插件已卸载")
 
@@ -172,6 +191,18 @@ class ComfyUIPlugin(Star):
     async def cmd_comfy_list(self, event: AstrMessageEvent):
         """列出工作流与契约状态。"""
         async for result in commands.list_workflows(self.cmd_ctx, event):
+            yield result
+
+    @comfy.command("run")
+    async def cmd_comfy_run(self, event: AstrMessageEvent):
+        """手动触发工作流并逐轮收集参数。"""
+        async for result in commands.run_workflow_command(self.cmd_ctx, event):
+            yield result
+
+    @comfy.command("cancel")
+    async def cmd_comfy_cancel(self, event: AstrMessageEvent):
+        """取消当前交互参数收集。"""
+        async for result in commands.cancel_workflow_command(self.cmd_ctx, event):
             yield result
 
     @comfy.command("check")

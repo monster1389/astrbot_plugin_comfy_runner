@@ -28,8 +28,8 @@ const OUTPUT_NODE_PATTERN = /Save|Preview|Output/;
 
 const STATUS_FILTERS = [
   ["all", "全部"],
-  ["enabled", "启用中"],
-  ["disabled", "已禁用"],
+  ["model_visible", "模型可见"],
+  ["command_only", "仅命令"],
   ["error", "有问题"],
   ["unconfigured", "无契约"],
 ];
@@ -90,8 +90,8 @@ export function renderStatusFilters(items, activeFilter) {
   const list = Array.isArray(items) ? items : [];
   const counts = {
     all: list.length,
-    enabled: list.filter((i) => i.has_workflow && i.has_contract && i.ok && i.enabled).length,
-    disabled: list.filter((i) => i.has_workflow && i.has_contract && i.ok && !i.enabled).length,
+    model_visible: list.filter((i) => i.has_workflow && i.has_contract && i.ok && i.model_visible).length,
+    command_only: list.filter((i) => i.has_workflow && i.has_contract && i.ok && !i.model_visible).length,
     error: list.filter((i) => !i.has_workflow || (i.has_contract && !i.ok)).length,
     unconfigured: list.filter((i) => i.has_workflow && !i.has_contract).length,
   };
@@ -200,7 +200,7 @@ export function renderModal(modal) {
             `<div class="modal-body">`,
             `<div class="drop-zone" data-modal-action="pick-file">`,
             `<p class="drop-zone-title">点击选择或把 ComfyUI API 格式 <code>.json</code> 拖到这里</p>`,
-            `<p class="muted-text">支持与已有工作流同名覆盖（若启用契约不受破坏）</p>`,
+            `<p class="muted-text">支持与已有工作流同名覆盖（若已有契约不受破坏）</p>`,
             `<button type="button" class="btn btn-primary">选择本地 .json 文件</button>`,
             `</div>`,
             `</div>`,
@@ -249,10 +249,10 @@ export function renderModal(modal) {
 
 function matchesStatus(item, statusFilter) {
   switch (statusFilter) {
-    case "enabled":
-      return item.has_workflow && item.has_contract && item.ok && item.enabled;
-    case "disabled":
-      return item.has_workflow && item.has_contract && item.ok && !item.enabled;
+    case "model_visible":
+      return item.has_workflow && item.has_contract && item.ok && item.model_visible;
+    case "command_only":
+      return item.has_workflow && item.has_contract && item.ok && !item.model_visible;
     case "error":
       return !item.has_workflow || (item.has_contract && !item.ok);
     case "unconfigured":
@@ -302,8 +302,8 @@ function workflowStatus(item) {
   if (!item.has_workflow) return { className: "badge-err", label: "缺工作流" };
   if (!item.has_contract) return { className: "badge-warn", label: "无契约" };
   if (!item.ok) return { className: "badge-err", label: "异常" };
-  if (!item.enabled) return { className: "badge-muted", label: "已禁用" };
-  return { className: "badge-ok", label: "启用正常" };
+  if (!item.model_visible) return { className: "badge-muted", label: "仅命令" };
+  return { className: "badge-ok", label: "模型可见" };
 }
 
 function renderWorkspaceHeader(detail, draft, state) {
@@ -333,10 +333,10 @@ function renderWorkspaceHeader(detail, draft, state) {
     `<div class="ws-meta-row">${fileBadges}</div>`,
     `</div>`,
     `<div class="ws-header-actions">`,
-    `<label class="switch-label header-switch" title="启用后该工作流工具对模型可用">`,
-    `<input type="checkbox" class="switch-input" data-basic-field="enabled"${draft.enabled ? " checked" : ""}>`,
+    `<label class="switch-label header-switch" title="开启后该工作流对模型工具可用；关闭时仍可通过 /comfy run 手动调用">`,
+    `<input type="checkbox" class="switch-input" data-basic-field="model_visible"${draft.model_visible ? " checked" : ""}>`,
     `<span class="switch-track"></span>`,
-    `<span class="switch-text">启用工具</span>`,
+    `<span class="switch-text">模型可见</span>`,
     `</label>`,
     `<button type="button" class="btn btn-sm" data-action="check-remote" title="重新拉取 ComfyUI 节点定义并核对">${ICONS.refresh}<span>连接 ComfyUI 核对</span></button>`,
     `<button type="button" id="btn-revert" class="btn btn-sm" data-action="revert-draft"${state.isDirty ? "" : " disabled"}>还原</button>`,
@@ -380,26 +380,24 @@ function renderRemotePill(detail, state) {
 function renderDeleteBanner(detail, state) {
   if (state.confirmDelete === "contract" && detail.has_contract) {
     return renderInlineConfirm(
-      "确认删除工具契约（.tool.json）？工作流文件会保留，但模型将不再看到该工具。",
+      "确认删除工具契约（.tool.json）？工作流文件会保留，但该工作流将无法被模型或 /comfy run 调用。",
     );
   }
   if (state.confirmDelete === "all" && detail.has_workflow) {
-    const enabledHint = detail.contract?.enabled
-      ? "当前已保存的工具契约仍处于启用状态，后端要求先停用或仅删除契约后才能删除工作流文件。"
+    const deleteHint = detail.contract?.model_visible
+      ? "当前契约对模型可见，确认要一并删除工作流文件与配套工具契约吗？此操作不可撤销。"
       : "确认删除工作流文件与配套工具契约？此操作不可撤销。";
-    return renderInlineConfirm(enabledHint, detail.contract?.enabled);
+    return renderInlineConfirm(deleteHint);
   }
   return "";
 }
 
-function renderInlineConfirm(hint, blocked = false) {
+function renderInlineConfirm(hint) {
   return [
     `<div class="inline-confirm">`,
     `<span class="inline-confirm-text">${ICONS.alert}<span>${escapeHtml(hint)}</span></span>`,
     `<span class="inline-confirm-actions">`,
-    blocked
-      ? `<button type="button" class="btn btn-sm" data-action="disable-and-delete">先停用再删除</button>`
-      : `<button type="button" class="btn btn-sm btn-danger" data-action="confirm-delete">确认删除</button>`,
+    `<button type="button" class="btn btn-sm btn-danger" data-action="confirm-delete">确认删除</button>`,
     `<button type="button" class="btn btn-sm" data-action="cancel-delete">取消</button>`,
     `</span>`,
     `</div>`,
@@ -951,7 +949,7 @@ function renderInspectPanel(detail, draft, state) {
     `<div class="section-body">`,
     `<div class="inspect-summary">`,
     `<div class="inspect-name"><code>${escapeHtml(localPreview.name || "未命名工具")}</code>` +
-      `<span class="badge ${localPreview.enabled ? "badge-ok" : "badge-muted"}">${localPreview.enabled ? "已启用" : "已禁用"}</span></div>`,
+      `<span class="badge ${localPreview.model_visible ? "badge-ok" : "badge-muted"}">${localPreview.model_visible ? "模型可见" : "仅命令"}</span></div>`,
     `<p class="inspect-desc">${escapeHtml(localPreview.description || "（暂未填写工具描述）")}</p>`,
     `</div>`,
     `<h4 class="subhead">可见参数</h4>`,

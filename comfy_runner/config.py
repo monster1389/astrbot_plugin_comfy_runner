@@ -66,11 +66,12 @@ def _policy(section: Mapping[str, Any], key: str) -> str:
 
 @dataclass(frozen=True, slots=True)
 class ExecutionSettings:
-    """单次执行的边界配置。"""
+    """单次执行与交互收集的边界配置。"""
 
     max_concurrency: int
     timeout_seconds: int
     poll_interval_seconds: float
+    interactive_timeout_seconds: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -154,6 +155,12 @@ class Config:
                 "配置项 poll_interval_seconds 必须大于 0，"
                 f"实际为 {poll_interval_seconds}",
             )
+        interactive_timeout = _integer(execution, "interactive_timeout_seconds")
+        if interactive_timeout < 10:
+            raise ConfigError(
+                "配置项 interactive_timeout_seconds 必须大于等于 10，"
+                f"实际为 {interactive_timeout}",
+            )
 
         return cls(
             server_address=_text(raw, "server_address"),
@@ -161,6 +168,7 @@ class Config:
                 max_concurrency=max_concurrency,
                 timeout_seconds=timeout_seconds,
                 poll_interval_seconds=poll_interval_seconds,
+                interactive_timeout_seconds=interactive_timeout,
             ),
             control=ControlSettings(
                 cooldown_seconds=_integer(control, "cooldown_seconds"),

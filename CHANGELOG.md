@@ -2,6 +2,14 @@
 
 ## 未发布
 
+### 手动命令执行与模型可见性
+
+- 工具契约 `enabled` 字段替换为 `model_visible`：所有配有 `.tool.json` 契约的工作流都在命令入口可见并参与完整校验与重名检查，仅 `model_visible: true` 的工作流才会注册进模型工具目录
+- 新增 `/comfy run [工作流名]` 与 `/comfy cancel`：通过用户级会话拦截实现不经过模型的多轮参数收集（支持 `enum`/工作流序号选择、布尔别名、`跳过`、剩余全可选时`立即执行`、直接发送附件或 `http(s)` 链接，命令模式禁止本地路径与 `file://` URI）
+- 向白名单普通用户开放简化版 `/comfy ls`（仅展示工作流名、说明与可见性，不暴露文件路径与错误细节）
+- `_conf_schema.json` 新增 `execution.interactive_timeout_seconds`（默认 `120` 秒），控制多轮向导空闲超时
+- 工作流管理页面（WebUI）同步更新为「模型可见 / 仅命令」筛选、徽章与开关，并移除删除工作流时的强制禁用拦截
+
 ### 跨平台与访问控制
 
 - `control.whitelist_group_ids` 替换为 `control.whitelist_ids`，同时管控群聊与私聊白名单；

@@ -88,13 +88,13 @@ class OutputMapping:
 
 @dataclass(frozen=True, slots=True)
 class ToolContract:
-    """一个工作流工具的完整契约。"""
+    """一个工作流的完整工具契约。"""
 
     path: Path
     version: int
     name: str
     description: str
-    enabled: bool
+    model_visible: bool
     inputs: dict[str, ParameterMapping]
     outputs: dict[str, OutputMapping]
 
@@ -463,7 +463,7 @@ def validate_arguments(contract: ToolContract, arguments: dict[str, Any]) -> Non
 
     Args:
         contract: 工具契约。
-        arguments: 模型给出的参数。
+        arguments: 调用给出的参数。
 
     Raises:
         ContractError: 缺少必填参数、出现未声明参数或取值不合法。
@@ -471,6 +471,25 @@ def validate_arguments(contract: ToolContract, arguments: dict[str, Any]) -> Non
     validator = Draft202012Validator(build_parameter_schema(contract))
     problems = [
         _argument_error(error, contract) for error in validator.iter_errors(arguments)
+    ]
+    if problems:
+        raise ContractError("\n".join(problems))
+
+
+def validate_parameter_value(parameter: ParameterMapping, value: Any) -> None:
+    """按单个参数的 Schema 校验输入值。
+
+    Args:
+        parameter: 参数映射定义。
+        value: 待校验的实参值。
+
+    Raises:
+        ContractError: 取值不符合参数类型或约束。
+    """
+    validator = Draft202012Validator(_parameter_schema(parameter))
+    problems = [
+        f"参数 {parameter.name} 取值不合法: {error.message}"
+        for error in validator.iter_errors(value)
     ]
     if problems:
         raise ContractError("\n".join(problems))
@@ -509,7 +528,7 @@ def _build_contract(path: Path, data: dict[str, Any]) -> ToolContract:
         version=data["version"],
         name=data["name"],
         description=data["description"],
-        enabled=data["enabled"],
+        model_visible=data["model_visible"],
         inputs=inputs,
         outputs=outputs,
     )

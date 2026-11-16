@@ -116,7 +116,7 @@ export function createDraftContract(stem, nodes) {
     version: 1,
     name: suggestToolName(stem),
     description: "",
-    enabled: false,
+    model_visible: false,
     inputs: {},
     outputs: defaultOutputs(nodes),
   };
@@ -138,7 +138,7 @@ export function contractToDraft(rawContract, stem, nodes) {
   return {
     name: source.name ?? suggestToolName(stem),
     description: source.description ?? "",
-    enabled: Boolean(source.enabled),
+    model_visible: Boolean(source.model_visible),
     inputs: inputRows(source.inputs),
     outputs: outputRows(source.outputs),
   };
@@ -180,7 +180,7 @@ export function draftToContract(draft) {
     version: 1,
     name: String(draft.name ?? "").trim(),
     description: String(draft.description ?? "").trim(),
-    enabled: Boolean(draft.enabled),
+    model_visible: Boolean(draft.model_visible),
     inputs,
     outputs,
   };
@@ -229,7 +229,7 @@ export function draftToSafeObject(draft) {
       version: 1,
       name: String(draft?.name ?? "").trim(),
       description: String(draft?.description ?? "").trim(),
-      enabled: Boolean(draft?.enabled),
+      model_visible: Boolean(draft?.model_visible),
       inputs,
       outputs,
     },
@@ -424,7 +424,7 @@ export function buildInspectPreview(draft) {
   return {
     name: String(draft?.name ?? "").trim(),
     description: String(draft?.description ?? "").trim(),
-    enabled: Boolean(draft?.enabled),
+    model_visible: Boolean(draft?.model_visible),
     parameters,
     visibleRows,
     hiddenKeys,

@@ -17,7 +17,7 @@ CONTRACT = {
     "version": 1,
     "name": "comfy_moss_t2i",
     "description": "使用 MOSS 工作流根据提示词生成图片",
-    "enabled": True,
+    "model_visible": True,
     "inputs": {
         "prompt": {
             "type": "string",
@@ -47,7 +47,7 @@ def setup(tmp_path: Path, monkeypatch, control: dict | None = None):
     workflow_dir = tmp_path / "plugin_data" / "workflow"
     workflow_dir.mkdir(parents=True, exist_ok=True)
     hidden = json.loads(json.dumps(CONTRACT))
-    hidden.update(enabled=False, name="comfy_hidden")
+    hidden.update(model_visible=False, name="comfy_hidden")
     for stem, contract in (("moss", CONTRACT), ("hidden", hidden)):
         (workflow_dir / f"{stem}.json").write_text(
             json.dumps(WORKFLOW),
@@ -213,8 +213,8 @@ def test_inspect_unknown_workflow_lists_available_names(tmp_path, monkeypatch):
     assert "comfy_moss_t2i" in summary
 
 
-def test_disabled_workflow_is_not_discoverable(tmp_path, monkeypatch):
-    """禁用的工作流既不出现在清单里，也不能查看。"""
+def test_command_only_workflow_is_not_discoverable_by_model(tmp_path, monkeypatch):
+    """仅命令可见的工作流既不出现在模型清单里，也不能被模型查看或执行。"""
     plugin, _ = setup(tmp_path, monkeypatch)
     event = FakeEvent(sender="9", group="2")
 

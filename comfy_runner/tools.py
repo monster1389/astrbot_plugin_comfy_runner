@@ -17,6 +17,7 @@ from .background import BackgroundJobs
 from .comfy import ComfyError, ExecutionTimeout, ExecutionUnknown
 from .contract import (
     ContractError,
+    ParameterMapping,
     ToolContract,
     contract_view,
     input_target_errors,
@@ -121,7 +122,7 @@ class WorkflowToolAdapter:
         return bool(self.catalog)
 
     async def list_workflows(self, event: AstrMessageEvent) -> str:
-        """列出已启用的工作流。
+        """列出对模型可见的工作流。
 
         Args:
             event: 触发本次调用的消息事件。
@@ -132,7 +133,7 @@ class WorkflowToolAdapter:
         Raises:
             WorkflowRejected: 准入未通过。
         """
-        self._admit(event)
+        self.admit(event)
         items = [
             {"name": contract.name, "description": contract.description}
             for _, contract in sorted(self.catalog.items())
@@ -153,7 +154,7 @@ class WorkflowToolAdapter:
             WorkflowRejected: 准入未通过。
             ContractError: 工作流不存在。
         """
-        self._admit(event)
+        self.admit(event)
         contract = self._contract(workflow)
         graph = read_workflow(contract.workflow_path)
         problems = input_target_errors(contract, graph, contract.path.name)
@@ -186,9 +187,41 @@ class WorkflowToolAdapter:
             ContractError: 工作流不存在或参数不合法。
             ComfyError: 提交失败或提交结果未知。
         """
-        self._admit(event)
+        self.admit(event)
         contract = self._contract(workflow)
         values = _arguments(arguments)
+        return await self.submit_contract(
+            event,
+            contract,
+            values,
+            Attachments.from_event(event),
+        )
+
+    async def submit_contract(
+        self,
+        event: AstrMessageEvent,
+        contract: ToolContract,
+        values: dict[str, Any],
+        attachments: Attachments,
+    ) -> str:
+        """校验参数、准入与并发后提交指定契约执行，并后台交付产物。
+
+        Args:
+            event: 触发本次调用的消息事件。
+            contract: 目标工具契约。
+            values: 调用参数字典。
+            attachments: 本次调用可用的附件集合。
+
+        Returns:
+            已提交状态说明。
+
+        Raises:
+            WorkflowRejected: 准入、敏感词、并发或冷却未通过。
+            ContractError: 参数不合法或工作流映射有误。
+            MediaError: 引用解析或上传失败。
+            ComfyError: 提交失败或提交结果未知。
+        """
+        self.admit(event)
         validate_arguments(contract, values)
         self._check_sensitive(contract, event, values)
 
@@ -201,11 +234,7 @@ class WorkflowToolAdapter:
             if not passed:
                 logger.info(f"[ComfyUI] 用户 {event.get_sender_id()} 冷却中")
                 raise WorkflowRejected(f"⚠️ 冷却中，请在 {remain} 秒后重试")
-            prompt_id = await self.executor.submit(
-                contract,
-                values,
-                Attachments.from_event(event),
-            )
+            prompt_id = await self.executor.submit(contract, values, attachments)
         except BaseException:
             self.gate.release()
             raise
@@ -220,7 +249,7 @@ class WorkflowToolAdapter:
         )
         return f"已提交工作流 {contract.name}，正在后台生成，完成后会自动发送到当前会话"
 
-    def _admit(self, event: AstrMessageEvent) -> None:
+    def admit(self, event: AstrMessageEvent) -> None:
         """只放行白名单群与未被全局锁定的会话。
 
         Args:
@@ -233,8 +262,42 @@ class WorkflowToolAdapter:
         if not allowed:
             raise WorkflowRejected(reason)
 
+    def ensure_parameter_sensitive(
+        self,
+        parameter: ParameterMapping,
+        event: AstrMessageEvent,
+        workflow_name: str,
+        value: Any,
+    ) -> None:
+        """检查单个自由文本参数是否触发敏感词。
+
+        Args:
+            parameter: 参数映射定义。
+            event: 触发本次调用的消息事件。
+            workflow_name: 工作流名称。
+            value: 待检查的参数值。
+
+        Raises:
+            WorkflowRejected: 命中敏感词。
+        """
+        if parameter.type != "string" or parameter.enum:
+            return
+        if not isinstance(value, str) or not value:
+            return
+        passed, words = self.access.check_sensitive(value, event)
+        if passed:
+            return
+        shown = "、".join(words[:5])
+        more = f" 等 {len(words)} 个" if len(words) > 5 else ""
+        logger.warning(
+            f"[ComfyUI] 用户 {event.get_sender_id()} 触发敏感词: {shown}"
+        )
+        raise WorkflowRejected(
+            f"🚫 检测到敏感词：{shown}{more}，无法执行 {workflow_name}"
+        )
+
     def _contract(self, name: str) -> ToolContract:
-        """按名称取出一个启用契约。
+        """按名称取出一个对模型可见的契约。
 
         Args:
             name: 工作流名称。
@@ -243,7 +306,7 @@ class WorkflowToolAdapter:
             对应的工具契约。
 
         Raises:
-            ContractError: 名称未对应任何启用契约。
+            ContractError: 名称未对应任何对模型可见的契约。
         """
         contract = self.catalog.get(name)
         if contract is None:
@@ -267,18 +330,14 @@ class WorkflowToolAdapter:
         Raises:
             WorkflowRejected: 命中敏感词。
         """
-        for text in _free_texts(contract, arguments):
-            passed, words = self.access.check_sensitive(text, event)
-            if passed:
-                continue
-            shown = "、".join(words[:5])
-            more = f" 等 {len(words)} 个" if len(words) > 5 else ""
-            logger.warning(
-                f"[ComfyUI] 用户 {event.get_sender_id()} 触发敏感词: {shown}"
-            )
-            raise WorkflowRejected(
-                f"🚫 检测到敏感词：{shown}{more}，无法执行 {contract.name}"
-            )
+        for name, parameter in contract.inputs.items():
+            if name in arguments:
+                self.ensure_parameter_sensitive(
+                    parameter,
+                    event,
+                    contract.name,
+                    arguments[name],
+                )
 
     async def _deliver(
         self,
@@ -450,23 +509,3 @@ def _arguments(raw: dict[str, Any] | None) -> dict[str, Any]:
     if not isinstance(raw, dict):
         raise ContractError(f"参数 arguments 必须是对象，实际为 {type(raw).__name__}")
     return raw
-
-
-def _free_texts(contract: ToolContract, arguments: dict[str, Any]) -> list[str]:
-    """取出需要检查敏感词的自由文本参数。
-
-    Args:
-        contract: 工具契约。
-        arguments: 本次调用的参数。
-
-    Returns:
-        需要检查的文本。
-    """
-    texts: list[str] = []
-    for name, parameter in contract.inputs.items():
-        if parameter.type != "string" or parameter.enum:
-            continue
-        value = arguments.get(name)
-        if isinstance(value, str) and value:
-            texts.append(value)
-    return texts

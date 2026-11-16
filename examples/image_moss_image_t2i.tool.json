@@ -2,7 +2,7 @@
   "version": 1,
   "name": "comfy_moss_t2i",
   "description": "使用 MOSS 工作流根据提示词生成图片",
-  "enabled": true,
+  "model_visible": true,
   "inputs": {
     "prompt": {
       "type": "string",

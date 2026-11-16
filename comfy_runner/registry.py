@@ -1,4 +1,4 @@
-"""契约扫描、启动校验与已启用的契约集合。"""
+"""契约扫描、启动校验与契约集合。"""
 
 from __future__ import annotations
 
@@ -29,9 +29,9 @@ class ContractReport:
         return not self.errors
 
     @property
-    def enabled(self) -> bool:
-        """契约可用且声明为启用时为 True。"""
-        return self.contract is not None and self.contract.enabled
+    def model_visible(self) -> bool:
+        """契约可用且声明对模型可见时为 True。"""
+        return self.contract is not None and self.contract.model_visible
 
 
 def discover_contracts(workflow_dir: Path) -> list[Path]:
@@ -49,7 +49,7 @@ def discover_contracts(workflow_dir: Path) -> list[Path]:
 
 
 def inspect_contracts(workflow_dir: Path, plugin_dir: Path) -> list[ContractReport]:
-    """检查全部契约，包含禁用契约。
+    """检查全部契约。
 
     Args:
         workflow_dir: 工作流目录。
@@ -76,33 +76,27 @@ def inspect_contracts(workflow_dir: Path, plugin_dir: Path) -> list[ContractRepo
     return _with_name_errors(reports)
 
 
-def load_enabled_contracts(workflow_dir: Path, plugin_dir: Path) -> list[ToolContract]:
-    """构建已启用且全部合法的契约集合。
+def load_contracts(workflow_dir: Path, plugin_dir: Path) -> list[ToolContract]:
+    """构建全部合法的契约集合。
 
     Args:
         workflow_dir: 工作流目录。
         plugin_dir: 插件根目录。
 
     Returns:
-        按工具名排序的启用契约；没有启用契约时为空列表。
+        按工具名排序的契约列表；没有契约时为空列表。
 
     Raises:
-        ContractError: 任一文件不符合格式，或任一启用契约语义不成立。
+        ContractError: 任一契约文件不符合格式、语义不成立或名称重复。
     """
     reports = inspect_contracts(workflow_dir, plugin_dir)
-    blocking = [
-        report
-        for report in reports
-        if not report.ok and (report.contract is None or report.contract.enabled)
-    ]
+    blocking = [report for report in reports if not report.ok]
     if blocking:
         detail = "\n".join(error for report in blocking for error in report.errors)
         raise ContractError(f"工具契约不合法:\n{detail}")
 
     contracts = [
-        report.contract
-        for report in reports
-        if report.enabled and report.contract is not None
+        report.contract for report in reports if report.contract is not None
     ]
     contracts.sort(key=lambda contract: contract.name)
     return contracts
@@ -112,7 +106,7 @@ def _with_name_errors(reports: list[ContractReport]) -> list[ContractReport]:
     grouped: dict[str, list[ContractReport]] = {}
     for report in reports:
         contract = report.contract
-        if contract is None or not contract.enabled:
+        if contract is None:
             continue
         grouped.setdefault(contract.name, []).append(report)
 

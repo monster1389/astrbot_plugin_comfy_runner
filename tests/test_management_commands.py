@@ -15,7 +15,7 @@ CONTRACT = {
     "version": 1,
     "name": "comfy_moss_t2i",
     "description": "使用 MOSS 工作流根据提示词生成图片",
-    "enabled": True,
+    "model_visible": True,
     "inputs": {
         "prompt": {
             "type": "string",
@@ -48,35 +48,48 @@ def write_workflow_dir(tmp_path: Path) -> Path:
 
 
 def test_list_command_shows_pairing(tmp_path, monkeypatch):
-    """/comfy ls 展示工作流与契约的配对、启用与校验状态。"""
+    """管理员执行 /comfy ls 展示工作流与契约的配对、可见性与校验状态。"""
     workflow_dir = write_workflow_dir(tmp_path)
     (workflow_dir / "plain.json").write_text("{}", encoding="utf-8")
     (workflow_dir / "moss.steps.json").write_text("{}", encoding="utf-8")
-    orphan = dict(CONTRACT, name="comfy_orphan", enabled=False)
+    plugin, _ = make_plugin(tmp_path, monkeypatch, control=admin_overrides())
+
+    orphan = dict(CONTRACT, name="comfy_orphan", model_visible=False)
     (workflow_dir / "orphan.tool.json").write_text(
         json.dumps(orphan),
         encoding="utf-8",
     )
-
-    plugin, _ = make_plugin(tmp_path, monkeypatch, control=admin_overrides())
     results = collect(plugin.cmd_comfy_list(FakeEvent("/comfy ls", sender="9")))
 
-    assert "✅ moss.json -> comfy_moss_t2i [启用]" in results[0][1]
+    assert "✅ moss.json -> comfy_moss_t2i [模型可见]" in results[0][1]
     assert "⚠️ plain.json 无配套契约" in results[0][1]
-    assert "❌ orphan.tool.json -> comfy_orphan [禁用] 缺少工作流 orphan.json" in (
-        results[0][1]
+    assert (
+        "❌ orphan.tool.json -> comfy_orphan [仅命令] 缺少工作流 orphan.json"
+        in results[0][1]
     )
     assert "moss.steps.json" not in results[0][1]
 
 
-def test_list_command_requires_admin(tmp_path, monkeypatch):
-    """/comfy ls 仅管理员可用。"""
-    write_workflow_dir(tmp_path)
+def test_list_command_shows_user_workflows_without_paths(tmp_path, monkeypatch):
+    """白名单普通用户执行 /comfy ls 只看可用工作流，不暴露文件与目录路径。"""
+    workflow_dir = write_workflow_dir(tmp_path)
+    (workflow_dir / "cmd_only.json").write_text(
+        json.dumps(WORKFLOW),
+        encoding="utf-8",
+    )
+    (workflow_dir / "cmd_only.tool.json").write_text(
+        json.dumps(dict(CONTRACT, name="comfy_cmd_only", model_visible=False)),
+        encoding="utf-8",
+    )
     plugin, _ = make_plugin(tmp_path, monkeypatch, control=admin_overrides())
 
     results = collect(plugin.cmd_comfy_list(FakeEvent("/comfy ls", sender="5")))
+    text = results[0][1]
 
-    assert "权限不足" in results[0][1]
+    assert "comfy_moss_t2i [模型可见]" in text
+    assert "comfy_cmd_only [仅命令]" in text
+    assert "moss.json" not in text
+    assert "目录:" not in text
 
 
 def test_help_command_lists_enabled_workflows(tmp_path, monkeypatch):
@@ -86,7 +99,8 @@ def test_help_command_lists_enabled_workflows(tmp_path, monkeypatch):
 
     results = collect(plugin.cmd_comfy_help(FakeEvent("/comfy help", sender="9")))
 
-    assert "已启用工作流：comfy_moss_t2i" in results[0][1]
+    assert "可用工作流：comfy_moss_t2i" in results[0][1]
+    assert "/comfy run" in results[0][1]
     assert "/comfy check" in results[0][1]
     assert "/comfy reload" in results[0][1]
     assert "/comfy save" not in results[0][1]
@@ -131,15 +145,15 @@ def test_lock_command_toggles_lockdown(tmp_path, monkeypatch):
 def test_check_command_reports_contract_errors(tmp_path, monkeypatch):
     """/comfy check 报告契约问题并定位到参数与节点字段。"""
     workflow_dir = write_workflow_dir(tmp_path)
+    plugin, _ = make_plugin(tmp_path, monkeypatch, control=admin_overrides())
     broken = json.loads(json.dumps(CONTRACT))
-    broken.update(name="comfy_broken", enabled=False)
+    broken.update(name="comfy_broken", model_visible=False)
     broken["inputs"]["prompt"]["target"] = {"node": "99", "field": "text"}
     (workflow_dir / "moss.tool.json").write_text(
         json.dumps(broken),
         encoding="utf-8",
     )
 
-    plugin, _ = make_plugin(tmp_path, monkeypatch, control=admin_overrides())
     results = collect(plugin.cmd_comfy_check(FakeEvent("/comfy check", sender="9")))
 
     assert "参数 prompt 的目标节点 99 不存在" in results[0][1]
@@ -192,7 +206,7 @@ def test_reload_command_registers_new_contract(tmp_path, monkeypatch):
     )
     results = collect(plugin.cmd_comfy_reload(FakeEvent("/comfy reload", sender="9")))
 
-    assert "已重新加载工具契约，当前启用：comfy_moss_t2i" in results[0][1]
+    assert "已重新加载工具契约，当前可用：comfy_moss_t2i" in results[0][1]
     assert [tool.name for tool in plugin.context.llm_tools] == [
         "comfy_list",
         "comfy_inspect",
@@ -201,7 +215,7 @@ def test_reload_command_registers_new_contract(tmp_path, monkeypatch):
     listed = run_tool(plugin, "comfy_list", FakeEvent("/comfy list", sender="9"))
     assert "comfy_moss_t2i" in listed
     help_text = collect(plugin.cmd_comfy_help(FakeEvent("/comfy help", sender="9")))
-    assert "已启用工作流：comfy_moss_t2i" in help_text[0][1]
+    assert "可用工作流：comfy_moss_t2i" in help_text[0][1]
 
 
 def test_reload_command_removes_tools_when_contracts_disappear(tmp_path, monkeypatch):
@@ -214,7 +228,7 @@ def test_reload_command_removes_tools_when_contracts_disappear(tmp_path, monkeyp
     (workflow_dir / "moss.tool.json").unlink()
     results = collect(plugin.cmd_comfy_reload(FakeEvent("/comfy reload", sender="9")))
 
-    assert "当前启用：无" in results[0][1]
+    assert "当前可用：无" in results[0][1]
     assert plugin.function_tools == []
     assert plugin.context.llm_tools == []
 

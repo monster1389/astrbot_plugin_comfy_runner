@@ -153,9 +153,9 @@ function renderTopbar() {
   elements.workflowDirWrap.title = `工作流目录: ${dir}`;
 
   const total = state.items.length;
-  const enabled = state.items.filter((i) => i.has_workflow && i.has_contract && i.ok && i.enabled).length;
+  const modelVisible = state.items.filter((i) => i.has_workflow && i.has_contract && i.ok && i.model_visible).length;
   const broken = state.items.filter((i) => !i.has_workflow || (i.has_contract && !i.ok)).length;
-  const parts = [`${total} 个工作流`, `${enabled} 个启用`];
+  const parts = [`${total} 个工作流`, `${modelVisible} 个模型可见`];
   if (broken > 0) parts.push(`${broken} 个异常`);
   elements.summaryStats.textContent = parts.join(" · ");
 
@@ -394,16 +394,9 @@ async function runServerPreview(remote) {
   refreshValidationStripInPlace();
 }
 
-async function deleteSelection(forceDisableFirst = false) {
+async function deleteSelection() {
   const scope = state.uiState.confirmDelete;
   if (scope !== "contract" && scope !== "all") return;
-  if (forceDisableFirst && scope === "all" && state.detail?.contract) {
-    const disabledContract = { ...state.detail.contract, enabled: false };
-    await bridge.apiPost(SAVE_ROUTE, {
-      stem: state.selectedStem,
-      contract: disabledContract,
-    });
-  }
   const result = await bridge.apiPost(DELETE_ROUTE, {
     stem: state.selectedStem,
     scope,
@@ -707,8 +700,8 @@ function revertDraft() {
 
 function updateBasics(field, target) {
   if (!state.draft) return;
-  if (field === "enabled") {
-    state.draft.enabled = target.checked;
+  if (field === "model_visible") {
+    state.draft.model_visible = target.checked;
     syncDirtyState();
     scheduleLivePreview();
     return;
@@ -871,10 +864,7 @@ function handleActionClick(event) {
       renderWorkspace();
       return;
     case "confirm-delete":
-      runTask(() => deleteSelection(false));
-      return;
-    case "disable-and-delete":
-      runTask(() => deleteSelection(true));
+      runTask(() => deleteSelection());
       return;
     case "cancel-delete":
       state.uiState.confirmDelete = null;

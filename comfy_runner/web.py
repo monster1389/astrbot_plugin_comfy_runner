@@ -118,7 +118,7 @@ class WebController:
         return json_response(
             {
                 "workflow_dir": str(workflow_dir),
-                "active_tools": _active_tools(self.plugin.contracts),
+                "active_tools": _active_tools(self.plugin.model_contracts),
                 "items": items,
             }
         )
@@ -216,13 +216,12 @@ class WebController:
         except ContractError as exc:
             return error_response(str(exc), status_code=400)
 
-        if contract.enabled:
-            problems = validate_contract(contract)
-            problems.extend(
-                _duplicate_name_errors(workflow_dir, contract_path, contract, schema)
-            )
-            if problems:
-                return error_response("\n".join(problems), status_code=400)
+        problems = validate_contract(contract)
+        problems.extend(
+            _duplicate_name_errors(workflow_dir, contract_path, contract, schema)
+        )
+        if problems:
+            return error_response("\n".join(problems), status_code=400)
 
         serialized = json.dumps(contract_data, ensure_ascii=False, indent=2) + "\n"
         previous = (
@@ -324,17 +323,11 @@ class WebController:
                 {
                     "deleted": "contract",
                     "stem": stem,
-                    "active_tools": _active_tools(self.plugin.contracts),
+                    "active_tools": _active_tools(self.plugin.model_contracts),
                 }
             )
 
         if scope == "all":
-            if contract_path.is_file() and not _is_disabled(contract_path):
-                return error_response(
-                    "该工作流关联的工具契约仍处于启用状态，"
-                    "请先停用或仅删除工具契约后再删除工作流文件",
-                    status_code=400,
-                )
             if not contract_path.is_file() and not workflow_path.is_file():
                 return error_response(f"工作流 {stem} 不存在", status_code=404)
             contract_path.unlink(missing_ok=True)
@@ -344,7 +337,7 @@ class WebController:
                 {
                     "deleted": "all",
                     "stem": stem,
-                    "active_tools": _active_tools(self.plugin.contracts),
+                    "active_tools": _active_tools(self.plugin.model_contracts),
                 }
             )
 
@@ -411,7 +404,7 @@ class WebController:
             "ok": not errors,
             "errors": errors,
             "inspect_preview": preview,
-            "active_tools": _active_tools(self.plugin.contracts),
+            "active_tools": _active_tools(self.plugin.model_contracts),
         }
 
     async def _item(
@@ -453,7 +446,7 @@ class WebController:
             "has_workflow": workflow_path.is_file(),
             "contract_file": contract_path.name,
             "has_contract": contract_path.is_file(),
-            "enabled": contract.enabled if contract is not None else False,
+            "model_visible": contract.model_visible if contract is not None else False,
             "tool_name": contract.name if contract is not None else None,
             "description": contract.description if contract is not None else None,
             "ok": not errors,
@@ -674,12 +667,10 @@ def _upload_conflict(contract_path: Path, data: dict[str, Any]) -> str | None:
         contract = load_contract(contract_path, schema)
     except ContractError as exc:
         return f"同名工具契约 {contract_path.name} 无法读取，请先修复或删除:\n{exc}"
-    if not contract.enabled:
-        return None
     problems = graph_target_errors(contract, data, contract_path.name)
     if not problems:
         return None
-    return "新工作流会导致已启用契约失效:\n" + "\n".join(problems)
+    return "新工作流会导致已有契约失效:\n" + "\n".join(problems)
 
 
 def _duplicate_name_errors(
@@ -696,19 +687,11 @@ def _duplicate_name_errors(
             other = load_contract(path, schema)
         except ContractError:
             continue
-        if other.enabled and other.name == contract.name:
+        if other.name == contract.name:
             others.append(path.name)
     if not others:
         return []
     return [f"{contract_path.name}: 工具名 {contract.name} 与 {', '.join(others)} 重复"]
-
-
-def _is_disabled(contract_path: Path) -> bool:
-    try:
-        contract = load_contract(contract_path, load_contract_schema(PLUGIN_DIR))
-    except ContractError:
-        return False
-    return not contract.enabled
 
 
 def _restore(path: Path, previous: str | None) -> None:

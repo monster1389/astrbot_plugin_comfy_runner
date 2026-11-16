@@ -18,7 +18,7 @@ CONTRACT = {
     "version": 1,
     "name": "comfy_i2i",
     "description": "按参考图重绘",
-    "enabled": True,
+    "model_visible": True,
     "inputs": {
         "prompt": {
             "type": "string",

@@ -24,6 +24,11 @@
         "description": "查询执行状态的间隔（秒）",
         "type": "float",
         "default": 1.0
+      },
+      "interactive_timeout_seconds": {
+        "description": "手动命令多轮参数收集的空闲超时时间（秒）",
+        "type": "int",
+        "default": 120
       }
     }
   },

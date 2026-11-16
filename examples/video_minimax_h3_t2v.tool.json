@@ -2,7 +2,7 @@
   "version": 1,
   "name": "comfy_minimax_h3_t2v",
   "description": "使用 MiniMax H3 工作流根据提示词生成带音频的短视频",
-  "enabled": true,
+  "model_visible": true,
   "inputs": {
     "prompt": {
       "type": "string",
