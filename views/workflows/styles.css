@@ -654,6 +654,7 @@ code {
   position: relative;
   flex: 1;
   min-height: 0;
+  overflow: hidden;
   display: grid;
   grid-template-columns: minmax(0, 1fr);
 }
@@ -793,6 +794,7 @@ code {
 }
 
 .switch-label {
+  position: relative;
   display: inline-flex;
   align-items: center;
   gap: 8px;

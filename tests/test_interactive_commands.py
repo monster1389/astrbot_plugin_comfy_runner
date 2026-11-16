@@ -157,6 +157,7 @@ def test_command_only_workflow_runs_multi_turn_without_llm_tools(
 
             pick = FakeEvent("1", sender="5", group="2")
             assert await dispatch_reply(pick) is True
+            assert "工作流：comfy_cmd_demo" in sent_texts(pick)[0]
             assert "[1/4] prompt" in sent_texts(pick)[0]
             assert "prefix" not in sent_texts(pick)[0]
 
@@ -387,6 +388,44 @@ def test_interactive_sensitive_cooldown_and_timeout(tmp_path, monkeypatch):
             assert "等待输入超时" in sent_texts(origin)[0]
             late = FakeEvent("晚了", sender="7", group="2")
             assert await dispatch_reply(late) is False
+        finally:
+            await plugin.terminate()
+
+    asyncio.run(scenario())
+
+
+def test_interactive_run_by_index_and_rejects_extra_args(tmp_path, monkeypatch):
+    """支持通过 /comfy run <序号> 直接启动，多参数与越界序号不开启向导。"""
+    plugin, server = setup_workflows(tmp_path, monkeypatch)
+
+    async def scenario():
+        try:
+            extra = FakeEvent("/comfy run 1 一只猫", sender="5", group="2")
+            extra_res = await run_cmd(plugin, extra)
+            assert "参数请在进入向导后逐轮输入" in extra_res[0][1]
+            chat = FakeEvent("普通聊天", sender="5", group="2")
+            assert await dispatch_reply(chat) is False
+
+            oob = FakeEvent("/comfy run 9", sender="5", group="2")
+            oob_res = await run_cmd(plugin, oob)
+            assert "未找到工作流：9" in oob_res[0][1]
+            assert "1. comfy_cmd_demo" in oob_res[0][1]
+            chat = FakeEvent("普通聊天", sender="5", group="2")
+            assert await dispatch_reply(chat) is False
+
+            start = FakeEvent("/comfy run 1", sender="5", group="2")
+            out = await run_cmd(plugin, start)
+            assert "工作流：comfy_cmd_demo" in out[0][1]
+            assert "[1/4] prompt" in out[0][1]
+
+            await dispatch_reply(FakeEvent("一只白猫", sender="5", group="2"))
+            await dispatch_reply(FakeEvent("1", sender="5", group="2"))
+            done = FakeEvent("立即执行", sender="5", group="2")
+            await dispatch_reply(done)
+            assert "已提交工作流 comfy_cmd_demo" in sent_texts(done)[0]
+            await asyncio.gather(*list(plugin.jobs.tasks), return_exceptions=True)
+            assert len(server.submissions) == 1
+            assert server.submissions[0]["1"]["inputs"]["text"] == "一只白猫"
         finally:
             await plugin.terminate()
 

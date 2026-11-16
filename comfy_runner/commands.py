@@ -81,7 +81,7 @@ async def help_command(
         "【指令】",
         "  /comfy help         显示此帮助",
         "  /comfy ls           查看可用工作流",
-        "  /comfy run [工作流] 手动触发工作流",
+        "  /comfy run [序号或工作流] 手动触发工作流",
         "  /comfy cancel       取消当前参数收集",
     ]
 
@@ -236,22 +236,48 @@ async def list_workflows(
         path.name for path in workflow_dir.glob("*.json") if not is_aux_file(path.name)
     )
 
-    lines = ["工作流与契约", f"目录: {workflow_dir}", ""]
+    run_index = {
+        contract.name: index for index, contract in enumerate(ctx.contracts, start=1)
+    }
+    numbered: list[tuple[int, str]] = []
+    others: list[str] = []
     handled: set[Path] = set()
+
     for name in files:
         contract_path = workflow_dir / f"{Path(name).stem}{CONTRACT_SUFFIX}"
         handled.add(contract_path)
-        lines.append(_workflow_line(name, reports.get(contract_path)))
+        report = reports.get(contract_path)
+        if (
+            report is not None
+            and report.ok
+            and report.contract is not None
+            and report.contract.name in run_index
+        ):
+            idx = run_index[report.contract.name]
+            numbered.append((idx, f"{idx}. {_workflow_line(name, report)}"))
+            continue
+        if report is not None and report.ok and report.contract is not None:
+            others.append(f"{_workflow_line(name, report)}（待 /comfy reload 生效）")
+            continue
+        others.append(_workflow_line(name, report))
 
     for path in sorted(reports):
         if path in handled:
             continue
-        lines.append(_orphan_line(reports[path]))
+        others.append(_orphan_line(reports[path]))
 
-    if len(lines) == 3:
+    lines = ["工作流与契约", f"目录: {workflow_dir}", ""]
+    numbered.sort(key=lambda item: item[0])
+    lines.extend(line for _, line in numbered)
+    if numbered and others:
+        lines.append("")
+    lines.extend(others)
+    if not numbered and not others:
         lines.append("目录中没有工作流文件")
     lines.append("")
-    lines.append("新增或修正契约后用 /comfy check 查看细节")
+    lines.append(
+        "发送 /comfy run [序号或工作流名] 可直接调用；用 /comfy check 查看细节"
+    )
     yield event.plain_result("\n".join(lines))
 
 
@@ -281,10 +307,10 @@ def _user_workflow_list(contracts: tuple[ToolContract, ...]) -> str:
     if not contracts:
         return "当前没有可用的工作流"
     lines = ["可用工作流：", ""]
-    for contract in contracts:
+    for index, contract in enumerate(contracts, start=1):
         scope = "模型可见" if contract.model_visible else "仅命令"
-        lines.append(f"- {contract.name} [{scope}]：{contract.description}")
-    lines.extend(["", "发送 /comfy run [工作流名] 可直接调用。"])
+        lines.append(f"{index}. {contract.name} [{scope}]：{contract.description}")
+    lines.extend(["", "发送 /comfy run [序号或工作流名] 可直接调用。"])
     return "\n".join(lines)
 
 

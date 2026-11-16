@@ -187,6 +187,7 @@ function renderWorkspace(options = {}) {
   state.uiState.localIssues = collectLocalDraftIssues(state.draft, state.detail.nodes);
   elements.workspace.innerHTML = renderWorkspaceHtml(state.detail, state.draft, state.uiState);
 
+  elements.workspace.scrollTop = 0;
   if (!options.resetScroll) {
     const nextMain = elements.workspace.querySelector(".ws-main");
     if (nextMain) nextMain.scrollTop = mainScroll;

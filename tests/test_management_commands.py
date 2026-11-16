@@ -61,7 +61,7 @@ def test_list_command_shows_pairing(tmp_path, monkeypatch):
     )
     results = collect(plugin.cmd_comfy_list(FakeEvent("/comfy ls", sender="9")))
 
-    assert "✅ moss.json -> comfy_moss_t2i [模型可见]" in results[0][1]
+    assert "1. ✅ moss.json -> comfy_moss_t2i [模型可见]" in results[0][1]
     assert "⚠️ plain.json 无配套契约" in results[0][1]
     assert (
         "❌ orphan.tool.json -> comfy_orphan [仅命令] 缺少工作流 orphan.json"
@@ -86,8 +86,8 @@ def test_list_command_shows_user_workflows_without_paths(tmp_path, monkeypatch):
     results = collect(plugin.cmd_comfy_list(FakeEvent("/comfy ls", sender="5")))
     text = results[0][1]
 
-    assert "comfy_moss_t2i [模型可见]" in text
-    assert "comfy_cmd_only [仅命令]" in text
+    assert "1. comfy_cmd_only [仅命令]" in text
+    assert "2. comfy_moss_t2i [模型可见]" in text
     assert "moss.json" not in text
     assert "目录:" not in text
 

@@ -170,10 +170,20 @@ class InteractiveManager:
             await self._launch_session(event, state)
             return _format_workflow_list(contracts)
 
-        contract = next((item for item in contracts if item.name == target), None)
+        parts = target.split()
+        if len(parts) > 1:
+            return (
+                "⚠️ 用法：/comfy run [序号或工作流名]，"
+                "参数请在进入向导后逐轮输入"
+            )
+
+        selector = parts[0]
+        contract = _pick_contract(contracts, selector)
         if contract is None:
-            available = ", ".join(item.name for item in contracts)
-            return f"❌ 未找到工作流：{target}\n可用工作流：{available}"
+            choices = "\n".join(
+                f"{idx}. {item.name}" for idx, item in enumerate(contracts, start=1)
+            )
+            return f"❌ 未找到工作流：{selector}\n可用工作流：\n{choices}"
 
         try:
             params, defaults = _prepare_contract(contract)
@@ -505,10 +515,15 @@ def _format_param_prompt(state: _WizardState) -> str:
     total = len(state.params)
     kind = TYPE_LABELS.get(param.type, param.type)
     req = "必填" if param.required else "可选"
-    lines = [
-        f"[{state.index + 1}/{total}] {param.name}（{kind}，{req}）",
-        f"说明：{param.description}",
-    ]
+    lines: list[str] = []
+    if state.index == 0 and state.contract is not None:
+        lines.append(f"工作流：{state.contract.name}")
+    lines.extend(
+        [
+            f"[{state.index + 1}/{total}] {param.name}（{kind}，{req}）",
+            f"说明：{param.description}",
+        ]
+    )
 
     if param.enum:
         lines.append("可选值（回复序号或原值）：")
