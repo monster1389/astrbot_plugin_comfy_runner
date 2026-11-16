@@ -870,3 +870,81 @@ def test_delete_all_refuses_unreadable_contract(tmp_path, monkeypatch):
     assert status == 400
     assert "仍处于启用状态" in body["message"]
     assert (workflow_dir / "moss.json").exists()
+
+
+def test_workflow_detail_caches_remote_node_defs_until_refresh(tmp_path, monkeypatch):
+    """连续拉取详情时复用节点定义缓存，传入 refresh 时强制重拉。"""
+    write_pair(tmp_path)
+    plugin, _ = make_plugin(tmp_path, monkeypatch, control=admin_overrides())
+    server = FakeComfyServer().install(monkeypatch)
+    calls = {"count": 0}
+    original_object_info = plugin.client.object_info
+
+    async def counting_object_info(class_type: str):
+        calls["count"] += 1
+        return await original_object_info(class_type)
+
+    monkeypatch.setattr(plugin.client, "object_info", counting_object_info)
+    server.object_info = {
+        "CLIPTextEncode": {"input": {"required": {"text": ["STRING", {}]}}},
+        "SaveImage": {"output_node": True, "input": {"required": {}}},
+    }
+
+    status1, body1 = call_api(
+        plugin,
+        "GET",
+        DETAIL_ROUTE,
+        query={"stem": "moss", "remote": "true"},
+    )
+    assert status1 == 200
+    assert body1["ok"] is True
+    assert calls["count"] == 2
+
+    status2, _ = call_api(
+        plugin,
+        "GET",
+        DETAIL_ROUTE,
+        query={"stem": "moss", "remote": "true"},
+    )
+    assert status2 == 200
+    assert calls["count"] == 2
+
+    status3, _ = call_api(
+        plugin,
+        "GET",
+        DETAIL_ROUTE,
+        query={"stem": "moss", "remote": "true", "refresh": "true"},
+    )
+    assert status3 == 200
+    assert calls["count"] == 4
+
+
+def test_workflow_detail_does_not_cache_remote_failures(tmp_path, monkeypatch):
+    """远端获取失败时不写入长期缓存，服务恢复后再次打开可立即成功。"""
+    write_pair(tmp_path)
+    plugin, _ = make_plugin(tmp_path, monkeypatch, control=admin_overrides())
+    server = FakeComfyServer().install(monkeypatch)
+    server.object_info_status = 500
+
+    status1, body1 = call_api(
+        plugin,
+        "GET",
+        DETAIL_ROUTE,
+        query={"stem": "moss", "remote": "true"},
+    )
+    assert status1 == 200
+    assert body1["ok"] is False
+
+    server.object_info_status = 200
+    server.object_info = {
+        "CLIPTextEncode": {"input": {"required": {"text": ["STRING", {}]}}},
+        "SaveImage": {"output_node": True, "input": {"required": {}}},
+    }
+    status2, body2 = call_api(
+        plugin,
+        "GET",
+        DETAIL_ROUTE,
+        query={"stem": "moss", "remote": "true"},
+    )
+    assert status2 == 200
+    assert body2["ok"] is True

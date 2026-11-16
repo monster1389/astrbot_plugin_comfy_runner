@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -35,6 +36,7 @@ if TYPE_CHECKING:
 
 PLUGIN_NAME = "astrbot_plugin_comfy_runner"
 BASE_ROUTE = f"/{PLUGIN_NAME}"
+WEB_OBJECT_INFO_TIMEOUT = 4.0
 
 
 class WebController:
@@ -47,6 +49,7 @@ class WebController:
             plugin: 已装配的插件。
         """
         self.plugin = plugin
+        self._node_def_cache: dict[str, dict[str, Any]] = {}
 
     def register(self, context: Context) -> None:
         """把固定路由注册到 AstrBot 的插件 Web API。
@@ -104,6 +107,9 @@ class WebController:
         workflow_dir = self.plugin.cfg.workflow_dir
         reports = _reports(workflow_dir)
         remote = _remote_flag(request.query.get("remote"))
+        refresh = _remote_flag(request.query.get("refresh"))
+        if remote and refresh:
+            self._node_def_cache.clear()
         cache: dict[str, dict[str, Any] | str] = {}
         items = [
             await self._item(stem, reports, remote, cache)
@@ -132,7 +138,10 @@ class WebController:
         if not has_workflow and not has_contract:
             return error_response(f"工作流 {stem} 不存在", status_code=404)
         remote = _remote_flag(request.query.get("remote"))
-        return json_response(await self._detail(stem, remote=remote))
+        refresh = _remote_flag(request.query.get("refresh"))
+        return json_response(
+            await self._detail(stem, remote=remote, refresh=refresh)
+        )
 
     async def upload_workflow(self) -> JSONResponse:
         """上传一份工作流文件，校验通过后写入并热刷新契约。
@@ -272,6 +281,7 @@ class WebController:
             node_defs, failures = await self._node_definitions(
                 _class_types(graph, _contract_node_ids(contract)),
                 {},
+                refresh=bool(payload.get("refresh")),
             )
             errors.extend(remote_target_errors(contract, graph, node_defs, failures))
 
@@ -340,12 +350,19 @@ class WebController:
 
         return error_response("删除范围只能是 contract 或 all", status_code=400)
 
-    async def _detail(self, stem: str, *, remote: bool) -> dict[str, Any]:
+    async def _detail(
+        self,
+        stem: str,
+        *,
+        remote: bool,
+        refresh: bool = False,
+    ) -> dict[str, Any]:
         """汇总一个工作流的节点、契约、校验结果与模型视图。
 
         Args:
             stem: 工作流文件名去掉 ``.json`` 的部分。
             remote: 是否用 ComfyUI 节点定义核对。
+            refresh: 是否忽略控制器缓存重新拉取。
 
         Returns:
             工作流详情字典。
@@ -372,7 +389,13 @@ class WebController:
                 nodes = _nodes(graph)
 
         if remote and graph:
-            await self._attach_remote(nodes, graph, contract, errors)
+            await self._attach_remote(
+                nodes,
+                graph,
+                contract,
+                errors,
+                refresh=refresh,
+            )
 
         preview = None
         if contract is not None and graph and not errors:
@@ -475,6 +498,8 @@ class WebController:
         graph: dict[str, Any],
         contract: ToolContract | None,
         errors: list[str],
+        *,
+        refresh: bool = False,
     ) -> None:
         """给每个节点附上远端定义信息，并核对契约目标。
 
@@ -483,9 +508,14 @@ class WebController:
             graph: 工作流图。
             contract: 配对的工具契约。
             errors: 要追加问题的列表。
+            refresh: 是否忽略进程级缓存并重新拉取远端定义。
         """
         class_types = {node["class_type"] for node in nodes if node["class_type"]}
-        node_defs, failures = await self._node_definitions(class_types, {})
+        node_defs, failures = await self._node_definitions(
+            class_types,
+            {},
+            refresh=refresh,
+        )
         for node in nodes:
             class_type = node["class_type"]
             problem = failures.get(class_type)
@@ -516,18 +546,27 @@ class WebController:
         self,
         class_types: set[str],
         cache: dict[str, dict[str, Any] | str],
+        *,
+        refresh: bool = False,
     ) -> tuple[dict[str, dict[str, Any]], dict[str, str]]:
-        """读取节点类型定义，成功与失败分别聚合。
+        """并发读取节点类型定义，成功结果写入控制器缓存，失败仅当次去重。
 
         Args:
             class_types: 要读取的节点类型。
             cache: 本次请求内的缓存，值为定义字典或失败原因。
+            refresh: 是否跳过控制器缓存重新拉取。
 
         Returns:
             节点类型到定义的映射，以及节点类型到失败原因的映射。
         """
+        if refresh:
+            for class_type in class_types:
+                self._node_def_cache.pop(class_type, None)
+
         node_defs: dict[str, dict[str, Any]] = {}
         failures: dict[str, str] = {}
+        missing: list[str] = []
+
         for class_type in sorted(class_types):
             if class_type in cache:
                 cached = cache[class_type]
@@ -536,16 +575,45 @@ class WebController:
                 else:
                     node_defs[class_type] = cached
                 continue
-            try:
-                definition = await self.plugin.client.object_info(class_type)
-            except ComfyError as exc:
-                cache[class_type] = str(exc)
-                failures[class_type] = str(exc)
-                logger.warning(f"[ComfyUI] 读取节点定义失败 {class_type}: {exc}")
+            if class_type in self._node_def_cache:
+                definition = self._node_def_cache[class_type]
+                cache[class_type] = definition
+                node_defs[class_type] = definition
                 continue
-            cache[class_type] = definition
-            node_defs[class_type] = definition
+            missing.append(class_type)
+
+        if missing:
+            results = await asyncio.gather(
+                *(self._fetch_node_definition(ct) for ct in missing)
+            )
+            for class_type, definition, error in results:
+                if error is not None or definition is None:
+                    reason = error or f"节点类型 {class_type} 无法核对"
+                    cache[class_type] = reason
+                    failures[class_type] = reason
+                    continue
+                self._node_def_cache[class_type] = definition
+                cache[class_type] = definition
+                node_defs[class_type] = definition
+
         return node_defs, failures
+
+    async def _fetch_node_definition(
+        self,
+        class_type: str,
+    ) -> tuple[str, dict[str, Any] | None, str | None]:
+        """以短超时读取单个节点类型定义，失败时返回原因。"""
+        try:
+            async with asyncio.timeout(WEB_OBJECT_INFO_TIMEOUT):
+                definition = await self.plugin.client.object_info(class_type)
+        except TimeoutError:
+            reason = f"读取节点定义超时（>{WEB_OBJECT_INFO_TIMEOUT:g}s）"
+            logger.warning(f"[ComfyUI] 读取节点定义失败 {class_type}: {reason}")
+            return class_type, None, reason
+        except ComfyError as exc:
+            logger.warning(f"[ComfyUI] 读取节点定义失败 {class_type}: {exc}")
+            return class_type, None, str(exc)
+        return class_type, definition, None
 
 
 def _is_safe_stem(stem: str) -> bool:

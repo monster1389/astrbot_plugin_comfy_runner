@@ -1,15 +1,25 @@
 /**
- * 工作流视图的交互：读取工作流、编辑契约草稿、调用后端 Web API。
+ * 工作流视图的交互逻辑：状态管理、防抖校验、节点浏览映射与 API 通信。
  *
- * 页面不直接读写工作流目录：全部请求经 AstrBot bridge 转给 comfy_runner/web.py，
- * HTML 生成交给 render.js，草稿与契约的转换交给 state.js。
+ * 所有后端请求经 AstrBot bridge 转发给 comfy_runner/web.py；
+ * HTML 拼接由 render.js 负责，状态转换与本地校验由 state.js 负责。
  */
 
-import { contractToDraft, draftToContract } from "./state.js";
 import {
-  escapeHtml,
-  renderWorkspace as renderWorkspaceHtml,
+  buildInputRowFromField,
+  buildOutputRowFromNode,
+  collectLocalDraftIssues,
+  contractToDraft,
+  draftSnapshot,
+  draftToContract,
+  draftToSafeObject,
+} from "./state.js";
+import {
+  renderModal,
+  renderStatusFilters,
+  renderValidationStripHtml,
   renderWorkflowList,
+  renderWorkspace as renderWorkspaceHtml,
 } from "./render.js";
 
 const LIST_ROUTE = "workflows";
@@ -18,10 +28,6 @@ const UPLOAD_ROUTE = "workflow/upload";
 const SAVE_ROUTE = "workflow/contract";
 const PREVIEW_ROUTE = "workflow/preview";
 const DELETE_ROUTE = "workflow/delete";
-
-const EMPTY_WORKSPACE = `<div class="empty-state">
-  <p>请从左侧选择一个工作流，或上传新的 ComfyUI API 格式工作流文件</p>
-</div>`;
 
 const REMOTE_TYPE_MAP = {
   INT: "integer",
@@ -35,6 +41,7 @@ const REMOTE_TYPE_MAP = {
 };
 
 const STRUCTURAL_INPUT_FIELDS = new Set(["type", "node", "field", "visible"]);
+const EMPTY_WORKSPACE_HTML = document.getElementById("workspace")?.innerHTML ?? "";
 
 const bridge = window.AstrBotPluginView || window.AstrBotPluginPage;
 
@@ -43,121 +50,197 @@ const state = {
   selectedStem: null,
   detail: null,
   draft: null,
+  baselineSnapshot: "",
   filterText: "",
+  statusFilter: "all",
   workflowDir: "",
-  activeTools: [],
   uiState: {
     activeTab: "form",
     confirmDelete: null,
+    moreMenuOpen: false,
+    nodeBrowserOpen: false,
+    browserSearch: "",
+    browserFilter: "tunable",
+    browserShowLinks: false,
+    validationExpanded: true,
+    showRawSchema: false,
+    remoteStatus: "idle",
+    expandedInputs: new Set(),
+    localIssues: [],
     errors: [],
     inspectPreview: null,
+    isDirty: false,
     busy: false,
   },
+  modal: null,
+  pendingAction: null,
 };
 
 const elements = {
-  banner: document.getElementById("global-banner"),
+  toast: document.getElementById("global-toast"),
   workflowDir: document.getElementById("workflow-dir"),
-  activeTools: document.getElementById("active-tools"),
+  workflowDirWrap: document.getElementById("workflow-dir-wrap"),
+  summaryStats: document.getElementById("summary-stats"),
+  statusFilters: document.getElementById("status-filters"),
   searchInput: document.getElementById("search-input"),
   workflowList: document.getElementById("workflow-list"),
   workspace: document.getElementById("workspace"),
   uploadInput: document.getElementById("upload-input"),
-  uploadButton: document.getElementById("btn-upload"),
-  checkLocalButton: document.getElementById("btn-check-local"),
+  importButton: document.getElementById("btn-import"),
   checkRemoteButton: document.getElementById("btn-check-remote"),
+  modalRoot: document.getElementById("modal-root"),
+  dropOverlay: document.getElementById("drop-overlay"),
 };
 
+let toastTimer = null;
+let previewTimer = null;
+let dragCounter = 0;
+
 /**
- * 在全局横幅里显示一条提示。
+ * 按 AstrBot URL 参数或系统偏好同步暗/亮色主题。
+ */
+function syncTheme() {
+  const params = new URLSearchParams(window.location.search);
+  const urlTheme = params.get("theme");
+  if (urlTheme === "dark" || urlTheme === "light") {
+    document.documentElement.dataset.theme = urlTheme;
+    return;
+  }
+  if (!document.documentElement.dataset.theme) {
+    const dark = window.matchMedia?.("(prefers-color-scheme: dark)")?.matches;
+    document.documentElement.dataset.theme = dark ? "dark" : "light";
+  }
+}
+
+/**
+ * 显示顶部非阻断提示条，支持自动收起。
  *
  * @param {string} message 提示文字。
- * @param {"ok"|"warn"|"err"} kind 提示等级。
+ * @param {"ok"|"warn"|"err"} kind 提示级别。
  */
-function showMessage(message, kind) {
-  elements.banner.textContent = message;
-  elements.banner.className = `banner banner-${kind ?? "ok"}`;
-  elements.banner.hidden = false;
+function showToast(message, kind = "ok") {
+  clearTimeout(toastTimer);
+  elements.toast.textContent = message;
+  elements.toast.className = `toast toast-${kind}`;
+  elements.toast.hidden = false;
+  toastTimer = setTimeout(() => {
+    elements.toast.hidden = true;
+  }, kind === "err" ? 6000 : 3200);
 }
 
-/**
- * 把异常显示成错误横幅。
- *
- * @param {unknown} error 捕获到的异常。
- */
 function showError(error) {
-  showMessage(error instanceof Error ? error.message : String(error), "err");
+  showToast(error instanceof Error ? error.message : String(error), "err");
 }
 
-/**
- * 渲染左侧列表。
- */
+function isDirty() {
+  if (!state.draft) return false;
+  return draftSnapshot(state.draft) !== state.baselineSnapshot;
+}
+
+function syncDirtyState() {
+  const dirty = isDirty();
+  state.uiState.isDirty = dirty;
+  const badge = document.getElementById("dirty-badge");
+  if (badge) badge.hidden = !dirty;
+  const revertBtn = document.getElementById("btn-revert");
+  if (revertBtn) revertBtn.disabled = !dirty;
+  renderList();
+}
+
+function renderTopbar() {
+  const dir = state.workflowDir || "未读取";
+  elements.workflowDir.textContent = dir;
+  elements.workflowDirWrap.title = `工作流目录: ${dir}`;
+
+  const total = state.items.length;
+  const enabled = state.items.filter((i) => i.has_workflow && i.has_contract && i.ok && i.enabled).length;
+  const broken = state.items.filter((i) => !i.has_workflow || (i.has_contract && !i.ok)).length;
+  const parts = [`${total} 个工作流`, `${enabled} 个启用`];
+  if (broken > 0) parts.push(`${broken} 个异常`);
+  elements.summaryStats.textContent = parts.join(" · ");
+
+  elements.statusFilters.innerHTML = renderStatusFilters(state.items, state.statusFilter);
+}
+
 function renderList() {
+  const dirtyStem = state.uiState.isDirty ? state.selectedStem : null;
   elements.workflowList.innerHTML = renderWorkflowList(
     state.items,
     state.selectedStem,
     state.filterText,
+    state.statusFilter,
+    dirtyStem,
   );
 }
 
-/**
- * 渲染顶栏的工作流目录与已启用工具。
- */
-function renderTopbar() {
-  elements.workflowDir.textContent = state.workflowDir || "未读取";
-  if (state.activeTools.length === 0) {
-    elements.activeTools.innerHTML = `<span class="chip chip-muted">无启用工具</span>`;
-    return;
-  }
-  elements.activeTools.innerHTML = state.activeTools
-    .map((name) => `<span class="chip">${escapeHtml(name)}</span>`)
-    .join("");
-}
-
-/**
- * 渲染右侧工作区，没有选中工作流时显示空状态。
- */
-function renderWorkspace() {
+function renderWorkspace(options = {}) {
   if (!state.detail || !state.draft) {
-    elements.workspace.innerHTML = EMPTY_WORKSPACE;
+    elements.workspace.innerHTML = EMPTY_WORKSPACE_HTML;
     return;
   }
-  elements.workspace.innerHTML = renderWorkspaceHtml(
-    state.detail,
-    state.draft,
-    state.uiState,
-  );
+  const mainEl = elements.workspace.querySelector(".ws-main");
+  const browserEl = elements.workspace.querySelector(".browser-list");
+  const mainScroll = mainEl ? mainEl.scrollTop : 0;
+  const browserScroll = browserEl ? browserEl.scrollTop : 0;
+
+  state.uiState.isDirty = isDirty();
+  state.uiState.localIssues = collectLocalDraftIssues(state.draft, state.detail.nodes);
+  elements.workspace.innerHTML = renderWorkspaceHtml(state.detail, state.draft, state.uiState);
+
+  if (!options.resetScroll) {
+    const nextMain = elements.workspace.querySelector(".ws-main");
+    if (nextMain) nextMain.scrollTop = mainScroll;
+    const nextBrowser = elements.workspace.querySelector(".browser-list");
+    if (nextBrowser) nextBrowser.scrollTop = browserScroll;
+  }
 }
 
-/**
- * 清空选中状态。
- */
+function refreshValidationStripInPlace() {
+  state.uiState.localIssues = collectLocalDraftIssues(state.draft, state.detail?.nodes);
+  const current = document.getElementById("validation-strip");
+  if (!current) return;
+  const wrapper = document.createElement("div");
+  wrapper.innerHTML = renderValidationStripHtml(state.uiState);
+  if (wrapper.firstElementChild) {
+    current.replaceWith(wrapper.firstElementChild);
+  }
+}
+
+function renderModalLayer() {
+  if (!state.modal) {
+    elements.modalRoot.hidden = true;
+    elements.modalRoot.innerHTML = "";
+    return;
+  }
+  elements.modalRoot.innerHTML = renderModal(state.modal);
+  elements.modalRoot.hidden = false;
+}
+
 function clearSelection() {
   state.selectedStem = null;
   state.detail = null;
   state.draft = null;
+  state.baselineSnapshot = "";
   state.uiState.confirmDelete = null;
+  state.uiState.moreMenuOpen = false;
   state.uiState.errors = [];
+  state.uiState.localIssues = [];
   state.uiState.inspectPreview = null;
+  state.uiState.isDirty = false;
+  state.uiState.expandedInputs = new Set();
   renderList();
-  renderWorkspace();
+  renderWorkspace({ resetScroll: true });
 }
 
-/**
- * 读取工作流列表，并同步顶栏与列表。
- *
- * @param {object} options 读取选项。
- * @param {boolean} options.remote 是否用 ComfyUI 节点定义核对。
- * @returns {Promise<object>} 后端返回的列表响应。
- */
 async function loadWorkflows(options = {}) {
-  const params = options.remote ? { remote: "true" } : {};
+  const params = {};
+  if (options.remote) params.remote = "true";
+  if (options.refresh) params.refresh = "true";
   const data = await bridge.apiGet(LIST_ROUTE, params);
   state.items = Array.isArray(data.items) ? data.items : [];
-  state.workflowDir =
-    typeof data.workflow_dir === "string" ? data.workflow_dir : "";
-  state.activeTools = Array.isArray(data.active_tools) ? data.active_tools : [];
+  state.workflowDir = typeof data.workflow_dir === "string" ? data.workflow_dir : "";
   renderTopbar();
+
   const stillListed =
     state.selectedStem !== null &&
     state.items.some((item) => item.stem === state.selectedStem);
@@ -169,89 +252,111 @@ async function loadWorkflows(options = {}) {
   return data;
 }
 
-/**
- * 选中一个工作流并读取详情。
- *
- * @param {string} stem 工作流文件名去掉 `.json` 的部分。
- */
-async function selectWorkflow(stem) {
+async function selectWorkflow(stem, options = {}) {
   if (!stem) return;
-  const detail = await bridge.apiGet(DETAIL_ROUTE, { stem });
-  applyDetail(detail);
+  state.uiState.remoteStatus = "loading";
+  const params = { stem, remote: "true" };
+  if (options.refresh) params.refresh = "true";
+  const detail = await bridge.apiGet(DETAIL_ROUTE, params);
+  state.uiState.remoteStatus = "done";
+  applyDetail(detail, { resetUi: true });
 }
 
-/**
- * 把后端返回的详情铺成选中状态与草稿。
- *
- * @param {object} detail 工作流详情。
- */
-function applyDetail(detail) {
+function applyDetail(detail, options = {}) {
   state.selectedStem = detail.stem ?? state.selectedStem;
   state.detail = detail;
   state.draft = contractToDraft(detail.contract, state.selectedStem, detail.nodes);
+  state.baselineSnapshot = draftSnapshot(state.draft);
   state.uiState.confirmDelete = null;
+  state.uiState.moreMenuOpen = false;
   state.uiState.errors = Array.isArray(detail.errors) ? detail.errors : [];
   state.uiState.inspectPreview = detail.inspect_preview ?? null;
+  if (options.resetUi) {
+    state.uiState.expandedInputs = new Set(
+      !detail.has_contract && state.draft.inputs.length <= 2
+        ? state.draft.inputs.map((_, idx) => idx)
+        : [],
+    );
+  }
   renderList();
-  renderWorkspace();
+  renderWorkspace({ resetScroll: Boolean(options.resetUi) });
 }
 
-/**
- * 用 ComfyUI 节点定义刷新节点下拉与被引用的字段。
- */
-async function fetchRemoteNodes() {
+function guardUnsaved(action) {
+  if (!isDirty()) {
+    action();
+    return;
+  }
+  state.pendingAction = action;
+  state.modal = { kind: "unsaved", stem: state.selectedStem };
+  renderModalLayer();
+}
+
+async function checkRemoteCurrent() {
+  if (!state.selectedStem) return;
+  const draftBackup = state.draft;
+  const baselineBackup = state.baselineSnapshot;
+  const wasDirty = isDirty();
+  state.uiState.remoteStatus = "loading";
+  renderWorkspace();
   const fresh = await bridge.apiGet(DETAIL_ROUTE, {
     stem: state.selectedStem,
     remote: "true",
+    refresh: "true",
   });
+  state.uiState.remoteStatus = "done";
   state.detail = {
     ...state.detail,
     nodes: Array.isArray(fresh.nodes) ? fresh.nodes : [],
     has_workflow: fresh.has_workflow,
     has_contract: fresh.has_contract,
   };
-  state.uiState.errors = Array.isArray(fresh.errors) ? fresh.errors : [];
-  state.uiState.inspectPreview = fresh.inspect_preview ?? null;
+  if (wasDirty) {
+    state.draft = draftBackup;
+    state.baselineSnapshot = baselineBackup;
+    await runServerPreview(true);
+  } else {
+    state.uiState.errors = Array.isArray(fresh.errors) ? fresh.errors : [];
+    state.uiState.inspectPreview = fresh.inspect_preview ?? null;
+  }
   renderWorkspace();
-  showMessage("已拉取 ComfyUI 节点定义", "ok");
+  const unreachable = (state.detail.nodes ?? []).every((n) => n.remote?.error);
+  if (state.detail.nodes?.length && unreachable) {
+    showToast("ComfyUI 离线或节点定义不可达，当前保留本地校验", "warn");
+  } else {
+    showToast("已完成 ComfyUI 远端节点定义核对", "ok");
+  }
 }
 
-/**
- * 上传一份工作流文件，成功后刷新列表并选中它。
- *
- * @param {File} file 用户选择的工作流文件。
- */
 async function uploadWorkflow(file) {
   const detail = await bridge.upload(UPLOAD_ROUTE, file);
   await loadWorkflows();
-  applyDetail(detail);
-  showMessage(`已上传 ${detail.stem}`, "ok");
+  applyDetail(detail, { resetUi: true });
+  showToast(`已导入工作流 ${detail.stem}`, "ok");
 }
 
-/**
- * 检查全部工作流。
- *
- * @param {boolean} remote 是否用 ComfyUI 节点定义核对。
- */
-async function checkAll(remote) {
-  await loadWorkflows({ remote });
-  const total = state.items.length;
-  const failed = state.items.filter((item) => !item.ok).length;
-  const scope = remote ? "远端" : "本地";
-  showMessage(
-    `${scope}检查完成：${total} 个工作流，${failed} 个有问题`,
-    failed ? "warn" : "ok",
-  );
-  const selected = state.items.find((item) => item.stem === state.selectedStem);
-  if (!selected) return;
-  state.uiState.errors = Array.isArray(selected.errors) ? selected.errors : [];
-  renderWorkspace();
+async function checkAllRemote() {
+  elements.checkRemoteButton.disabled = true;
+  try {
+    await loadWorkflows({ remote: true, refresh: true });
+    const total = state.items.length;
+    const failed = state.items.filter((item) => !item.ok).length;
+    showToast(
+      `全部远端核对完成：${total} 个工作流，${failed} 个存在问题`,
+      failed ? "warn" : "ok",
+    );
+    const selected = state.items.find((item) => item.stem === state.selectedStem);
+    if (selected && !isDirty()) {
+      state.uiState.errors = Array.isArray(selected.errors) ? selected.errors : [];
+      renderWorkspace();
+    }
+  } finally {
+    elements.checkRemoteButton.disabled = false;
+  }
 }
 
-/**
- * 保存当前草稿对应的工具契约。
- */
 async function saveContract() {
+  if (!state.draft || !state.selectedStem) return;
   const contract = draftToContract(state.draft);
   const detail = await bridge.apiPost(SAVE_ROUTE, {
     stem: state.selectedStem,
@@ -259,16 +364,26 @@ async function saveContract() {
   });
   await loadWorkflows();
   applyDetail(detail);
-  showMessage("契约已保存，工具已刷新", "ok");
+  showToast("工具契约已保存并热刷新生效", "ok");
 }
 
-/**
- * 用后端校验当前草稿并生成模型视图。
- *
- * @param {boolean} remote 是否用 ComfyUI 节点定义核对。
- */
-async function refreshPreview(remote) {
-  const contract = draftToContract(state.draft);
+function scheduleLivePreview() {
+  clearTimeout(previewTimer);
+  previewTimer = setTimeout(() => {
+    runServerPreview(false).catch(() => {});
+  }, 260);
+}
+
+async function runServerPreview(remote) {
+  if (!state.draft || !state.selectedStem) return;
+  let contract;
+  try {
+    contract = draftToContract(state.draft);
+  } catch {
+    state.uiState.inspectPreview = null;
+    refreshValidationStripInPlace();
+    return;
+  }
   const result = await bridge.apiPost(PREVIEW_ROUTE, {
     stem: state.selectedStem,
     contract,
@@ -276,19 +391,19 @@ async function refreshPreview(remote) {
   });
   state.uiState.errors = Array.isArray(result.errors) ? result.errors : [];
   state.uiState.inspectPreview = result.inspect_preview ?? null;
-  renderWorkspace();
-  showMessage(
-    result.ok ? "契约检查通过" : "契约检查未通过",
-    result.ok ? "ok" : "err",
-  );
+  refreshValidationStripInPlace();
 }
 
-/**
- * 按当前内联确认的范围删除契约或工作流。
- */
-async function deleteSelection() {
+async function deleteSelection(forceDisableFirst = false) {
   const scope = state.uiState.confirmDelete;
   if (scope !== "contract" && scope !== "all") return;
+  if (forceDisableFirst && scope === "all" && state.detail?.contract) {
+    const disabledContract = { ...state.detail.contract, enabled: false };
+    await bridge.apiPost(SAVE_ROUTE, {
+      stem: state.selectedStem,
+      contract: disabledContract,
+    });
+  }
   const result = await bridge.apiPost(DELETE_ROUTE, {
     stem: state.selectedStem,
     scope,
@@ -298,7 +413,7 @@ async function deleteSelection() {
   if (state.selectedStem === result.stem) {
     await selectWorkflow(result.stem);
   }
-  showMessage(
+  showToast(
     scope === "all"
       ? `已删除工作流 ${result.stem}`
       : `已删除工具契约 ${result.stem}`,
@@ -306,13 +421,6 @@ async function deleteSelection() {
   );
 }
 
-/**
- * 执行一次异步操作，期间拦住重复点击，失败时把原因显示在横幅里。
- *
- * @param {() => Promise<void>} task 待执行的操作。
- * @param {object} options 执行选项。
- * @param {boolean} options.showErrors 失败时把错误逐行写进校验面板。
- */
 async function runTask(task, options = {}) {
   if (state.uiState.busy) return;
   state.uiState.busy = true;
@@ -330,46 +438,24 @@ async function runTask(task, options = {}) {
   }
 }
 
-/**
- * 按节点 id 找节点。
- *
- * @param {string} nodeId 节点 id。
- * @returns {object|null} 命中节点，找不到返回 null。
- */
 function findNode(nodeId) {
   const nodes = Array.isArray(state.detail?.nodes) ? state.detail.nodes : [];
   return nodes.find((node) => String(node.id) === String(nodeId)) ?? null;
 }
 
-/**
- * 取节点定义里的第一个字段名。
- *
- * @param {string} nodeId 节点 id。
- * @returns {string} 字段名，节点不存在或没有字段时为空串。
- */
-function firstFieldName(nodeId) {
+function firstTunableFieldName(nodeId) {
   const node = findNode(nodeId);
   const fields = Array.isArray(node?.fields) ? node.fields : [];
-  return fields.length ? fields[0].name : "";
+  const nonLink = fields.find((f) => !f.is_link);
+  return nonLink ? nonLink.name : fields[0]?.name ?? "";
 }
 
-/**
- * 取当前行映射的远端字段定义。
- *
- * @param {object} row 参数行。
- * @returns {object|null} 远端字段定义，没有拉取过节点定义时返回 null。
- */
 function remoteFieldOf(row) {
   if (!row) return null;
   const node = findNode(row.node);
   return node?.remote?.fields?.[row.field] ?? null;
 }
 
-/**
- * 把远端字段定义里的类型、枚举与范围填进当前行。
- *
- * @param {number} index 参数行下标。
- */
 function applyRemoteField(index) {
   const row = state.draft.inputs[index];
   const remote = remoteFieldOf(row);
@@ -384,23 +470,14 @@ function applyRemoteField(index) {
     row.maximum = limitText(remote.maximum);
   }
   renderWorkspace();
+  scheduleLivePreview();
+  showToast("已同步远端节点约束", "ok");
 }
 
-/**
- * 把远端限值转成输入框文本。
- *
- * @param {unknown} value 远端限值。
- * @returns {string} 限值文本，未提供时为空串。
- */
 function limitText(value) {
   return value === null || value === undefined ? "" : String(value);
 }
 
-/**
- * 生成一条空参数行。
- *
- * @returns {object} 参数行。
- */
 function newInputRow() {
   return {
     key: "",
@@ -419,29 +496,151 @@ function newInputRow() {
   };
 }
 
-/**
- * 生成一条空产物行。
- *
- * @returns {object} 产物行。
- */
 function newOutputRow() {
-  return { key: "", type: "image", node: "", field: "" };
+  return { key: "", type: "image", node: "", field: "images" };
 }
 
-/**
- * 切换标签页。
- *
- * @param {string} tab 标签页名称。
- */
+function addInputFromNodeBrowser(nodeId, fieldName) {
+  const node = findNode(nodeId);
+  const field = (node?.fields ?? []).find((f) => f.name === fieldName);
+  if (!node || !field || field.is_link) return;
+  const row = buildInputRowFromField(node, field, state.draft.inputs);
+  const index = state.draft.inputs.length;
+  state.draft.inputs.push(row);
+  state.uiState.activeTab = "form";
+  state.uiState.expandedInputs.add(index);
+  renderWorkspace();
+  syncDirtyState();
+  scheduleLivePreview();
+  focusElement(`#input-${index}-description`);
+}
+
+function addOutputFromNodeBrowser(nodeId) {
+  const node = findNode(nodeId);
+  if (!node) return;
+  const row = buildOutputRowFromNode(node, state.draft.outputs);
+  const index = state.draft.outputs.length;
+  state.draft.outputs.push(row);
+  state.uiState.activeTab = "form";
+  renderWorkspace();
+  syncDirtyState();
+  scheduleLivePreview();
+  focusElement(`#output-${index}-key`);
+}
+
+function focusElement(selector) {
+  requestAnimationFrame(() => {
+    const el = document.querySelector(selector);
+    if (!el) return;
+    el.scrollIntoView({ behavior: "smooth", block: "center" });
+    el.focus();
+  });
+}
+
+function focusIssueTarget(issueIndex) {
+  const items = [];
+  const seen = new Set();
+  for (const issue of state.uiState.localIssues ?? []) {
+    if (!seen.has(issue.message)) {
+      seen.add(issue.message);
+      items.push(issue);
+    }
+  }
+  for (const msg of state.uiState.errors ?? []) {
+    if (!seen.has(msg)) {
+      seen.add(msg);
+      const paramMatch = /参数\s+([a-z0-9_]+)/.exec(msg);
+      const outputMatch = /输出\s+([a-z0-9_]+)/.exec(msg);
+      items.push({
+        message: msg,
+        target: paramMatch
+          ? { kind: "inputKey", key: paramMatch[1] }
+          : outputMatch
+            ? { kind: "outputKey", key: outputMatch[1] }
+            : null,
+      });
+    }
+  }
+  const target = items[issueIndex]?.target;
+  if (!target) return;
+
+  state.uiState.activeTab = "form";
+  if (target.kind === "basic") {
+    renderWorkspace();
+    focusElement(`#contract-${target.field}`);
+    return;
+  }
+  if (target.kind === "input" || target.kind === "inputKey") {
+    const index =
+      target.kind === "input"
+        ? target.index
+        : state.draft.inputs.findIndex((r) => r.key === target.key);
+    if (index < 0) return;
+    state.uiState.expandedInputs.add(index);
+    renderWorkspace();
+    const fieldId = target.field ? `#input-${index}-${target.field}` : `#input-${index}-key`;
+    focusElement(fieldId);
+    return;
+  }
+  if (target.kind === "output" || target.kind === "outputKey") {
+    const index =
+      target.kind === "output"
+        ? target.index
+        : state.draft.outputs.findIndex((r) => r.key === target.key);
+    if (index < 0) {
+      renderWorkspace();
+      return;
+    }
+    renderWorkspace();
+    const fieldId = target.field ? `#output-${index}-${target.field}` : `#output-${index}-key`;
+    focusElement(fieldId);
+  }
+}
+
+function toggleInputExpanded(index) {
+  if (state.uiState.expandedInputs.has(index)) {
+    state.uiState.expandedInputs.delete(index);
+  } else {
+    state.uiState.expandedInputs.add(index);
+  }
+  renderWorkspace();
+}
+
+function moveInputRow(index, delta) {
+  const nextIndex = index + delta;
+  if (nextIndex < 0 || nextIndex >= state.draft.inputs.length) return;
+  const list = state.draft.inputs;
+  [list[index], list[nextIndex]] = [list[nextIndex], list[index]];
+  const nextExpanded = new Set();
+  for (const idx of state.uiState.expandedInputs) {
+    if (idx === index) nextExpanded.add(nextIndex);
+    else if (idx === nextIndex) nextExpanded.add(index);
+    else nextExpanded.add(idx);
+  }
+  state.uiState.expandedInputs = nextExpanded;
+  renderWorkspace();
+  syncDirtyState();
+}
+
+function removeInputRow(index) {
+  state.draft.inputs.splice(index, 1);
+  const nextExpanded = new Set();
+  for (const idx of state.uiState.expandedInputs) {
+    if (idx < index) nextExpanded.add(idx);
+    else if (idx > index) nextExpanded.add(idx - 1);
+  }
+  state.uiState.expandedInputs = nextExpanded;
+  renderWorkspace();
+  syncDirtyState();
+  scheduleLivePreview();
+}
+
 function switchTab(tab) {
   if (!tab || tab === state.uiState.activeTab) return;
   state.uiState.activeTab = tab;
   renderWorkspace();
 }
 
-/**
- * 把原始 JSON 文本应用成表单草稿。
- */
 function applyJsonFromEditor() {
   const editor = document.getElementById("raw-json-editor");
   if (!editor) return;
@@ -450,43 +649,78 @@ function applyJsonFromEditor() {
     if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
       throw new Error("契约 JSON 必须是一个对象");
     }
-    state.draft = contractToDraft(
-      parsed,
-      state.selectedStem,
-      state.detail?.nodes ?? [],
-    );
+    state.draft = contractToDraft(parsed, state.selectedStem, state.detail?.nodes ?? []);
     state.uiState.activeTab = "form";
     renderWorkspace();
-    showMessage("已把 JSON 应用到表单，保存后生效", "ok");
+    syncDirtyState();
+    scheduleLivePreview();
+    showToast("已把 JSON 应用到表单，保存后生效", "ok");
   } catch (error) {
     showError(error);
   }
 }
 
-/**
- * 同步基础信息。
- *
- * @param {string} field 草稿字段名。
- * @param {HTMLInputElement} target 触发事件的输入框。
- */
+function formatJsonInEditor() {
+  const editor = document.getElementById("raw-json-editor");
+  if (!editor) return;
+  try {
+    const parsed = JSON.parse(editor.value);
+    editor.value = JSON.stringify(parsed, null, 2);
+  } catch (error) {
+    showError(error);
+  }
+}
+
+async function copyText(text, successMsg) {
+  try {
+    await navigator.clipboard.writeText(text);
+    showToast(successMsg, "ok");
+  } catch {
+    showToast("浏览器剪贴板写入失败，请手动复制", "warn");
+  }
+}
+
+function exportContractFile() {
+  const safe = draftToSafeObject(state.draft);
+  const blob = new Blob([JSON.stringify(safe.contract, null, 2) + "\n"], {
+    type: "application/json",
+  });
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = `${state.selectedStem}.tool.json`;
+  link.click();
+  URL.revokeObjectURL(url);
+  showToast(`已导出 ${state.selectedStem}.tool.json`, "ok");
+}
+
+function revertDraft() {
+  if (!state.detail) return;
+  state.draft = contractToDraft(state.detail.contract, state.selectedStem, state.detail.nodes);
+  state.baselineSnapshot = draftSnapshot(state.draft);
+  state.uiState.errors = Array.isArray(state.detail.errors) ? state.detail.errors : [];
+  state.uiState.inspectPreview = state.detail.inspect_preview ?? null;
+  renderWorkspace();
+  syncDirtyState();
+  showToast("已还原为上次保存的状态", "ok");
+}
+
 function updateBasics(field, target) {
   if (!state.draft) return;
   if (field === "enabled") {
     state.draft.enabled = target.checked;
+    syncDirtyState();
+    scheduleLivePreview();
     return;
   }
   if (field === "name" || field === "description") {
     state.draft[field] = target.value;
+    syncDirtyState();
+    refreshValidationStripInPlace();
+    scheduleLivePreview();
   }
 }
 
-/**
- * 同步一条参数行，结构变化时重绘工作区。
- *
- * @param {number} index 参数行下标。
- * @param {string} field 草稿字段名。
- * @param {HTMLInputElement|HTMLSelectElement} target 触发事件的控件。
- */
 function updateInputRow(index, field, target) {
   const row = state.draft?.inputs?.[index];
   if (!row || !field) return;
@@ -496,33 +730,55 @@ function updateInputRow(index, field, target) {
     if (field === "visible" && target.checked) row.valueTemplate = "";
   } else if (field === "node") {
     row.node = target.value;
-    row.field = firstFieldName(target.value);
+    row.field = firstTunableFieldName(target.value);
   } else {
     row[field] = target.value;
   }
-  if (STRUCTURAL_INPUT_FIELDS.has(field)) renderWorkspace();
+  if (STRUCTURAL_INPUT_FIELDS.has(field)) {
+    renderWorkspace();
+  } else {
+    const keyEl = document.querySelector(`[data-input-index="${index}"] .param-key`);
+    if (keyEl && field === "key") {
+      keyEl.textContent = row.key || `未命名参数 #${index + 1}`;
+      keyEl.classList.toggle("is-empty", !row.key);
+    }
+    refreshValidationStripInPlace();
+  }
+  syncDirtyState();
+  scheduleLivePreview();
 }
 
-/**
- * 同步一条产物行。
- *
- * @param {number} index 产物行下标。
- * @param {string} field 草稿字段名。
- * @param {HTMLInputElement|HTMLSelectElement} target 触发事件的控件。
- */
 function updateOutputRow(index, field, target) {
   const row = state.draft?.outputs?.[index];
   if (!row || !field) return;
   row[field] = target.value;
+  syncDirtyState();
+  refreshValidationStripInPlace();
+  scheduleLivePreview();
 }
 
-/**
- * 把表单输入同步进草稿。
- *
- * @param {InputEvent|Event} event 输入或变更事件。
- */
 function handleFormEvent(event) {
   const target = event.target;
+  if (target.dataset?.browserSearch) {
+    state.uiState.browserSearch = target.value;
+    const caret = target.selectionStart;
+    renderWorkspace();
+    requestAnimationFrame(() => {
+      const next = document.querySelector("[data-browser-search]");
+      if (next) {
+        next.focus();
+        if (typeof caret === "number") next.setSelectionRange(caret, caret);
+      }
+    });
+    return;
+  }
+  if (target.dataset?.browserLinks) {
+    if (event.type !== "change") return;
+    state.uiState.browserShowLinks = target.checked;
+    renderWorkspace();
+    return;
+  }
+
   if (
     !(
       target instanceof HTMLInputElement ||
@@ -536,22 +792,15 @@ function handleFormEvent(event) {
     target instanceof HTMLSelectElement ||
     (target instanceof HTMLInputElement && target.type === "checkbox");
   if (event.type === "input" ? toggle : !toggle) return;
+
   const inputCard = target.closest("[data-input-index]");
   if (inputCard) {
-    updateInputRow(
-      Number(inputCard.dataset.inputIndex),
-      target.dataset.inputField,
-      target,
-    );
+    updateInputRow(Number(inputCard.dataset.inputIndex), target.dataset.inputField, target);
     return;
   }
   const outputCard = target.closest("[data-output-index]");
   if (outputCard) {
-    updateOutputRow(
-      Number(outputCard.dataset.outputIndex),
-      target.dataset.outputField,
-      target,
-    );
+    updateOutputRow(Number(outputCard.dataset.outputIndex), target.dataset.outputField, target);
     return;
   }
   if (target.dataset.basicField) {
@@ -559,70 +808,185 @@ function handleFormEvent(event) {
   }
 }
 
-/**
- * 处理工作区里的按钮点击。
- *
- * @param {MouseEvent} event 点击事件。
- */
 function handleActionClick(event) {
   if (!(event.target instanceof Element)) return;
+
+  if (event.target.closest("[data-empty-import]")) {
+    openImportModal("file");
+    return;
+  }
+
   const button = event.target.closest("[data-action]");
   if (!button) return;
+
   const action = button.dataset.action;
   const inputIndex = button.closest("[data-input-index]")?.dataset.inputIndex;
   const outputIndex = button.closest("[data-output-index]")?.dataset.outputIndex;
+
+  if (action === "toggle-input" && event.target.closest(".param-row-actions")) {
+    return;
+  }
+
   switch (action) {
-    case "add-input":
-      state.draft.inputs.push(newInputRow());
+    case "toggle-more-menu":
+      state.uiState.moreMenuOpen = !state.uiState.moreMenuOpen;
       renderWorkspace();
       return;
-    case "remove-input":
-      state.draft.inputs.splice(Number(inputIndex), 1);
-      renderWorkspace();
+    case "check-remote":
+      state.uiState.moreMenuOpen = false;
+      runTask(checkRemoteCurrent, { showErrors: true });
       return;
-    case "add-output":
-      state.draft.outputs.push(newOutputRow());
-      renderWorkspace();
-      return;
-    case "remove-output":
-      state.draft.outputs.splice(Number(outputIndex), 1);
-      renderWorkspace();
-      return;
-    case "apply-remote-field":
-      applyRemoteField(Number(inputIndex));
-      return;
-    case "switch-tab":
-      switchTab(button.dataset.tab);
-      return;
-    case "fetch-remote":
-      runTask(fetchRemoteNodes);
-      return;
-    case "preview-local":
-      runTask(() => refreshPreview(false), { showErrors: true });
-      return;
-    case "preview-remote":
-      runTask(() => refreshPreview(true), { showErrors: true });
-      return;
-    case "refresh-inspect":
-      runTask(() => refreshPreview(false), { showErrors: true });
+    case "revert-draft":
+      revertDraft();
       return;
     case "save-contract":
       runTask(saveContract, { showErrors: true });
       return;
+    case "copy-contract":
+      state.uiState.moreMenuOpen = false;
+      renderWorkspace();
+      copyText(
+        JSON.stringify(draftToSafeObject(state.draft).contract, null, 2),
+        "已复制工具契约 JSON",
+      );
+      return;
+    case "copy-schema": {
+      const schemaObj = state.uiState.inspectPreview ?? {};
+      copyText(JSON.stringify(schemaObj, null, 2), "已复制模型 Schema");
+      return;
+    }
+    case "export-contract":
+      state.uiState.moreMenuOpen = false;
+      renderWorkspace();
+      exportContractFile();
+      return;
     case "delete-contract":
+      state.uiState.moreMenuOpen = false;
       state.uiState.confirmDelete = "contract";
       renderWorkspace();
       return;
     case "delete-workflow":
+      state.uiState.moreMenuOpen = false;
       state.uiState.confirmDelete = "all";
       renderWorkspace();
       return;
     case "confirm-delete":
-      runTask(deleteSelection);
+      runTask(() => deleteSelection(false));
+      return;
+    case "disable-and-delete":
+      runTask(() => deleteSelection(true));
       return;
     case "cancel-delete":
       state.uiState.confirmDelete = null;
       renderWorkspace();
+      return;
+    case "toggle-validation":
+      state.uiState.validationExpanded = state.uiState.validationExpanded === false;
+      renderWorkspace();
+      return;
+    case "focus-issue":
+      focusIssueTarget(Number(button.dataset.issueIndex));
+      return;
+    case "switch-tab":
+      switchTab(button.dataset.tab);
+      return;
+    case "toggle-node-browser":
+      state.uiState.nodeBrowserOpen = !state.uiState.nodeBrowserOpen;
+      renderWorkspace();
+      return;
+    case "open-node-browser-input":
+      state.uiState.nodeBrowserOpen = true;
+      state.uiState.browserFilter = "tunable";
+      renderWorkspace();
+      return;
+    case "open-node-browser-output":
+      state.uiState.nodeBrowserOpen = true;
+      state.uiState.browserFilter = "output";
+      renderWorkspace();
+      return;
+    case "close-node-browser":
+      state.uiState.nodeBrowserOpen = false;
+      renderWorkspace();
+      return;
+    case "browser-filter":
+      state.uiState.browserFilter = button.dataset.filter;
+      renderWorkspace();
+      return;
+    case "browser-add-input":
+      addInputFromNodeBrowser(button.dataset.nodeId, button.dataset.fieldName);
+      return;
+    case "browser-add-output":
+      addOutputFromNodeBrowser(button.dataset.nodeId);
+      return;
+    case "jump-input": {
+      const idx = Number(button.dataset.inputIndex);
+      state.uiState.activeTab = "form";
+      state.uiState.expandedInputs.add(idx);
+      renderWorkspace();
+      focusElement(`#input-${idx}-key`);
+      return;
+    }
+    case "add-input": {
+      const idx = state.draft.inputs.length;
+      state.draft.inputs.push(newInputRow());
+      state.uiState.expandedInputs.add(idx);
+      renderWorkspace();
+      syncDirtyState();
+      focusElement(`#input-${idx}-key`);
+      return;
+    }
+    case "toggle-input":
+      toggleInputExpanded(Number(inputIndex));
+      return;
+    case "expand-all-inputs":
+      state.uiState.expandedInputs = new Set(state.draft.inputs.map((_, i) => i));
+      renderWorkspace();
+      return;
+    case "collapse-all-inputs":
+      state.uiState.expandedInputs = new Set();
+      renderWorkspace();
+      return;
+    case "move-input-up":
+      moveInputRow(Number(inputIndex), -1);
+      return;
+    case "move-input-down":
+      moveInputRow(Number(inputIndex), 1);
+      return;
+    case "remove-input":
+      removeInputRow(Number(inputIndex));
+      return;
+    case "apply-remote-field":
+      applyRemoteField(Number(inputIndex));
+      return;
+    case "add-output": {
+      const idx = state.draft.outputs.length;
+      state.draft.outputs.push(newOutputRow());
+      renderWorkspace();
+      syncDirtyState();
+      focusElement(`#output-${idx}-key`);
+      return;
+    }
+    case "remove-output":
+      state.draft.outputs.splice(Number(outputIndex), 1);
+      renderWorkspace();
+      syncDirtyState();
+      scheduleLivePreview();
+      return;
+    case "set-output-field": {
+      const row = state.draft.outputs[Number(outputIndex)];
+      if (!row) return;
+      row.field = button.dataset.value ?? "";
+      renderWorkspace();
+      syncDirtyState();
+      scheduleLivePreview();
+      return;
+    }
+    case "toggle-raw-schema":
+      state.uiState.showRawSchema = !state.uiState.showRawSchema;
+      renderWorkspace();
+      return;
+    case "format-json":
+      formatJsonInEditor();
       return;
     case "apply-json":
       applyJsonFromEditor();
@@ -630,47 +994,201 @@ function handleActionClick(event) {
   }
 }
 
-/**
- * 绑定顶栏、列表与工作区的事件。
- */
+function openImportModal(mode = "file") {
+  state.modal = { kind: "import", mode, stem: "", jsonText: "", error: "" };
+  renderModalLayer();
+}
+
+async function handleModalClick(event) {
+  if (!(event.target instanceof Element)) return;
+  if (event.target === elements.modalRoot) {
+    state.modal = null;
+    state.pendingAction = null;
+    renderModalLayer();
+    return;
+  }
+  const btn = event.target.closest("[data-modal-action]");
+  if (!btn) return;
+  const action = btn.dataset.modalAction;
+
+  switch (action) {
+    case "close":
+      state.modal = null;
+      state.pendingAction = null;
+      renderModalLayer();
+      return;
+    case "import-mode":
+      state.modal.mode = btn.dataset.mode;
+      state.modal.error = "";
+      renderModalLayer();
+      return;
+    case "pick-file":
+      elements.uploadInput.click();
+      return;
+    case "submit-paste": {
+      const stem = document.getElementById("paste-stem")?.value.trim() ?? "";
+      const jsonText = document.getElementById("paste-json")?.value ?? "";
+      state.modal.stem = stem;
+      state.modal.jsonText = jsonText;
+      if (!stem) {
+        state.modal.error = "请填写工作流名称";
+        renderModalLayer();
+        return;
+      }
+      if (!jsonText.trim()) {
+        state.modal.error = "请粘贴工作流 JSON 内容";
+        renderModalLayer();
+        return;
+      }
+      try {
+        JSON.parse(jsonText);
+      } catch (err) {
+        state.modal.error = `JSON 格式有误: ${err.message}`;
+        renderModalLayer();
+        return;
+      }
+      const file = new File([jsonText], `${stem}.json`, { type: "application/json" });
+      state.modal = null;
+      renderModalLayer();
+      await runTask(() => uploadWorkflow(file));
+      return;
+    }
+    case "discard-and-continue": {
+      const next = state.pendingAction;
+      state.modal = null;
+      state.pendingAction = null;
+      renderModalLayer();
+      if (next) next();
+      return;
+    }
+    case "save-and-continue": {
+      const next = state.pendingAction;
+      await runTask(async () => {
+        await saveContract();
+        state.modal = null;
+        state.pendingAction = null;
+        renderModalLayer();
+        if (next) next();
+      }, { showErrors: true });
+      return;
+    }
+  }
+}
+
 function bindEvents() {
-  elements.uploadButton.addEventListener("click", () => {
-    elements.uploadInput.click();
-  });
+  elements.importButton.addEventListener("click", () => openImportModal("file"));
+
   elements.uploadInput.addEventListener("change", () => {
     const file = elements.uploadInput.files?.[0];
     elements.uploadInput.value = "";
     if (!file) return;
-    runTask(() => uploadWorkflow(file));
+    state.modal = null;
+    renderModalLayer();
+    guardUnsaved(() => runTask(() => uploadWorkflow(file)));
   });
-  elements.checkLocalButton.addEventListener("click", () => {
-    runTask(() => checkAll(false));
-  });
+
   elements.checkRemoteButton.addEventListener("click", () => {
-    runTask(() => checkAll(true));
+    runTask(checkAllRemote);
   });
+
   elements.searchInput.addEventListener("input", () => {
     state.filterText = elements.searchInput.value;
     renderList();
   });
+
+  elements.statusFilters.addEventListener("click", (event) => {
+    if (!(event.target instanceof Element)) return;
+    const chip = event.target.closest("[data-status-filter]");
+    if (!chip) return;
+    state.statusFilter = chip.dataset.statusFilter;
+    renderTopbar();
+    renderList();
+  });
+
   elements.workflowList.addEventListener("click", (event) => {
     if (!(event.target instanceof Element)) return;
     const item = event.target.closest(".workflow-item");
     const stem = item?.dataset.stem;
     if (!stem || stem === state.selectedStem) return;
-    runTask(() => selectWorkflow(stem));
+    guardUnsaved(() => runTask(() => selectWorkflow(stem)));
   });
+
   elements.workspace.addEventListener("click", handleActionClick);
   elements.workspace.addEventListener("input", handleFormEvent);
   elements.workspace.addEventListener("change", handleFormEvent);
+  elements.modalRoot.addEventListener("click", handleModalClick);
+
+  document.addEventListener("click", (event) => {
+    if (!state.uiState.moreMenuOpen) return;
+    if (event.target instanceof Element && event.target.closest(".dropdown-wrap")) return;
+    state.uiState.moreMenuOpen = false;
+    renderWorkspace();
+  });
+
+  document.addEventListener("keydown", (event) => {
+    if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "s") {
+      if (state.selectedStem && state.draft) {
+        event.preventDefault();
+        runTask(saveContract, { showErrors: true });
+      }
+      return;
+    }
+    if (event.key === "Escape") {
+      if (state.modal) {
+        state.modal = null;
+        state.pendingAction = null;
+        renderModalLayer();
+      } else if (state.uiState.moreMenuOpen) {
+        state.uiState.moreMenuOpen = false;
+        renderWorkspace();
+      }
+    }
+  });
+
+  window.addEventListener("dragenter", (event) => {
+    if (!event.dataTransfer?.types?.includes("Files")) return;
+    event.preventDefault();
+    dragCounter += 1;
+    elements.dropOverlay.hidden = false;
+  });
+
+  window.addEventListener("dragover", (event) => {
+    if (!event.dataTransfer?.types?.includes("Files")) return;
+    event.preventDefault();
+  });
+
+  window.addEventListener("dragleave", () => {
+    dragCounter = Math.max(0, dragCounter - 1);
+    if (dragCounter === 0) elements.dropOverlay.hidden = true;
+  });
+
+  window.addEventListener("drop", (event) => {
+    event.preventDefault();
+    dragCounter = 0;
+    elements.dropOverlay.hidden = true;
+    const file = event.dataTransfer?.files?.[0];
+    if (!file) return;
+    if (!file.name.endsWith(".json")) {
+      showToast("请拖入 .json 格式的 ComfyUI 工作流文件", "err");
+      return;
+    }
+    state.modal = null;
+    renderModalLayer();
+    guardUnsaved(() => runTask(() => uploadWorkflow(file)));
+  });
+
+  window.addEventListener("beforeunload", (event) => {
+    if (isDirty()) {
+      event.preventDefault();
+      event.returnValue = "";
+    }
+  });
 }
 
-/**
- * 页面入口：等 bridge 就绪后读取工作流列表。
- */
 async function start() {
+  syncTheme();
   if (!bridge) {
-    showMessage("未检测到 AstrBot 视图 bridge，请从 AstrBot WebUI 的插件页打开本视图", "err");
+    showToast("未检测到 AstrBot 视图 bridge，请从 AstrBot WebUI 插件页打开本视图", "err");
     return;
   }
   await bridge.ready();
@@ -680,7 +1198,7 @@ async function start() {
   } catch (error) {
     showError(error);
   }
-  renderWorkspace();
+  renderWorkspace({ resetScroll: true });
 }
 
 await start();

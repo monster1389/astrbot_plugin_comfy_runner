@@ -1,8 +1,8 @@
 /**
- * 工作流视图的表单状态转换。
+ * 工作流视图的状态与纯数据转换。
  *
- * 这里只放纯函数：工具契约与工作流节点换成可编辑草稿，草稿再还原成契约。
- * 契约的权威格式见 schemas/tool-contract-v1.schema.json。
+ * 负责工具契约与表单草稿之间的无损转换、节点字段智能推断、
+ * 实时本地校验提示以及模型公开视图的本地预览构建。
  */
 
 const TOOL_NAME_PATTERN = /^[a-z][a-z0-9_]{0,63}$/;
@@ -13,14 +13,47 @@ const DEFAULT_OUTPUT_TYPE = "image";
 const ENUM_TYPES = new Set(["string", "integer", "number"]);
 const TEXT_TYPES = new Set(["string"]);
 const NUMBER_TYPES = new Set(["integer", "number"]);
-const OUTPUT_NODE_DEFAULTS = {
-  SaveImage: { type: "image", field: "images" },
-  SaveAnimatedWEBP: { type: "image", field: "images" },
-  SaveVideo: { type: "video", field: "images" },
-  VHS_VideoCombine: { type: "video", field: "gifs" },
-  SaveAudio: { type: "audio", field: "audio" },
-  SaveAudioMP3: { type: "audio", field: "audio" },
-  SaveAudioFLAC: { type: "audio", field: "audio" },
+const REFERENCE_TYPES = new Set(["image", "video", "audio", "file"]);
+
+export const OUTPUT_NODE_DEFAULTS = {
+  SaveImage: { type: "image", field: "images", key: "image" },
+  PreviewImage: { type: "image", field: "images", key: "image" },
+  SaveAnimatedWEBP: { type: "image", field: "images", key: "image" },
+  SaveVideo: { type: "video", field: "images", key: "video" },
+  VHS_VideoCombine: { type: "video", field: "gifs", key: "video" },
+  SaveAudio: { type: "audio", field: "audio", key: "audio" },
+  SaveAudioMP3: { type: "audio", field: "audio", key: "audio" },
+  SaveAudioFLAC: { type: "audio", field: "audio", key: "audio" },
+};
+
+const LOADER_FIELD_HINTS = {
+  LoadImage: { image: "image" },
+  LoadImageMask: { image: "image" },
+  VHS_LoadVideo: { video: "video" },
+  LoadVideo: { file: "video", video: "video" },
+  LoadAudio: { audio: "audio" },
+};
+
+const REMOTE_TYPE_MAP = {
+  INT: "integer",
+  FLOAT: "number",
+  BOOLEAN: "boolean",
+  STRING: "string",
+  COMBO: "string",
+  IMAGE: "image",
+  VIDEO: "video",
+  AUDIO: "audio",
+};
+
+const JSON_TYPES = {
+  string: "string",
+  integer: "integer",
+  number: "number",
+  boolean: "boolean",
+  image: "string",
+  video: "string",
+  audio: "string",
+  file: "string",
 };
 
 /**
@@ -41,15 +74,38 @@ export function suggestToolName(stem) {
   const clipped = prefixed
     .slice(0, TOOL_NAME_MAX_LENGTH)
     .replace(/_+$/, "");
-  return TOOL_NAME_PATTERN.test(clipped) ? clipped : TOOL_NAME_PREFIX.replace(/_$/, "");
+  return TOOL_NAME_PATTERN.test(clipped) ? clipped : "comfy";
+}
+
+/**
+ * 由字段名推出合法且不重复的蛇形标识符。
+ *
+ * @param {string} rawName 原始字段名或预设名。
+ * @param {Iterable<string>} usedNames 已被占用的名称集合。
+ * @param {string} fallback 无法规范化时的兜底前缀。
+ * @returns {string} 合法且不重复的标识符。
+ */
+export function suggestUniqueKey(rawName, usedNames, fallback = "param") {
+  let base = String(rawName ?? "")
+    .toLowerCase()
+    .replace(/[^a-z0-9_]+/g, "_")
+    .replace(/_+/g, "_")
+    .replace(/^_+|_+$/g, "");
+  if (!/^[a-z]/.test(base)) {
+    base = base ? `${fallback}_${base}` : fallback;
+  }
+  base = base.slice(0, 56).replace(/_+$/, "") || fallback;
+  const taken = new Set(usedNames);
+  if (!taken.has(base)) return base;
+  let seq = 2;
+  while (taken.has(`${base}_${seq}`)) {
+    seq += 1;
+  }
+  return `${base}_${seq}`;
 }
 
 /**
  * 为没有配套契约的工作流生成初始契约。
- *
- * 返回值是契约本身的形状（`inputs` 是对象、`outputs` 是对象），可以直接交给
- * {@link contractToDraft} 转成表单草稿。产物映射从 SaveImage 一类的输出节点预填，
- * 找不到输出节点时取第一个节点，节点都没有就留一条待填的空映射。
  *
  * @param {string} stem 工作流文件名去掉 `.json` 的部分。
  * @param {Array<object>} nodes 后端给出的节点列表。
@@ -80,7 +136,6 @@ export function contractToDraft(rawContract, stem, nodes) {
       ? rawContract
       : createDraftContract(stem, nodes);
   return {
-    version: source.version ?? 1,
     name: source.name ?? suggestToolName(stem),
     description: source.description ?? "",
     enabled: Boolean(source.enabled),
@@ -90,46 +145,28 @@ export function contractToDraft(rawContract, stem, nodes) {
 }
 
 /**
- * 把表单草稿还原成可提交的契约。
+ * 把草稿序列化成稳定快照字符串，用于对比是否有未保存更改。
  *
- * 只写 Schema 有意义的字段：可见与必填只在偏离默认值时出现，长度与范围只给
- * 允许它们的类型，枚举按行或逗号拆成对应类型的数组。没填名字的行不写入。
+ * @param {object|null} draft 表单草稿。
+ * @returns {string} 快照字符串。
+ */
+export function draftSnapshot(draft) {
+  if (!draft) return "";
+  return JSON.stringify(draft);
+}
+
+/**
+ * 把表单草稿转成契约对象（严格校验空名与重名）。
  *
  * @param {object} draft 表单草稿。
  * @returns {object} 符合契约 Schema 的对象。
  */
-/**
- * 把草稿行数组收集成契约对象，遇到空名或重名直接报错。
- *
- * @param {Array<object>} rows 表单行数组。
- * @param {string} kindLabel 展示用类别名，例如 `参数` 或 `产物`。
- * @param {(row: object) => object} buildSpec 单行转换函数。
- * @param {Array<string>} errors 收集到的错误列表。
- * @returns {object} 键值映射对象。
- */
-function collectNamedEntries(rows, kindLabel, buildSpec, errors) {
-  const entries = {};
-  for (const [index, row] of (rows ?? []).entries()) {
-    const key = String(row.key ?? "").trim();
-    if (!key) {
-      errors.push(`第 ${index + 1} 个${kindLabel}未填写名称`);
-      continue;
-    }
-    if (Object.hasOwn(entries, key)) {
-      errors.push(`${kindLabel}名「${key}」重复`);
-      continue;
-    }
-    entries[key] = buildSpec(row);
-  }
-  return entries;
-}
-
 export function draftToContract(draft) {
   const errors = [];
   const inputs = collectNamedEntries(draft.inputs, "参数", inputSpec, errors);
   const outputs = collectNamedEntries(
     draft.outputs,
-    "产物",
+    "输出",
     (row) => ({
       type: row.type ?? DEFAULT_OUTPUT_TYPE,
       target: targetOf(row),
@@ -150,6 +187,317 @@ export function draftToContract(draft) {
 }
 
 /**
+ * 安全生成 JSON 源码展示用的对象，草稿存在空名或重名时不抛错。
+ *
+ * @param {object} draft 表单草稿。
+ * @returns {{ contract: object, warnings: Array<string> }} 契约对象与非阻断提醒。
+ */
+export function draftToSafeObject(draft) {
+  const warnings = [];
+  const inputs = {};
+  const outputs = {};
+
+  for (const [index, row] of (draft?.inputs ?? []).entries()) {
+    let key = String(row.key ?? "").trim();
+    if (!key) {
+      key = `__unnamed_input_${index + 1}`;
+      warnings.push(`第 ${index + 1} 个参数未填写名称（源码中暂以占位名展示）`);
+    } else if (Object.hasOwn(inputs, key)) {
+      warnings.push(`参数名「${key}」重复`);
+      key = `${key}__dup_${index + 1}`;
+    }
+    inputs[key] = inputSpec(row);
+  }
+
+  for (const [index, row] of (draft?.outputs ?? []).entries()) {
+    let key = String(row.key ?? "").trim();
+    if (!key) {
+      key = `__unnamed_output_${index + 1}`;
+      warnings.push(`第 ${index + 1} 个输出未填写名称（源码中暂以占位名展示）`);
+    } else if (Object.hasOwn(outputs, key)) {
+      warnings.push(`输出名「${key}」重复`);
+      key = `${key}__dup_${index + 1}`;
+    }
+    outputs[key] = {
+      type: row.type ?? DEFAULT_OUTPUT_TYPE,
+      target: targetOf(row),
+    };
+  }
+
+  return {
+    contract: {
+      version: 1,
+      name: String(draft?.name ?? "").trim(),
+      description: String(draft?.description ?? "").trim(),
+      enabled: Boolean(draft?.enabled),
+      inputs,
+      outputs,
+    },
+    warnings,
+  };
+}
+
+/**
+ * 在本地做即时基础校验，返回可直接定位到表单行的问题列表。
+ *
+ * @param {object} draft 表单草稿。
+ * @param {Array<object>} nodes 工作流节点列表。
+ * @returns {Array<{ message: string, target?: { kind: "basic"|"input"|"output", index?: number, field?: string } }>} 问题列表。
+ */
+export function collectLocalDraftIssues(draft, nodes) {
+  const issues = [];
+  if (!draft) return issues;
+  const name = String(draft.name ?? "").trim();
+  if (!TOOL_NAME_PATTERN.test(name)) {
+    issues.push({
+      message: "工具名称需以小写字母开头，仅含小写字母、数字与下划线（最长 64 字符）",
+      target: { kind: "basic", field: "name" },
+    });
+  }
+  if (!String(draft.description ?? "").trim()) {
+    issues.push({
+      message: "请填写工具描述，帮助模型理解何时调用该工作流工具",
+      target: { kind: "basic", field: "description" },
+    });
+  }
+
+  const nodeMap = new Map((nodes ?? []).map((n) => [String(n.id), n]));
+  const inputKeys = new Set();
+
+  for (const [index, row] of (draft.inputs ?? []).entries()) {
+    const key = String(row.key ?? "").trim();
+    const label = key ? `参数「${key}」` : `第 ${index + 1} 个参数`;
+    if (!key) {
+      issues.push({
+        message: `第 ${index + 1} 个参数未填写名称`,
+        target: { kind: "input", index, field: "key" },
+      });
+    } else if (!TOOL_NAME_PATTERN.test(key)) {
+      issues.push({
+        message: `${label} 名称不合法，需以小写字母开头且仅含小写字母、数字和下划线`,
+        target: { kind: "input", index, field: "key" },
+      });
+    } else if (inputKeys.has(key)) {
+      issues.push({
+        message: `参数名「${key}」重复`,
+        target: { kind: "input", index, field: "key" },
+      });
+    } else {
+      inputKeys.add(key);
+    }
+
+    if (!String(row.description ?? "").trim()) {
+      issues.push({
+        message: `${label} 未填写参数描述`,
+        target: { kind: "input", index, field: "description" },
+      });
+    }
+
+    const nodeId = String(row.node ?? "").trim();
+    const fieldName = String(row.field ?? "").trim();
+    if (!nodeId || !fieldName) {
+      issues.push({
+        message: `${label} 尚未选择映射节点与字段`,
+        target: { kind: "input", index, field: nodeId ? "field" : "node" },
+      });
+    } else if (nodeMap.size > 0) {
+      const node = nodeMap.get(nodeId);
+      if (!node) {
+        issues.push({
+          message: `${label} 映射的节点 ${nodeId} 在工作流中不存在`,
+          target: { kind: "input", index, field: "node" },
+        });
+      } else {
+        const field = (node.fields ?? []).find((f) => f.name === fieldName);
+        if (!field) {
+          issues.push({
+            message: `${label} 映射的字段 ${nodeId}.${fieldName} 在节点中不存在`,
+            target: { kind: "input", index, field: "field" },
+          });
+        } else if (field.is_link) {
+          issues.push({
+            message: `${label} 映射的 ${nodeId}.${fieldName} 是节点连线，不能直接作为输入参数`,
+            target: { kind: "input", index, field: "field" },
+          });
+        }
+      }
+    }
+  }
+
+  const outputKeys = new Set();
+  if (!draft.outputs || draft.outputs.length === 0) {
+    issues.push({
+      message: "至少需要配置一条输出映射，否则无法交付产物",
+      target: { kind: "output", index: -1 },
+    });
+  }
+  for (const [index, row] of (draft.outputs ?? []).entries()) {
+    const key = String(row.key ?? "").trim();
+    const label = key ? `输出「${key}」` : `第 ${index + 1} 个输出`;
+    if (!key) {
+      issues.push({
+        message: `第 ${index + 1} 个输出未填写名称`,
+        target: { kind: "output", index, field: "key" },
+      });
+    } else if (!TOOL_NAME_PATTERN.test(key)) {
+      issues.push({
+        message: `${label} 名称不合法，需以小写字母开头且仅含小写字母、数字和下划线`,
+        target: { kind: "output", index, field: "key" },
+      });
+    } else if (outputKeys.has(key)) {
+      issues.push({
+        message: `输出名「${key}」重复`,
+        target: { kind: "output", index, field: "key" },
+      });
+    } else {
+      outputKeys.add(key);
+    }
+
+    const nodeId = String(row.node ?? "").trim();
+    const fieldName = String(row.field ?? "").trim();
+    if (!nodeId || !fieldName) {
+      issues.push({
+        message: `${label} 尚未填写完整映射节点与字段`,
+        target: { kind: "output", index, field: nodeId ? "field" : "node" },
+      });
+    } else if (nodeMap.size > 0 && !nodeMap.has(nodeId)) {
+      issues.push({
+        message: `${label} 映射的节点 ${nodeId} 在工作流中不存在`,
+        target: { kind: "output", index, field: "node" },
+      });
+    }
+  }
+
+  return issues;
+}
+
+/**
+ * 基于当前草稿生成本地模型公开视图预览（无需等待后端校验通过）。
+ *
+ * @param {object} draft 表单草稿。
+ * @returns {object} 包含名称、描述、参数 Schema 及隐藏参数清单的对象。
+ */
+export function buildInspectPreview(draft) {
+  const properties = {};
+  const required = [];
+  const visibleRows = [];
+  const hiddenKeys = [];
+
+  for (const row of draft?.inputs ?? []) {
+    const key = String(row.key ?? "").trim();
+    if (!key) continue;
+    if (!row.visible) {
+      hiddenKeys.push(key);
+      continue;
+    }
+    const spec = inputSpec(row);
+    const prop = {
+      type: JSON_TYPES[spec.type] ?? "string",
+      description: REFERENCE_TYPES.has(spec.type)
+        ? `${spec.description}${spec.description ? "。" : ""}传文件引用（附件、路径、file:// 或链接）`
+        : spec.description,
+    };
+    if (spec.enum) prop.enum = spec.enum;
+    if (spec.minLength !== undefined) prop.minLength = spec.minLength;
+    if (spec.maxLength !== undefined) prop.maxLength = spec.maxLength;
+    if (spec.minimum !== undefined) prop.minimum = spec.minimum;
+    if (spec.maximum !== undefined) prop.maximum = spec.maximum;
+    properties[key] = prop;
+    if (spec.required) required.push(key);
+    visibleRows.push({
+      key,
+      type: spec.type,
+      required: Boolean(spec.required),
+      description: spec.description,
+      constraints: summarizeConstraints(spec),
+    });
+  }
+
+  const parameters = {
+    type: "object",
+    properties,
+  };
+  if (required.length > 0) {
+    parameters.required = required;
+  }
+
+  return {
+    name: String(draft?.name ?? "").trim(),
+    description: String(draft?.description ?? "").trim(),
+    enabled: Boolean(draft?.enabled),
+    parameters,
+    visibleRows,
+    hiddenKeys,
+    outputs: (draft?.outputs ?? []).map((o) => ({
+      key: String(o.key ?? "").trim(),
+      type: o.type ?? DEFAULT_OUTPUT_TYPE,
+      node: String(o.node ?? "").trim(),
+      field: String(o.field ?? "").trim(),
+    })),
+  };
+}
+
+/**
+ * 从节点字段与远端节点定义推断一条新参数草稿行。
+ *
+ * @param {object} node 工作流节点。
+ * @param {object} field 节点字段对象。
+ * @param {Array<object>} existingInputs 当前已有参数行。
+ * @returns {object} 预填好的参数草稿行（description 故意留空）。
+ */
+export function buildInputRowFromField(node, field, existingInputs) {
+  const used = (existingInputs ?? []).map((r) => String(r.key ?? "").trim()).filter(Boolean);
+  const remote = node?.remote?.fields?.[field.name] ?? null;
+  const inferredType = inferInputType(node, field, remote);
+  const row = {
+    key: suggestUniqueKey(field.name, used, "param"),
+    type: inferredType,
+    description: "",
+    visible: true,
+    required: false,
+    node: String(node.id),
+    field: String(field.name),
+    enumText: "",
+    minLength: "",
+    maxLength: "",
+    minimum: "",
+    maximum: "",
+    valueTemplate: "",
+  };
+  if (remote) {
+    if (Array.isArray(remote.enum) && remote.enum.length > 0) {
+      row.enumText = remote.enum.map((v) => String(v)).join("\n");
+    }
+    if (row.type === "integer" || row.type === "number") {
+      row.minimum = editableLimit(remote.minimum);
+      row.maximum = editableLimit(remote.maximum);
+    }
+  }
+  return row;
+}
+
+/**
+ * 从工作流节点推断一条新输出映射行。
+ *
+ * @param {object} node 工作流节点。
+ * @param {Array<object>} existingOutputs 当前已有输出行。
+ * @returns {object} 预填好的输出映射草稿行。
+ */
+export function buildOutputRowFromNode(node, existingOutputs) {
+  const used = (existingOutputs ?? []).map((r) => String(r.key ?? "").trim()).filter(Boolean);
+  const preset = OUTPUT_NODE_DEFAULTS[node?.class_type];
+  const type = preset?.type ?? DEFAULT_OUTPUT_TYPE;
+  const field = preset?.field ?? "images";
+  const baseKey = preset?.key ?? "output";
+  return {
+    key: suggestUniqueKey(baseKey, used, "output"),
+    type,
+    node: String(node.id),
+    field,
+  };
+}
+
+/**
  * 把节点字段的取值格式化成一行可读文字。
  *
  * @param {object|null} fieldObj 节点字段，形如 `{ is_link, value, link }`。
@@ -165,18 +513,90 @@ export function formatOriginalValue(fieldObj) {
 }
 
 /**
- * 按输出节点类型预填一条产物映射。
+ * 把节点字段的纯值格式化为紧凑预览字符串（不含前缀）。
  *
- * @param {Array<object>} nodes 后端给出的节点列表。
- * @returns {object} 产物名到产物映射的对象。
+ * @param {object|null} fieldObj 节点字段对象。
+ * @returns {string} 值文本。
  */
+export function formatRawValue(fieldObj) {
+  if (!fieldObj || typeof fieldObj !== "object") return "";
+  if (fieldObj.is_link) {
+    const link = Array.isArray(fieldObj.link) ? fieldObj.link : [];
+    return `[${link.map((part) => String(part)).join(", ")}]`;
+  }
+  return JSON.stringify(fieldObj.value ?? null);
+}
+
+/**
+ * 推断节点字段对应的参数类型。
+ *
+ * @param {object} node 节点对象。
+ * @param {object} field 字段对象。
+ * @param {object|null} remote 远端字段定义。
+ * @returns {string} 契约参数类型。
+ */
+export function inferInputType(node, field, remote) {
+  const loaderType = LOADER_FIELD_HINTS[node?.class_type]?.[field?.name];
+  if (loaderType) return loaderType;
+  if (remote?.suggested_type) {
+    const mapped = REMOTE_TYPE_MAP[String(remote.suggested_type).toUpperCase()];
+    if (mapped) return mapped;
+  }
+  const value = field?.value;
+  if (typeof value === "boolean") return "boolean";
+  if (typeof value === "number") {
+    return Number.isInteger(value) ? "integer" : "number";
+  }
+  return DEFAULT_INPUT_TYPE;
+}
+
+/**
+ * 汇总单个参数的约束描述，用于摘要行和预览表格展示。
+ *
+ * @param {object} spec 契约参数条目。
+ * @returns {string} 简洁约束摘要。
+ */
+export function summarizeConstraints(spec) {
+  const parts = [];
+  if (Array.isArray(spec.enum) && spec.enum.length > 0) {
+    parts.push(`枚举 ${spec.enum.length} 项`);
+  }
+  if (spec.minLength !== undefined || spec.maxLength !== undefined) {
+    parts.push(`长度 ${spec.minLength ?? 0}..${spec.maxLength ?? "∞"}`);
+  }
+  if (spec.minimum !== undefined || spec.maximum !== undefined) {
+    parts.push(`范围 ${spec.minimum ?? "-∞"}..${spec.maximum ?? "∞"}`);
+  }
+  if (spec.value_template) {
+    parts.push(`模板 ${spec.value_template}`);
+  }
+  return parts.join(" · ");
+}
+
+function collectNamedEntries(rows, kindLabel, buildSpec, errors) {
+  const entries = {};
+  for (const [index, row] of (rows ?? []).entries()) {
+    const key = String(row.key ?? "").trim();
+    if (!key) {
+      errors.push(`第 ${index + 1} 个${kindLabel}未填写名称`);
+      continue;
+    }
+    if (Object.hasOwn(entries, key)) {
+      errors.push(`${kindLabel}名「${key}」重复`);
+      continue;
+    }
+    entries[key] = buildSpec(row);
+  }
+  return entries;
+}
+
 function defaultOutputs(nodes) {
   const list = Array.isArray(nodes) ? nodes : [];
   const saver = list.find((node) => OUTPUT_NODE_DEFAULTS[node?.class_type]);
   if (saver) {
     const preset = OUTPUT_NODE_DEFAULTS[saver.class_type];
     return {
-      [preset.type]: {
+      [preset.key]: {
         type: preset.type,
         target: { node: saver.id, field: preset.field },
       },
@@ -191,12 +611,6 @@ function defaultOutputs(nodes) {
   };
 }
 
-/**
- * 把契约里的参数对象摊成表单行。
- *
- * @param {object|null} inputs 契约的 `inputs`。
- * @returns {Array<object>} 参数行数组。
- */
 function inputRows(inputs) {
   if (!inputs || typeof inputs !== "object") return [];
   return Object.entries(inputs).map(([key, spec]) => {
@@ -219,12 +633,6 @@ function inputRows(inputs) {
   });
 }
 
-/**
- * 把契约里的产物对象摊成表单行。
- *
- * @param {object|null} outputs 契约的 `outputs`。
- * @returns {Array<object>} 产物行数组。
- */
 function outputRows(outputs) {
   if (!outputs || typeof outputs !== "object") return [];
   return Object.entries(outputs).map(([key, spec]) => {
@@ -238,22 +646,10 @@ function outputRows(outputs) {
   });
 }
 
-/**
- * 把可选的数值限制转成输入框里的文本。
- *
- * @param {number|undefined|null} value 契约里的限制值。
- * @returns {string} 限值，未设置时为空串。
- */
 function editableLimit(value) {
   return value === undefined || value === null ? "" : String(value);
 }
 
-/**
- * 由一行表单生成一个参数映射。
- *
- * @param {object} row 参数行。
- * @returns {object} 契约里的 `inputs` 条目。
- */
 function inputSpec(row) {
   const type = row.type ?? DEFAULT_INPUT_TYPE;
   const spec = {
@@ -280,12 +676,6 @@ function inputSpec(row) {
   return spec;
 }
 
-/**
- * 取一行表单里的节点与字段映射。
- *
- * @param {object} row 参数行或产物行。
- * @returns {{node: string, field: string}} 映射目标。
- */
 function targetOf(row) {
   return {
     node: String(row.node ?? "").trim(),
@@ -293,13 +683,6 @@ function targetOf(row) {
   };
 }
 
-/**
- * 把枚举输入框的文本拆成对应类型的数组。
- *
- * @param {string} text 按行或逗号分隔的枚举文本。
- * @param {string} type 参数类型。
- * @returns {Array<string|number>} 枚举值。
- */
 function parseEnumText(text, type) {
   return String(text ?? "")
     .split(/[\n,]+/)
@@ -308,26 +691,12 @@ function parseEnumText(text, type) {
     .map((part) => castEnumValue(part, type));
 }
 
-/**
- * 把枚举文本转成参数类型对应的值。
- *
- * @param {string} text 单个枚举值文本。
- * @param {string} type 参数类型。
- * @returns {string|number} 数值类型解析成数字，解析不了就保留原文等后端报错。
- */
 function castEnumValue(text, type) {
   if (!NUMBER_TYPES.has(type)) return text;
   const value = Number(text);
   return Number.isFinite(value) ? value : text;
 }
 
-/**
- * 写入一个可选的数值限制，空值不写。
- *
- * @param {object} spec 待写入的契约条目。
- * @param {string} name 限制字段名。
- * @param {string|number} raw 表单里的文本。
- */
 function assignLimit(spec, name, raw) {
   const text = String(raw ?? "").trim();
   if (!text) return;
