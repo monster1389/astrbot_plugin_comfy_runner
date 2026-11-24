@@ -1,7 +1,8 @@
-"""工作流的一次执行：映射校验、提交、等待与产物解析。"""
+"""工作流的一次执行：映射校验、提交、等待与产物元数据提取。"""
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -25,17 +26,16 @@ from .contract import (
     input_target_errors,
     read_workflow,
 )
-from .media import Attachments, resolve_reference
+from .media import Attachments, TaskReferenceResolver, resolve_reference
 
 
 @dataclass(frozen=True, slots=True)
 class FileArtifact:
-    """一个下载完成的文件类正式产物。"""
+    """一个待按需拉取的文件类正式产物。"""
 
     output: str
     type: str
     ref: ArtifactRef
-    content: bytes
 
     @property
     def suffix(self) -> str:
@@ -123,7 +123,7 @@ class WorkflowExecutor:
         """记录 ComfyUI 客户端。
 
         Args:
-            client: 提交与下载使用的客户端。
+            client: 提交与查询使用的客户端。
         """
         self.client = client
 
@@ -132,6 +132,8 @@ class WorkflowExecutor:
         contract: ToolContract,
         arguments: dict[str, Any],
         attachments: Attachments,
+        task_resolver: TaskReferenceResolver | None = None,
+        pre_uploaded: dict[str, str] | None = None,
     ) -> str:
         """校验映射、上传附件并提交一次执行。
 
@@ -139,6 +141,8 @@ class WorkflowExecutor:
             contract: 工具契约。
             arguments: 本次调用显式提供的参数。
             attachments: 本次消息里的附件，供文件类参数引用。
+            task_resolver: 可选的上游任务产物解析回调。
+            pre_uploaded: 已经在前置阶段上传完成的文件名映射。
 
         Returns:
             ComfyUI 分配的任务 ID。
@@ -153,6 +157,7 @@ class WorkflowExecutor:
         if problems:
             raise ContractError("\n".join(problems))
 
+        uploaded_map = pre_uploaded or {}
         values = dict(arguments)
         now = datetime.now()
         for name, parameter in contract.inputs.items():
@@ -161,10 +166,14 @@ class WorkflowExecutor:
                 continue
             if not parameter.is_reference or name not in arguments:
                 continue
+            if name in uploaded_map:
+                values[name] = uploaded_map[name]
+                continue
             payload = await resolve_reference(
                 arguments[name],
                 parameter.type,
                 attachments,
+                task_resolver=task_resolver,
             )
             values[name] = await self.client.upload(
                 payload.filename,
@@ -186,46 +195,64 @@ class WorkflowExecutor:
         self,
         contract: ToolContract,
         prompt_id: str,
+        abort_check: Callable[[], str | None] | None = None,
     ) -> ExecutionResult:
-        """等待同一个任务完成并下载声明的正式产物。
+        """等待同一个任务完成并提取声明的正式产物元数据。
 
         Args:
             contract: 工具契约。
             prompt_id: 已经提交的任务 ID。
+            abort_check: 可选的中断检测回调。
 
         Returns:
-            任务 ID 与全部正式产物。
+            任务 ID 与全部正式产物元数据。
 
         Raises:
-            ComfyError: 执行失败、状态未知或产物下载失败。
+            ComfyError: 执行失败、等待超时、被中断或状态未知。
         """
-        entry = await self.client.wait(prompt_id)
-
-        artifacts: list[Artifact] = []
-        for output, mapping, index, value in declared_outputs(contract, entry):
-            if mapping.type == TEXT_OUTPUT_TYPE:
-                if not isinstance(value, str) or not value:
-                    raise OutputError(f"产物 {output} 的第 {index} 项不是文本")
-                artifacts.append(TextArtifact(output=output, text=value))
-                continue
-            ref = artifact_ref(value)
-            if ref is None:
-                raise OutputError(f"产物 {output} 的第 {index} 项不是可下载的产物")
-            content = await self.client.download(ref)
-            artifacts.append(
-                FileArtifact(
-                    output=output,
-                    type=mapping.type,
-                    ref=ref,
-                    content=content,
-                )
-            )
-
+        entry = await self.client.wait(prompt_id, abort_check=abort_check)
+        result = extract_execution_result(contract, prompt_id, entry)
         logger.info(
             f"[ComfyUI] 执行完成 {contract.name} | prompt_id: {prompt_id} | "
-            f"产物: {len(artifacts)} 个"
+            f"产物: {len(result.artifacts)} 个"
         )
-        return ExecutionResult(prompt_id=prompt_id, artifacts=tuple(artifacts))
+        return result
+
+
+def extract_execution_result(
+    contract: ToolContract,
+    prompt_id: str,
+    entry: dict[str, Any],
+) -> ExecutionResult:
+    """从 ComfyUI ``history`` 条目里提取并校验全部正式产物。
+
+    Args:
+        contract: 工具契约。
+        prompt_id: 任务 ID。
+        entry: ``history`` 里的任务结果。
+
+    Returns:
+        结构化的产物元数据集合。
+
+    Raises:
+        ExecutionFailed: 执行状态为失败。
+        ExecutionUnknown: 执行状态不完整。
+        OutputError: 声明的产物缺失、为空或结构不符。
+    """
+    artifacts: list[Artifact] = []
+    for output, mapping, index, value in declared_outputs(contract, entry):
+        if mapping.type == TEXT_OUTPUT_TYPE:
+            if not isinstance(value, str) or not value:
+                raise OutputError(f"产物 {output} 的第 {index} 项不是文本")
+            artifacts.append(TextArtifact(output=output, text=value))
+            continue
+        ref = artifact_ref(value)
+        if ref is None:
+            raise OutputError(f"产物 {output} 的第 {index} 项不是可下载的产物")
+        artifacts.append(
+            FileArtifact(output=output, type=mapping.type, ref=ref)
+        )
+    return ExecutionResult(prompt_id=prompt_id, artifacts=tuple(artifacts))
 
 
 def apply_arguments(

@@ -82,7 +82,7 @@ async def help_command(
         "  /comfy help         显示此帮助",
         "  /comfy ls           查看可用工作流",
         "  /comfy run [序号或工作流] 手动触发工作流",
-        "  /comfy cancel       取消当前参数收集",
+        "  /comfy cancel [任务ID] 取消参数收集或指定任务",
     ]
 
     if is_admin:
@@ -295,12 +295,17 @@ async def cancel_workflow_command(
     ctx: CommandContext,
     event: AstrMessageEvent,
 ) -> AsyncIterator[MessageEventResult]:
-    """不在向导中时告知用户没有可取消的会话。"""
+    """取消指定任务，或在不在向导中且无参数时告知用户。"""
     allowed, reason = ctx.access.check_access(event)
     if not allowed:
         yield event.plain_result(reason)
         return
-    yield event.plain_result("⚠️ 当前没有进行中的工作流向导")
+    target = command_arguments(event)
+    if not target:
+        yield event.plain_result("⚠️ 当前没有进行中的工作流向导")
+        return
+    reply = await ctx.interactive.adapter.cancel_task_by_command(event, target)
+    yield event.plain_result(reply)
 
 
 def _user_workflow_list(contracts: tuple[ToolContract, ...]) -> str:

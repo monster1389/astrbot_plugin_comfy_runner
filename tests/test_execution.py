@@ -123,13 +123,14 @@ def test_execute_returns_before_artifacts_are_sent(tmp_path, monkeypatch):
 
     assert sent_before == 0
     assert summary == (
-        "已提交工作流 comfy_test_t2i，正在后台生成，完成后会自动发送到当前会话"
+        "已提交工作流 comfy_test_t2i（任务: p1），"
+        "正在后台生成，完成后会自动发送到当前会话"
     )
     assert len(event.sent) == 1
     kind, components = event.sent[0]
     assert kind == "chain"
     assert [type(item).__name__ for item in components] == ["Image"]
-    assert len(list((tmp_path / "plugin_data" / "output").glob("*.png"))) == 1
+    assert list((tmp_path / "plugin_data" / "temp").rglob("*")) == []
 
 
 def test_summary_hides_internal_location(tmp_path, monkeypatch):
@@ -400,7 +401,7 @@ def test_video_artifact_is_delivered_as_video_message(tmp_path, monkeypatch):
     kind, components = event.sent[0]
     assert kind == "chain"
     assert [type(item).__name__ for item in components] == ["Video"]
-    assert len(list((tmp_path / "plugin_data" / "output").glob("*.mp4"))) == 1
+    assert list((tmp_path / "plugin_data" / "temp").rglob("*")) == []
 
 
 def test_audio_artifact_is_delivered_as_record_message(tmp_path, monkeypatch):
@@ -461,7 +462,7 @@ def test_file_artifact_keeps_original_filename(tmp_path, monkeypatch):
     _, components = event.sent[0]
     assert [type(item).__name__ for item in components] == ["File"]
     assert components[0].name == "报告.pdf"
-    assert len(list((tmp_path / "plugin_data" / "output").glob("*.pdf"))) == 1
+    assert list((tmp_path / "plugin_data" / "temp").rglob("*")) == []
 
 
 def test_text_artifact_is_sent_without_download(tmp_path, monkeypatch):
@@ -485,7 +486,7 @@ def test_text_artifact_is_sent_without_download(tmp_path, monkeypatch):
 
     assert sent_texts(event) == ["一只猫坐在窗台上"]
     assert server.downloads == []
-    assert list((tmp_path / "plugin_data" / "output").iterdir()) == []
+    assert list((tmp_path / "plugin_data" / "temp").iterdir()) == []
 
 
 def test_each_artifact_is_sent_as_its_own_message(tmp_path, monkeypatch):

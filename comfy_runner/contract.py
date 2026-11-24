@@ -29,7 +29,8 @@ TEXT_OUTPUT_TYPE = "text"
 FILE_OUTPUT_TYPES = frozenset({"image", "video", "audio", "file"})
 REFERENCE_HINT = (
     "取值可以是 attachment 或 attachment:N"
-    "（该类型第 N 个附件，本条消息的排在引用消息前面），"
+    "（该类型第 N 个附件，本条消息的排在引用消息前面）、"
+    "task:<任务ID> 或 task:<任务ID>:N（引用已有任务的产物），"
     "也可以是本地绝对路径、file:// URI 或 http(s) 链接"
 )
 NUMERIC_MARKERS = frozenset({"INT", "FLOAT", "BOOLEAN"})

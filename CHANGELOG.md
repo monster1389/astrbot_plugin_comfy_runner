@@ -2,6 +2,14 @@
 
 ## 未发布
 
+### 任务账本、按需临时下载与任务管理
+
+- 新增 SQLite 任务账本 `tasks.db`：持久化任务 `prompt_id`、工作流、提交者、参数、执行状态、交付状态与产物位置（`subfolder` / `filename` / `type`），ComfyUI 重启丢失 `/history` 或容器重启后仍可下载与补发历史产物
+- 新增第四个固定工具 `comfy_task`，支持 `status`（查并发与任务账本）、`wait`（等待完成并在收到用户新消息时立即中断）、`download`（按 ComfyUI 原路径下载到 `temp/`）、`deliver`（发送或补发产物）与 `cancel`（取消任务并立即归还并发名额）；`/comfy cancel [任务ID]` 亦支持直接取消指定任务
+- `comfy_execute` 返回值包含任务 ID，并新增可选参数 `deliver`（默认 `true`）；文件类参数支持 `task:<任务ID>` / `task:<任务ID>:序号` 串联已有或运行中的上游任务产物
+- 废除永久 `output/` 目录，改用 `temp/<subfolder>/<filename>` 临时目录；自动发送或手动 `deliver` 成功后立即删除未经 `download` 保留的临时文件
+- 轮询期间处于 ComfyUI `queue_pending` 的任务不再消耗执行超时；超时未知的任务在后续查询时若 ComfyUI 已完成会自动自愈；消息发送新增有限次重试
+
 ### 手动命令执行与模型可见性
 
 - 工具契约 `enabled` 字段替换为 `model_visible`：所有配有 `.tool.json` 契约的工作流都在命令入口可见并参与完整校验与重名检查，仅 `model_visible: true` 的工作流才会注册进模型工具目录

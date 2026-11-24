@@ -1,9 +1,10 @@
-"""附件与参数引用：把模型给出的引用变成一份可上传的文件。"""
+"""附件与参数引用：把模型给出的引用解析成一份可上传的文件。"""
 
 from __future__ import annotations
 
 import asyncio
 import hashlib
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -36,31 +37,11 @@ FILE_KIND_EXTENSIONS = {
         {".mp3", ".wav", ".ogg", ".opus", ".flac", ".m4a", ".aac", ".amr"}
     ),
 }
-
-
-def _file_extension(component: File) -> str:
-    for candidate in (
-        getattr(component, "name", ""),
-        getattr(component, "url", ""),
-        getattr(component, "file_", ""),
-    ):
-        if not candidate:
-            continue
-        suffix = Path(urlparse(str(candidate)).path).suffix.lower()
-        if suffix:
-            return suffix
-    return ""
-
-
-def _matches_kind(component: Any, kind: str, component_type: type[Any]) -> bool:
-    if isinstance(component, component_type):
-        return True
-    if not isinstance(component, File):
-        return False
-    extensions = FILE_KIND_EXTENSIONS.get(kind)
-    return bool(extensions and _file_extension(component) in extensions)
 ATTACHMENT_PREFIX = "attachment"
+TASK_PREFIX = "task:"
 DOWNLOAD_TIMEOUT_SECONDS = 60.0
+
+TaskReferenceResolver = Callable[[str, int | None, str], Awaitable["MediaPayload"]]
 
 
 class MediaError(ValueError):
@@ -89,7 +70,7 @@ class Attachments:
 
     @classmethod
     def from_event(cls, event: AstrMessageEvent) -> Attachments:
-        """按"本条消息优先、引用消息在后"的顺序收集附件。
+        """按本条消息优先、引用消息在后的顺序收集附件。
 
         Args:
             event: 触发本次调用的消息事件。
@@ -142,18 +123,56 @@ KIND_LABELS = {
 }
 
 
+def parse_task_reference(value: str) -> tuple[str, int | None] | None:
+    """解析形如 ``task:<任务ID>`` 或 ``task:<任务ID>:<序号>`` 的产物引用。
+
+    Args:
+        value: 参数值字符串。
+
+    Returns:
+        ``(任务 ID, 从 1 开始的产物序号或 None)``；不是任务引用时返回 None。
+
+    Raises:
+        MediaError: 前缀命中但任务 ID 或产物序号格式非法。
+    """
+    text = value.strip()
+    if text == "task":
+        raise MediaError(
+            "无法解析的任务引用 'task'：应写成 task:<任务ID> 或 task:<任务ID>:序号"
+        )
+    if not text.startswith(TASK_PREFIX):
+        return None
+    rest = text[len(TASK_PREFIX) :].strip()
+    if not rest:
+        raise MediaError("无法解析的任务引用：缺少任务 ID，应写成 task:<任务ID>")
+    if ":" in rest:
+        task_id, tail = rest.rsplit(":", 1)
+        task_id = task_id.strip()
+        tail = tail.strip()
+        if not task_id:
+            raise MediaError(f"无法解析的任务引用 {value!r}：缺少任务 ID")
+        if not tail.isdigit() or int(tail) < 1:
+            raise MediaError(
+                f"无法解析的任务产物序号 {tail!r}：应写成 task:<任务ID>:1"
+            )
+        return task_id, int(tail)
+    return rest, None
+
+
 async def resolve_reference(
     value: str,
     kind: str,
     attachments: Attachments,
+    task_resolver: TaskReferenceResolver | None = None,
 ) -> MediaPayload:
     """把模型给出的引用解析成一份待上传的文件。
 
     Args:
-        value: 参数值，形如 ``attachment``、``attachment:2``、``file://`` URI、
-            http(s) 链接或本地绝对路径。
-        kind: 参数类型，决定 ``attachment`` 取哪一类附件。
+        value: 参数值，形如 ``attachment``、``attachment:2``、``task:<任务ID>``、
+            ``file://`` URI、http(s) 链接或本地绝对路径。
+        kind: 参数类型，决定 ``attachment`` 取哪一类附件或校验任务产物类型。
         attachments: 本次消息里的附件集合。
+        task_resolver: 可选的上游任务产物解析回调。
 
     Returns:
         文件内容与扩展名。
@@ -170,6 +189,13 @@ async def resolve_reference(
             content=await _read_bytes(path, value),
             suffix=_require_suffix(path.suffix, value),
         )
+
+    task_ref = parse_task_reference(text)
+    if task_ref is not None:
+        if task_resolver is None:
+            raise MediaError(f"当前入口不支持任务产物引用 {value!r}")
+        task_id, artifact_index = task_ref
+        return await task_resolver(task_id, artifact_index, kind)
 
     if is_file_uri(text):
         path = Path(file_uri_to_path(text))
@@ -191,8 +217,31 @@ async def resolve_reference(
 
     raise MediaError(
         f"无法解析的引用 {value!r}：请填 attachment、attachment:序号、"
-        "file:// URI、http(s) 链接或本地绝对路径"
+        "task:<任务ID>、file:// URI、http(s) 链接或本地绝对路径"
     )
+
+
+def _file_extension(component: File) -> str:
+    for candidate in (
+        getattr(component, "name", ""),
+        getattr(component, "url", ""),
+        getattr(component, "file_", ""),
+    ):
+        if not candidate:
+            continue
+        suffix = Path(urlparse(str(candidate)).path).suffix.lower()
+        if suffix:
+            return suffix
+    return ""
+
+
+def _matches_kind(component: Any, kind: str, component_type: type[Any]) -> bool:
+    if isinstance(component, component_type):
+        return True
+    if not isinstance(component, File):
+        return False
+    extensions = FILE_KIND_EXTENSIONS.get(kind)
+    return bool(extensions and _file_extension(component) in extensions)
 
 
 def _attachment_index(text: str) -> int | None:

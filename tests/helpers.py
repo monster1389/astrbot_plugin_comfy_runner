@@ -5,6 +5,7 @@ import json
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
+from urllib.parse import parse_qs, urlparse
 
 import aiohttp
 import pytest
@@ -102,6 +103,7 @@ class FakeEvent:
         self.message_str = text
         self.extra: dict = {}
         self.sent: list = []
+        self.send_errors: list[Exception] = []
         self.message_obj = SimpleNamespace(message=list(components or []))
         self._sender = sender
         self._group = group
@@ -113,6 +115,10 @@ class FakeEvent:
         """返回消息链。"""
         return self.message_obj.message
 
+    def get_message_str(self) -> str:
+        """返回纯文本消息内容。"""
+        return self.message_str
+
     def plain_result(self, text: str):
         """构造纯文本结果的替身。"""
         return ("text", text)
@@ -122,7 +128,9 @@ class FakeEvent:
         return ("chain", components)
 
     async def send(self, result) -> None:
-        """把主动发送的结果记下来。"""
+        """把主动发送的结果记下来，可按队列模拟发送失败。"""
+        if self.send_errors:
+            raise self.send_errors.pop(0)
         self.sent.append(result)
 
     def get_sender_id(self) -> str:
@@ -289,9 +297,16 @@ class FakeComfyServer:
         self.submissions: list[dict] = []
         self.history_queries: list[str] = []
         self.downloads: list[str] = []
+        self.queue_deletions: list[list[str]] = []
+        self.interrupts: list[dict] = []
+        self.prompt_queue: list[tuple[int, object]] = []
         self.prompt_response = (200, {"prompt_id": "p1", "node_errors": {}})
+        self.history_by_id: dict[str, dict] = {}
         self.history_queue: list[dict] = []
         self.history_reply: dict = {}
+        self.queue_queue: list[dict] = []
+        self.queue_reply: dict = {"queue_running": [], "queue_pending": []}
+        self.view_by_filename: dict[str, bytes] = {}
         self.view_response = (200, b"png-bytes")
         self.object_info: dict[str, dict] = {}
         self.object_info_status = 200
@@ -325,24 +340,47 @@ class FakeComfyServer:
     def _post(self, url: str, payload: dict, data=None) -> FakeResponse:
         if url.endswith("/prompt"):
             self.submissions.append(payload["prompt"])
-            return _response(*self.prompt_response)
+            status, body = (
+                self.prompt_queue.pop(0)
+                if self.prompt_queue
+                else self.prompt_response
+            )
+            return _response(status, body)
         if url.endswith("/upload/image"):
             filename = _form_filename(data)
             self.uploads.append((filename, _form_content(data)))
             if self.upload_response is not None:
                 return _response(*self.upload_response)
             return _response(200, {"name": filename, "subfolder": "", "type": "input"})
+        if url.endswith("/queue"):
+            self.queue_deletions.append(list(payload.get("delete", [])))
+            return _response(200, {})
+        if url.endswith("/interrupt"):
+            self.interrupts.append(dict(payload))
+            return _response(200, {})
         raise AssertionError(f"未预期的 POST: {url}")
 
     def _get(self, url: str) -> FakeResponse:
         if "/history/" in url:
-            self.history_queries.append(url.rsplit("/", 1)[-1])
+            pid = url.rsplit("/", 1)[-1]
+            self.history_queries.append(pid)
+            if pid in self.history_by_id:
+                return _response(200, {pid: self.history_by_id[pid]})
             reply = (
                 self.history_queue.pop(0) if self.history_queue else self.history_reply
             )
             return _response(200, reply)
+        if url.endswith("/queue"):
+            reply = (
+                self.queue_queue.pop(0) if self.queue_queue else self.queue_reply
+            )
+            return _response(200, reply)
         if "/view?" in url:
             self.downloads.append(url)
+            params = parse_qs(urlparse(url).query)
+            filename = params.get("filename", [""])[0]
+            if filename in self.view_by_filename:
+                return _response(200, self.view_by_filename[filename])
             return _response(*self.view_response)
         if "/object_info/" in url:
             return _response(self.object_info_status, self.object_info)

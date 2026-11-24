@@ -7,15 +7,15 @@
 ## 核心特性
 
 - **双调用入口（模型工具 + 无模型命令向导）**
-  - **模型工具**：固定公开 `comfy_list`、`comfy_inspect`、`comfy_execute` 三个工具，仅对标记 `model_visible: true` 的工作流可见；不向系统提示词注入额外规则，也不修改节点图结构。
+  - **模型工具**：固定公开 `comfy_list`、`comfy_inspect`、`comfy_execute`、`comfy_task` 四个工具，仅对标记 `model_visible: true` 的工作流可见；不向系统提示词注入额外规则，也不修改节点图结构。
   - **手动命令**：通过 `/comfy run` 在本地管线拦截用户后续消息（`SessionWaiter`，按会话来源与发送者隔离），逐轮引导填写参数并直接提交执行，全过程不经过大模型；所有配好契约的工作流（含 `model_visible: false`）均可通过命令调用。
 - **显式工具契约（`.tool.json`）**
   - 每个工作流对应同名契约文件，显式声明名称、说明、`model_visible`、输入参数映射（类型、约束、可见性 `visible`、必填性 `required`）与正式产物输出映射。
   - 隐藏字符串参数（`visible: false` + `type: "string"`）支持 `value_template` 时间模板（如 `out/%date:yyyy-MM-dd%/img-%date:HHmmss%`），每次提交按容器本地时间展开。
   - 每次执行读取原始工作流副本，只覆盖本次显式提供的参数，未提供或未映射字段（如 `seed`）保持工作流原值。
 - **多模态输入与逐条产物交付**
-  - 支持 `image` / `video` / `audio` / `file` 四类引用参数：命令模式可直接发送或回复附件、粘贴 `http(s)` 链接（禁止本地路径）；模型工具额外支持 `attachment[:N]`、本地绝对路径与 `file://` URI。
-  - 同步校验并提交到 ComfyUI 拿到 `prompt_id` 后立即结束工具/向导并释放会话锁，后台轮询完成并将每个正式产物（图片、视频、语音、文件、文本）按对应消息类型逐条发送回原会话。
+  - 支持 `image` / `video` / `audio` / `file` 四类引用参数：命令模式可直接发送或回复附件、粘贴 `http(s)` 链接（禁止本地路径）；模型工具额外支持 `attachment[:N]`、`task:<任务ID>[:N]`、本地绝对路径与 `file://` URI。
+  - 同步校验并提交到 ComfyUI 拿到 `prompt_id` 后立即结束工具/向导并释放会话锁，任务状态与产物位置持久化写入 `tasks.db`；按 `deliver` 参数后台发送并在发送后清理 `temp/` 临时文件，也可通过 `comfy_task` 查询、等待、按需下载、补发或取消任务。
 - **WebUI 可视化管理与热刷新**
   - 在 AstrBot 后台「工作流与映射规则」视图中导入 `.json` 工作流、浏览节点与字段、连接 ComfyUI `/object_info` 远端核对类型、编辑契约并保存热刷新（无需重启容器）。
 - **多平台访问控制与并发边界**
@@ -39,7 +39,7 @@
 
 ### 3. 开始使用
 
-- **让模型调用**：确保契约开启「模型可见」（`model_visible: true`），在聊天中直接提出需求，模型会自行调用 `comfy_list` / `comfy_inspect` / `comfy_execute`。
+- **让模型调用**：确保契约开启「模型可见」（`model_visible: true`），在聊天中直接提出需求，模型会自行调用 `comfy_list` / `comfy_inspect` / `comfy_execute` / `comfy_task`。
 - **手动命令调用（不经过模型）**：
   1. 发送 `/comfy ls` 查看编号清单，或直接发送 `/comfy run`；
   2. 发送 `/comfy run <序号或工作流名>`（如 `/comfy run 1`）启动向导；
@@ -59,7 +59,7 @@
 | `/comfy help` | 查看指令帮助与当前会话访问状态 |
 | `/comfy ls` | 查看可用工作流编号、名称、模型可见性与说明 |
 | `/comfy run [序号或工作流名]` | 手动触发工作流并逐轮收集参数（无参时先列出清单供选择） |
-| `/comfy cancel` | 取消当前进行中的参数收集向导 |
+| `/comfy cancel [任务ID]` | 取消当前参数收集向导，或取消指定进行中的任务 |
 
 ### 管理员指令
 

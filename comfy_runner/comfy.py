@@ -1,4 +1,4 @@
-"""ComfyUI 的 HTTP 接口：提交工作流、等待完成、下载产物。"""
+"""ComfyUI 的 HTTP 接口：提交工作流、等待完成、查询队列、取消与下载产物。"""
 
 from __future__ import annotations
 
@@ -7,6 +7,7 @@ import json
 import re
 import time
 import uuid
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 from urllib.parse import quote, urlencode
@@ -15,6 +16,7 @@ import aiohttp
 
 DEFAULT_TIMEOUT_SECONDS = 300.0
 DEFAULT_POLL_INTERVAL = 1.0
+ABORT_SLICE_SECONDS = 0.25
 
 
 class ComfyError(RuntimeError):
@@ -35,6 +37,10 @@ class ExecutionFailed(ComfyError):
 
 class ExecutionTimeout(ComfyError):
     """在超时上限内没有等到执行结果。"""
+
+
+class WaitInterrupted(ComfyError):
+    """等待执行完成时被外部条件中断。"""
 
 
 class OutputError(ComfyError):
@@ -224,6 +230,56 @@ class ComfyClient:
             raise SubmitError("ComfyUI 未返回 prompt_id")
         return prompt_id
 
+    async def queue_state(self) -> tuple[set[str], set[str]]:
+        """读取 ComfyUI 当前运行中与排队中的任务 ID 集合。
+
+        Returns:
+            ``(运行中 ID 集合, 排队中 ID 集合)``。
+
+        Raises:
+            ComfyError: 查询失败或返回结构不符。
+        """
+        url = f"{self.base_url}/queue"
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(url, timeout=self._request_timeout()) as resp:
+                    if resp.status != 200:
+                        raise ComfyError(f"查询队列失败: HTTP {resp.status}")
+                    data = await resp.json()
+        except (aiohttp.ClientError, TimeoutError) as exc:
+            raise ComfyError(f"查询队列失败: {exc}") from exc
+
+        if not isinstance(data, dict):
+            raise ComfyError("查询队列返回的不是对象")
+        return (
+            _queue_ids(data.get("queue_running")),
+            _queue_ids(data.get("queue_pending")),
+        )
+
+    async def cancel(self, prompt_id: str) -> str:
+        """取消在队列中或正在执行的 ComfyUI 任务。
+
+        Args:
+            prompt_id: 目标任务 ID。
+
+        Returns:
+            取消前所处位置：``pending``、``running`` 或 ``not_in_queue``。
+
+        Raises:
+            ComfyError: 请求失败或返回非 200。
+        """
+        running_ids, pending_ids = await self.queue_state()
+        if prompt_id in pending_ids:
+            await self._post_json(f"{self.base_url}/queue", {"delete": [prompt_id]})
+            return "pending"
+        if prompt_id in running_ids:
+            await self._post_json(
+                f"{self.base_url}/interrupt",
+                {"prompt_id": prompt_id},
+            )
+            return "running"
+        return "not_in_queue"
+
     async def history(self, prompt_id: str) -> dict[str, Any] | None:
         """查询同一个任务的执行结果。
 
@@ -255,32 +311,53 @@ class ComfyClient:
             raise ComfyError(f"任务 {prompt_id} 的结果结构不符")
         return entry
 
-    async def wait(self, prompt_id: str) -> dict[str, Any]:
+    async def wait(
+        self,
+        prompt_id: str,
+        abort_check: Callable[[], str | None] | None = None,
+    ) -> dict[str, Any]:
         """轮询同一个任务直到出现结果。
 
-        超过总超时后抛错，不重新提交。
+        在任务处于 ComfyUI 排队期时不消耗执行超时；超过实际执行超时上限后抛错。
 
         Args:
             prompt_id: 任务 ID。
+            abort_check: 可选的中断检测回调，返回非空原因时立即抛出
+                ``WaitInterrupted``。
 
         Returns:
             任务结果。
 
         Raises:
-            ExecutionTimeout: 超时仍未出现结果。
+            WaitInterrupted: 被 ``abort_check`` 中断。
+            ExecutionTimeout: 超过执行超时仍未出现结果。
             ExecutionUnknown: 查询失败，无法确认执行状态。
         """
+        running_started = False
         deadline = time.monotonic() + self.timeout
         while True:
+            if abort_check is not None:
+                reason = abort_check()
+                if reason:
+                    raise WaitInterrupted(reason)
             try:
                 entry = await self.history(prompt_id)
             except ComfyError as exc:
                 raise ExecutionUnknown(f"执行状态未知: {exc}") from exc
             if entry is not None:
                 return entry
-            if time.monotonic() >= deadline:
+            if not running_started:
+                try:
+                    running_ids, pending_ids = await self.queue_state()
+                except ComfyError as exc:
+                    raise ExecutionUnknown(f"执行状态未知: {exc}") from exc
+                if prompt_id in pending_ids and prompt_id not in running_ids:
+                    deadline = time.monotonic() + self.timeout
+                else:
+                    running_started = True
+            if running_started and time.monotonic() >= deadline:
                 raise ExecutionTimeout(f"生成超时（{self.timeout:g} 秒）")
-            await asyncio.sleep(self.poll_interval)
+            await _sleep_with_abort(self.poll_interval, abort_check)
 
     async def download(self, ref: ArtifactRef) -> bytes:
         """下载一个正式产物。
@@ -363,8 +440,48 @@ class ComfyClient:
             raise UploadError(f"上传 {filename} 返回的 subfolder 不是字符串")
         return f"{subfolder}/{name}" if subfolder else name
 
+    async def _post_json(self, url: str, payload: dict[str, Any]) -> None:
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    url,
+                    json=payload,
+                    timeout=self._request_timeout(),
+                ) as resp:
+                    if resp.status != 200:
+                        raise ComfyError(f"请求 {url} 失败: HTTP {resp.status}")
+        except (aiohttp.ClientError, TimeoutError) as exc:
+            raise ComfyError(f"请求 {url} 失败: {exc}") from exc
+
     def _request_timeout(self) -> aiohttp.ClientTimeout:
         return aiohttp.ClientTimeout(total=self.timeout)
+
+
+def _queue_ids(items: Any) -> set[str]:
+    if not isinstance(items, list):
+        return set()
+    return {
+        item[1]
+        for item in items
+        if isinstance(item, list) and len(item) >= 2 and isinstance(item[1], str)
+    }
+
+
+async def _sleep_with_abort(
+    duration: float,
+    abort_check: Callable[[], str | None] | None,
+) -> None:
+    if abort_check is None or duration <= ABORT_SLICE_SECONDS:
+        await asyncio.sleep(duration)
+        return
+    remaining = duration
+    while remaining > 0:
+        step = min(remaining, ABORT_SLICE_SECONDS)
+        await asyncio.sleep(step)
+        reason = abort_check()
+        if reason:
+            raise WaitInterrupted(reason)
+        remaining -= step
 
 
 def _submit_detail(error: Any, node_errors: Any) -> str:

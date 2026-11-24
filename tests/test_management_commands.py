@@ -211,6 +211,7 @@ def test_reload_command_registers_new_contract(tmp_path, monkeypatch):
         "comfy_list",
         "comfy_inspect",
         "comfy_execute",
+        "comfy_task",
     ]
     listed = run_tool(plugin, "comfy_list", FakeEvent("/comfy list", sender="9"))
     assert "comfy_moss_t2i" in listed
@@ -223,7 +224,7 @@ def test_reload_command_removes_tools_when_contracts_disappear(tmp_path, monkeyp
     workflow_dir = write_workflow_dir(tmp_path)
     plugin, _ = make_plugin(tmp_path, monkeypatch, control=admin_overrides())
     asyncio.run(plugin.initialize())
-    assert len(plugin.context.llm_tools) == 3
+    assert len(plugin.context.llm_tools) == 4
 
     (workflow_dir / "moss.tool.json").unlink()
     results = collect(plugin.cmd_comfy_reload(FakeEvent("/comfy reload", sender="9")))
@@ -248,6 +249,7 @@ def test_reload_command_keeps_state_when_contract_broken(tmp_path, monkeypatch):
         "comfy_list",
         "comfy_inspect",
         "comfy_execute",
+        "comfy_task",
     ]
 
 

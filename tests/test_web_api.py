@@ -490,6 +490,7 @@ def test_save_contract_writes_file_and_refreshes_tools(tmp_path, monkeypatch):
         "comfy_list",
         "comfy_inspect",
         "comfy_execute",
+        "comfy_task",
     ]
 
 

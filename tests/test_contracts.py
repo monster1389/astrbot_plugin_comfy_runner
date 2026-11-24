@@ -86,6 +86,7 @@ def test_enabled_contract_registers_three_fixed_tools(tmp_path, monkeypatch):
         "comfy_list",
         "comfy_inspect",
         "comfy_execute",
+        "comfy_task",
     ]
 
 

@@ -17,12 +17,11 @@ from .comfy_runner.commands import CommandContext
 from .comfy_runner.config import Config
 from .comfy_runner.execution import ConcurrencyGate, WorkflowExecutor
 from .comfy_runner.interactive import InteractiveManager
-from .comfy_runner.paths import PLUGIN_DIR, prepare_data_dir
+from .comfy_runner.paths import PLUGIN_DIR, clear_temp_dir, prepare_data_dir
 from .comfy_runner.registry import load_contracts
+from .comfy_runner.tasks import TaskStore
 from .comfy_runner.tools import (
-    EXECUTE_NAME,
-    INSPECT_NAME,
-    LIST_NAME,
+    TOOL_NAMES,
     WorkflowToolAdapter,
     build_function_tools,
 )
@@ -62,6 +61,7 @@ class ComfyUIPlugin(Star):
         )
         self.gate = ConcurrencyGate(execution.max_concurrency)
         self.jobs = BackgroundJobs()
+        self.tasks = TaskStore(self.cfg.tasks_db_path)
         self.contracts = load_contracts(self.cfg.workflow_dir, PLUGIN_DIR)
         self.model_contracts = [
             contract for contract in self.contracts if contract.model_visible
@@ -72,7 +72,9 @@ class ComfyUIPlugin(Star):
             self.gate,
             self.jobs,
             {contract.name: contract for contract in self.model_contracts},
-            self.cfg.output_dir,
+            self.cfg.temp_dir,
+            self.tasks,
+            {contract.name: contract for contract in self.contracts},
         )
         self.interactive = InteractiveManager(
             self.adapter,
@@ -137,6 +139,10 @@ class ComfyUIPlugin(Star):
         self.adapter.catalog.update(
             {contract.name: contract for contract in model_contracts}
         )
+        self.adapter.all_contracts.clear()
+        self.adapter.all_contracts.update(
+            {contract.name: contract for contract in contracts}
+        )
         names = tuple(contract.name for contract in contracts)
         self.cmd_ctx = replace(self.cmd_ctx, contracts=tuple(contracts))
         self._sync_tool_registration(bool(model_contracts))
@@ -154,15 +160,16 @@ class ComfyUIPlugin(Star):
             return
         if hasattr(self.context, "get_llm_tool_manager"):
             manager = self.context.get_llm_tool_manager()
-            for name in (LIST_NAME, INSPECT_NAME, EXECUTE_NAME):
+            for name in TOOL_NAMES:
                 manager.remove_func(name)
         self.function_tools = []
         logger.info("[ComfyUI] 已移除工作流工具")
 
     async def terminate(self) -> None:
-        """插件卸载或重载时取消交互向导与尚未完成的后台交付。"""
+        """插件卸载或重载时取消交互向导、后台交付并清空临时目录。"""
         await self.interactive.cancel_all()
         await self.jobs.cancel_all()
+        clear_temp_dir(self.cfg.temp_dir)
         logger.info("[ComfyUI] 插件已卸载")
 
     @filter.command_group("comfy")
@@ -201,7 +208,7 @@ class ComfyUIPlugin(Star):
 
     @comfy.command("cancel")
     async def cmd_comfy_cancel(self, event: AstrMessageEvent):
-        """取消当前交互参数收集。"""
+        """取消当前交互参数收集或指定任务。"""
         async for result in commands.cancel_workflow_command(self.cmd_ctx, event):
             yield result
 

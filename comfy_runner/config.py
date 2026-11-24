@@ -112,9 +112,14 @@ class Config:
         return self.data_dir / "workflow"
 
     @property
-    def output_dir(self) -> Path:
-        """产物落盘目录。"""
-        return self.data_dir / "output"
+    def temp_dir(self) -> Path:
+        """产物临时目录。"""
+        return self.data_dir / "temp"
+
+    @property
+    def tasks_db_path(self) -> Path:
+        """任务账本数据库文件。"""
+        return self.data_dir / "tasks.db"
 
     @property
     def sensitive_words_path(self) -> Path:
